@@ -1,0 +1,258 @@
+"""Stratified train / holdout split, shared by every downstream stage.
+
+`fit_urr` and `train_diffusion` see only `train_idx`; `evaluate` uses `holdout_idx`
+Stratified on joint (disease_condition, compound_idx): each stratum puts `round(holdout_frac * n)` rows to holdout, and other in train
+
+    python -m src.data.splits --holdout-frac 0.10
+"""
+from __future__ import annotations
+
+import hashlib
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+from datasets import load_from_disk
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.spec import (
+    CaseConfig, add_adjustment_set_cli, config_from_args, default_config)  # noqa: E402
+from src.data.rarity import (  # noqa: E402
+    RarityConfig,
+    add_rarity_cli_args,
+    rarity_from_args,
+    save_rarity_meta,
+    subsample_train_idx,
+    tagged_nuisance_dir,
+)
+
+
+SPLITS_FILENAME = "splits.json"
+
+
+def population_filters(cfg) -> dict:
+    """{column: required value} for cfg.population. Used to check a cached split and to create a new one."""
+    out = {k: str(v) for k, v in (
+        ("disease_condition", cfg.population.disease_condition),
+        ("cell_type", cfg.population.cell_type)) if v is not None}
+    # Part of the cache key, not an equality filter: a split built for a
+    # different action space must not be silently reused. Handled separately
+    # in the mask loop below.
+    if cfg.population.compounds:
+        out["compounds"] = f"{len(cfg.population.compounds)}:" + hashlib.sha1(
+            "|".join(sorted(cfg.population.compounds)).encode()).hexdigest()[:12]
+    return out
+
+
+def _splits_path(cfg: CaseConfig) -> str:
+    return os.path.join(cfg.paths.nuisance_dir, SPLITS_FILENAME)
+
+
+def _stratified_indices(
+    strata_key: np.ndarray, holdout_frac: float, seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-stratum random holdout. `strata_key` is an int array (one stratum id per row); returns (train_idx, holdout_idx) over the original positions."""
+    rng = np.random.default_rng(seed)
+    train_parts: list[np.ndarray] = []
+    holdout_parts: list[np.ndarray] = []
+    for s in np.unique(strata_key):
+        rows = np.where(strata_key == s)[0]
+        rng.shuffle(rows)
+        n = rows.shape[0]
+        n_hold = int(round(holdout_frac * n))
+        if n < 2:
+            n_hold = 0  # can't hold out a singleton stratum
+        holdout_parts.append(rows[:n_hold])
+        train_parts.append(rows[n_hold:])
+    train_idx = np.concatenate(train_parts) if train_parts else np.array([], dtype=np.int64)
+    holdout_idx = np.concatenate(holdout_parts) if holdout_parts else np.array([], dtype=np.int64)
+    # Sorted indices are friendlier to HF dataset.select.
+    train_idx.sort()
+    holdout_idx.sort()
+    return train_idx.astype(np.int64), holdout_idx.astype(np.int64)
+
+
+def make_splits(
+    cfg: CaseConfig | None = None,
+    holdout_frac: float = 0.20,
+    seed: int | None = None,
+    force: bool = False,
+    rarity: RarityConfig | None = None,
+) -> dict:
+    """Compute (or reuse) the stratified split.
+
+    With `rarity` active the caller must have already pointed `cfg.paths.nuisance_dir` at the tagged directory. 
+    Subsampling applies to `train_idx` only, so the holdout matches the full-data run and metrics stay comparable.
+
+    Returns train_idx, holdout_idx, holdout_frac, seed, n_total, n_strata, and a `rarity` block when active.
+    """
+    cfg = cfg or default_config()
+    seed = cfg.seed if seed is None else seed
+    rarity = rarity or RarityConfig()
+    out_path = _splits_path(cfg)
+
+    if os.path.isfile(out_path) and not force:
+        with open(out_path) as f:
+            cached = json.load(f)
+        cached_rarity = cached.get("rarity", {"active": False})
+        rarity_matches = (
+            cached_rarity.get("active", False) == rarity.active
+            and cached_rarity.get("tag", "") == rarity.tag
+        )
+
+        # define the pop of interest. not just all samples.
+        if (cached.get("holdout_frac") == holdout_frac
+                and cached.get("seed") == seed
+                and cached.get("population", {}) == population_filters(cfg)
+                and rarity_matches):
+            return {
+                "train_idx": np.asarray(cached["train_idx"], dtype=np.int64),
+                "holdout_idx": np.asarray(cached["holdout_idx"], dtype=np.int64),
+                "holdout_frac": cached["holdout_frac"],
+                "seed": cached["seed"],
+                "n_total": cached["n_total"],
+                "n_strata": cached["n_strata"],
+                "rarity": cached_rarity,
+            }
+
+    ds = load_from_disk(cfg.paths.tabular_dataset_dir)
+    n_total = len(ds)
+
+    # Population restriction (cfg.population). Rows outside it never enter train OR holdout; they stay on disk for eval to use as real references.
+    pop_filters = population_filters(cfg)
+    pop_mask = np.ones(n_total, dtype=bool)
+    for col, want in pop_filters.items():
+        if col == "compounds":
+            continue          # membership, not equality -- applied below
+        pop_mask &= (np.array([str(x) for x in ds[col]]) == want)
+    if cfg.population.compounds:
+        _want = set(cfg.population.compounds)
+        _treat = np.array([str(x) for x in ds["treatment"]])
+        _isctl = np.asarray(ds["is_control"], dtype=np.int64) == 1
+        _keep = np.isin(_treat, list(_want)) | _isctl
+        _missing = _want - set(_treat[np.isin(_treat, list(_want))].tolist())
+        if _missing:
+            raise ValueError(
+                f"population.compounds names {len(_missing)} compound(s) absent "
+                f"from the dataset, e.g. {sorted(_missing)[:3]}.")
+        pop_mask &= _keep
+        print(f"[splits] action space restricted to {len(_want)} compounds "
+              f"(+controls): {int(_keep.sum()):,} rows pass")
+    if pop_filters:
+        print(f"[splits] population {pop_filters}: "
+              f"{int(pop_mask.sum()):,}/{n_total:,} rows")
+
+    disease = np.array(
+        ["<missing>" if d is None else str(d) for d in ds["disease_condition"]]
+    )
+    compound = np.asarray(ds["compound_idx"], dtype=np.int64)
+
+    # (disease, compound) -> a single int stratum id.
+    disease_levels, disease_codes = np.unique(disease, return_inverse=True)
+    strata_key = disease_codes.astype(np.int64) * (compound.max() + 1) + compound
+
+    # Stratify within the population only
+    pop_rows = np.where(pop_mask)[0]
+    _tr, _ho = _stratified_indices(strata_key[pop_rows], holdout_frac, seed)
+    train_idx, holdout_idx = pop_rows[_tr], pop_rows[_ho]
+    n_strata = int(np.unique(strata_key[pop_rows]).shape[0])
+
+    rarity_info: dict = {"rare_compounds": []}
+    if rarity.active:
+        train_idx, _rare_ids, rarity_info = subsample_train_idx(cfg, train_idx, rarity)
+        save_rarity_meta(cfg.paths.nuisance_dir, rarity, rarity_info)
+
+    payload = {
+        "holdout_frac": holdout_frac,
+        "seed": seed,
+        "n_total": n_total,
+        "n_strata": n_strata,
+        "stratify_by": ["disease_condition", "compound_idx"],
+        "population": pop_filters, #pop filters
+        "disease_levels": [str(x) for x in disease_levels.tolist()],
+        "n_train": int(train_idx.shape[0]),
+        "n_holdout": int(holdout_idx.shape[0]),
+        "train_idx": train_idx.tolist(),
+        "holdout_idx": holdout_idx.tolist(),
+        "rarity": {**rarity.to_dict(), **rarity_info},
+    }
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(payload, f)
+    print(f"[splits] wrote {out_path}: "
+          f"n_total={n_total} train={payload['n_train']} "
+          f"holdout={payload['n_holdout']} ({holdout_frac:.0%}) "
+          f"n_strata={n_strata}"
+          + (f" rarity={rarity.tag}" if rarity.active else ""))
+
+    return {
+        "train_idx": train_idx,
+        "holdout_idx": holdout_idx,
+        "holdout_frac": holdout_frac,
+        "seed": seed,
+        "n_total": n_total,
+        "n_strata": n_strata,
+        "rarity": payload["rarity"],
+    }
+
+
+def load_splits(cfg: CaseConfig | None = None) -> dict:
+    """Load an existing splits.json. Calls `make_splits` to create one if it doesn't exist yet (using defaults).
+    when loading a rarity-tagged split, set `cfg.paths.nuisance_dir` to the tagged directory (see `tagged_nuisance_dir`).
+    """
+    cfg = cfg or default_config()
+    out_path = _splits_path(cfg)
+    if not os.path.isfile(out_path):
+        base = os.path.basename(cfg.paths.nuisance_dir)
+        if "_rare" in base:
+            raise FileNotFoundError(
+                f"no splits.json in the rarity-tagged dir {cfg.paths.nuisance_dir}.\n"
+                f"  load_splits() cannot create one: it does not receive the "
+                f"RarityConfig, so it would write an UNABLATED split into a "
+                f"directory whose name promises an ablation -- and every "
+                f"downstream consumer would then load it as if it were ablated.\n"
+                f"  Build it first:\n"
+                f"    python -m src.data.splits --rare-compound-frac ... "
+                f"--rare-keep-frac ... --rare-confound-pos-gamma ... "
+                f"[--population_compounds ...] [--adjustment_set ...]")
+        return make_splits(cfg)
+    with open(out_path) as f:
+        cached = json.load(f)
+    return {
+        "train_idx": np.asarray(cached["train_idx"], dtype=np.int64),
+        "holdout_idx": np.asarray(cached["holdout_idx"], dtype=np.int64),
+        "holdout_frac": cached["holdout_frac"],
+        "seed": cached["seed"],
+        "n_total": cached["n_total"],
+        "n_strata": cached["n_strata"],
+        "rarity": cached.get("rarity", {"active": False}),
+    }
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--holdout-frac", type=float, default=0.20)
+    p.add_argument("--seed", type=int, default=None,
+                   help="Defaults to cfg.seed.")
+    p.add_argument("--force", action="store_true")
+    add_rarity_cli_args(p)
+    add_adjustment_set_cli(p)
+    a = p.parse_args()
+    rcfg = rarity_from_args(a)
+    cfg = config_from_args(a)
+    if rcfg.active:
+        cfg.paths.nuisance_dir = tagged_nuisance_dir(cfg, rcfg)
+        print(f"[splits] rarity active: tag={rcfg.tag} -> {cfg.paths.nuisance_dir}")
+    make_splits(cfg=cfg, holdout_frac=a.holdout_frac, seed=a.seed,
+                force=a.force, rarity=rcfg)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,23 @@
+# Track ONLY the library: RxRx19a/src/**.py, plus README and requirements.
+# Everything else -- data, checkpoints, logs, samples, scripts, archive -- is
+# local. Note this governs UNtracked files only; already-committed ones stay
+# tracked until `git rm --cached`.
+
+# 1. Ignore everything by default
+*
+
+# 2. But descend into directories so nested keeps are reachable
+!*/
+
+# 3. The library
+!RxRx19a/src/**/*.py
+
+# 4. Project files
+!RxRx19a/README.md
+!RxRx19a/requirements.txt
+!LICENSE
+!.gitignore
+
+# 5. Never, even under src/
+__pycache__/
+*.pyc
