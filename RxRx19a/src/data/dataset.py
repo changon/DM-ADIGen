@@ -270,6 +270,33 @@ def denormalize_latents(z: torch.Tensor, spec: LatentSpec) -> torch.Tensor:
     mean, std = _stat_tensors(spec, z)
     return z * std + mean
 
+DOSE_ENCODINGS = ("scalar", "fourier", "level")
+DOSE_NONE = "none"          # level-0 label for a well with no dose (vehicle)
+
+
+def dose_levels(log10_conc_train: np.ndarray | torch.Tensor) -> tuple[str, ...]:
+    """Level labels for a categorical dose, index order, with `none` at 0.
+
+    Labels are the formatted log10 values, so `arch.json` carries the grid a
+    checkpoint was trained on and eval cannot silently re-bin against another.
+    """
+    x = np.asarray(log10_conc_train, dtype=np.float64)
+    x = np.unique(x[np.isfinite(x)])
+    return (DOSE_NONE,) + tuple(f"{v:.6g}" for v in x)
+
+
+def encode_dose_levels(log10_conc, levels: Sequence[str]) -> np.ndarray:
+    """Raw log10 dose -> level index, matching `dose_levels` order.
+
+    Non-finite (a vehicle well) maps to 0. A value off the trained grid snaps to
+    its nearest level rather than failing, so held-out doses stay samplable.
+    """
+    grid = np.asarray([float(v) for v in levels[1:]], dtype=np.float64)
+    d = np.asarray(log10_conc, dtype=np.float64)
+    k = np.abs(d[:, None] - grid[None, :]).argmin(axis=1) + 1
+    return np.where(np.isfinite(d), k, 0).astype(np.int64)
+
+
 def build_cond_spec(
     cfg,
     n_compounds: int,
@@ -277,6 +304,7 @@ def build_cond_spec(
     *,
     include_env: bool = False,
     adjustment_set: Sequence[str] | None = None,
+    dose_encoding: str = "scalar",
 ) -> CondSpec:
     """Cond spec.
 
@@ -288,6 +316,8 @@ def build_cond_spec(
 
     `adjustment_set` promotes named fields from their default role to C.
     """
+    if dose_encoding not in DOSE_ENCODINGS:
+        raise ValueError(f"dose_encoding must be one of {DOSE_ENCODINGS}, got {dose_encoding!r}")
     x = np.asarray(log10_conc_train, dtype=np.float64)
     x = x[np.isfinite(x)]
     if x.size == 0:
@@ -322,8 +352,15 @@ def build_cond_spec(
     for name in ACTION_FIELDS:
         d = BY_NAME[name]
         if d.kind == "cont":
+            if name == "dose" and dose_encoding == "level":
+                lv = dose_levels(log10_conc_train)
+                fields.append(Field(name=name, role="A", kind="cat",
+                                    cardinality=len(lv), levels=lv))
+                continue
+            nf = d.n_freqs if (name != "dose" or dose_encoding == "fourier") else 0
             fields.append(Field(name=name, role="A", kind="cont",
-                                loc=loc, scale=scale, nullable=d.nullable))
+                                loc=loc, scale=scale, nullable=d.nullable,
+                                n_freqs=nf))
         else:
             card = d.cardinality
             if card is None:
@@ -387,7 +424,10 @@ def cond_from_arrays(spec: CondSpec, *, compound, log10_conc, is_control,
         elif f.name == "is_control":
             cond[f.name] = is_ctrl.long()
         elif f.name == "dose":
-            cond[f.name] = dose
+            # a level-encoded dose carries its grid in the spec; index 0 = no dose
+            cond[f.name] = (
+                _t(encode_dose_levels(dose.detach().cpu().numpy(), f.levels), torch.long)
+                if f.kind == "cat" else dose)
         else:
             cond[f.name] = ctx[:, CONTEXT_COL[f.name]].long()
     return cond

@@ -149,7 +149,7 @@ class Field:
         """Width of the continuous field's MLP input. primarily bookkeeping maintained in arch.json"""
         if self.kind != KIND_CONT:
             raise AttributeError(f"{self.name} is not continuous")
-        return self.dim * (1 if self.n_freqs == 0 else 2 * self.n_freqs)
+        return self.dim * (1 + 2 * self.n_freqs)
 
     # -- data helpers -------------------------------------------------------
     def encode(self, values: Sequence[Any]) -> list[int]:
@@ -303,16 +303,14 @@ class CondSpec:
 # ---------------------------------------------------------------------------
 # Embedder
 # ---------------------------------------------------------------------------
-def fourier_features(v: torch.Tensor, n_freqs: int, max_period: float = 10_000.0
+def fourier_features(v: torch.Tensor, n_freqs: int, max_freq: float = 5.0
                      ) -> torch.Tensor:
-    """(N, D) -> (N, D * 2 * n_freqs) sin/cos features.
-
-    Same geometric frequency ladder DiT's `TimestepEmbedder` uses.
-    """
+    """(N, D) -> (N, D * 2 * n_freqs) sin/cos features.    """
+    if n_freqs < 1:
+        raise ValueError("n_freqs must be >= 1 to build Fourier features")
     freqs = torch.exp(
-        -math.log(max_period)
-        * torch.arange(n_freqs, dtype=torch.float32, device=v.device) / max(n_freqs, 1)
-    )                                              # (F,)
+        math.log(max_freq) * torch.arange(n_freqs, dtype=torch.float32, device=v.device) / max(n_freqs - 1, 1)
+    )                                              # (F,) 1 .. max_freq
     args = v.unsqueeze(-1) * freqs                 # (N, D, F)
     out = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)   # (N, D, 2F)
     return out.flatten(1)
@@ -346,15 +344,17 @@ class CondEmbedder(nn.Module):
       terms_out optional dict; if given, filled with per-field ||term|| means so we can see how the breakdown of the context embeddings look (prior to adding it up)
     """
 
-    def __init__(self, spec: CondSpec, hidden_size: int):
+    def __init__(self, spec: CondSpec, hidden_size: int, *, cfg_null: bool = True):
         super().__init__()
         self.spec = spec
         self.hidden_size = int(hidden_size)
+        self.cfg_null = bool(cfg_null)
 
         cat, cont, nulls = {}, {}, {}
         for f in spec:
             if f.kind == KIND_CAT:
-                cat[f.name] = nn.Embedding(f.n_rows, hidden_size)
+                cat[f.name] = nn.Embedding(
+                    f.n_rows if self.cfg_null else int(f.cardinality), hidden_size)
             else:
                 cont[f.name] = _ContEmbedder(f.in_features, hidden_size)
                 if f.needs_null:
@@ -415,7 +415,7 @@ class CondEmbedder(nn.Module):
                 else:
                     x = torch.randn(n_probe, f.dim, device=dev)   # already standardised
                 if f.n_freqs:
-                    x = fourier_features(x, f.n_freqs)
+                    x = torch.cat([x, fourier_features(x, f.n_freqs)], dim=-1)
                 measured = mod(x).norm(dim=-1).mean()
                 k = float(target / measured.clamp_min(1e-12))
                 mod.mlp[2].weight.mul_(k)
@@ -434,20 +434,16 @@ class CondEmbedder(nn.Module):
             raise KeyError(
                 f"conditioning dict is missing {missing}; the spec declares "
                 f"{list(self.spec.names)}")
+        if drop is not None and not self.cfg_null:
+            raise ValueError("drop was given but this embedder was built without CFG null rows (cfg_null=False), so dropped samples have no index to route to.")
 
         ref = cond[self.spec.names[0]]
         n = ref.shape[0]
         device = ref.device
-        c = torch.zeros(n, self.hidden_size, device=device,
-                        dtype=torch.get_default_dtype())
+        c = torch.zeros(n, self.hidden_size, device=device, dtype=torch.get_default_dtype())
 
         for f in self.spec:
-            v = cond[f.name]
-            if v.shape[0] != n:
-                raise ValueError(
-                    f"{f.name}: batch dim {v.shape[0]} != {n} for the other fields")
-            term = self._cat_term(f, v, drop) if f.kind == KIND_CAT \
-                else self._cont_term(f, v, drop)
+            term = self._term(f, cond, drop, n)
             c = c + term.to(c.dtype)
             if terms_out is not None:
                 terms_out[f.name] = float(term.detach().float().norm(dim=-1).mean())
@@ -455,6 +451,34 @@ class CondEmbedder(nn.Module):
         if terms_out is not None:
             terms_out["__total__"] = float(c.detach().float().norm(dim=-1).mean())
         return c
+
+    def _term(self, f: Field, cond: Mapping[str, torch.Tensor],
+              drop: torch.Tensor | None, n: int) -> torch.Tensor:
+        """One field's contribution. The adaLN sum and the token path share this."""
+        v = cond[f.name]
+        if v.shape[0] != n:
+            raise ValueError(
+                f"{f.name}: batch dim {v.shape[0]} != {n} for the other fields")
+        return (self._cat_term(f, v, drop) if f.kind == KIND_CAT
+                else self._cont_term(f, v, drop))
+
+    def field_tokens(self, cond: Mapping[str, torch.Tensor],
+                     drop: torch.Tensor | None = None,
+                     roles: tuple[str, ...] = ("A",)) -> torch.Tensor:
+        """Per-field terms kept SEPARATE, as (N, k, hidden) tokens. The adaLN path sums these into one vector, which forces one modulation for each patch
+        """
+        names = [f.name for f in self.spec if f.role in roles]
+        if not names:
+            raise ValueError(f"no field in the spec has role in {roles}")
+        missing = [nm for nm in names if nm not in cond]
+        if missing:
+            raise KeyError(f"conditioning dict is missing {missing}")
+        if drop is not None and not self.cfg_null:
+            raise ValueError(
+                "drop was given but this embedder was built without CFG null rows")
+        n = int(cond[names[0]].shape[0])
+        return torch.stack(
+            [self._term(self.spec[nm], cond, drop, n) for nm in names], dim=1)
 
     def _cat_term(self, f: Field, v: torch.Tensor,
                   drop: torch.Tensor | None) -> torch.Tensor:
@@ -495,7 +519,7 @@ class CondEmbedder(nn.Module):
 
         x = (x - f.loc) / f.scale
         if f.n_freqs:
-            x = fourier_features(x, f.n_freqs)
+            x = torch.cat([x, fourier_features(x, f.n_freqs)], dim=-1)
         term = self.cont[f.name](x)
 
         if f.needs_null:

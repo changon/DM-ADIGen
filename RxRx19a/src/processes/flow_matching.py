@@ -20,16 +20,31 @@ class FlowMatching:
     """Flow matching for latent DiT arms.
     """
 
-    def __init__(self, num_train_timesteps: int = 1000):
+    def __init__(self, num_train_timesteps: int = 1000,
+                 tau_dist: str = "uniform", tau_ln_m: float = 0.0,
+                 tau_ln_s: float = 1.0):
         self.num_train_timesteps = int(num_train_timesteps)
+        if tau_dist not in ("uniform", "logitnormal"):
+            raise ValueError(f"unknown tau_dist {tau_dist!r}")
+        self.tau_dist = str(tau_dist)
+        self.tau_ln_m = float(tau_ln_m)
+        self.tau_ln_s = float(tau_ln_s)
         # Set by set_timesteps() for the sampler; unused during training.
         self._dt: float | None = None
         self.timesteps: torch.Tensor | None = None
 
     # ------------------------------------------------------------------ train
     def sample_tau(self, batch: int, device, generator=None) -> torch.Tensor:
-        """tau ~ Uniform[0, 1), one per batch element."""
-        return torch.rand(batch, device=device, generator=generator)
+        """tau in [0, 1), one per batch element. Sets where training mass lands.
+
+        NOTE the convention here is tau=0 NOISE -> tau=1 DATA, the reverse of
+        SD3's. m=0 is symmetric either way; m>0 shifts mass toward DATA (the
+        low-noise end where covariance structure is resolved), m<0 toward noise.
+        """
+        if self.tau_dist == "uniform":
+            return torch.rand(batch, device=device, generator=generator)
+        u = torch.randn(batch, device=device, generator=generator)
+        return torch.sigmoid(self.tau_ln_m + self.tau_ln_s * u)
 
     def model_timesteps(self, tau: torch.Tensor) -> torch.Tensor:
         """Index-scale timestep fed to the DiT embedder: t = tau * N (float)."""
@@ -61,5 +76,27 @@ class FlowMatching:
         return SimpleNamespace(prev_sample=sample + self._dt * model_output)
 
 
-def make_train_flow_matching(num_train_timesteps: int = 1000) -> FlowMatching:
-    return FlowMatching(num_train_timesteps)
+def ot_couple(x0: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+    """Reorder `noise` so each row is paired with its minibatch-OT partner in x0.
+
+    A permutation preserves BOTH marginals, so p(x|a) and the estimand are
+    unchanged; only the pairing -- and the variance of the target x0 - noise --
+    differs. Solved per process on the local batch.
+    """
+    from scipy.optimize import linear_sum_assignment
+
+    B = x0.shape[0]
+    if B < 2:
+        return noise
+    a = x0.reshape(B, -1).float()
+    b = noise.reshape(B, -1).float()
+    cost = torch.cdist(a, b, p=2).pow(2)
+    _, col = linear_sum_assignment(cost.detach().cpu().numpy())
+    return noise[torch.as_tensor(col, device=noise.device, dtype=torch.long)]
+
+
+def make_train_flow_matching(num_train_timesteps: int = 1000,
+                             tau_dist: str = "uniform", tau_ln_m: float = 0.0,
+                             tau_ln_s: float = 1.0) -> FlowMatching:
+    return FlowMatching(num_train_timesteps, tau_dist=tau_dist,
+                        tau_ln_m=tau_ln_m, tau_ln_s=tau_ln_s)

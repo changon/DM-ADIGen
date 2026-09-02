@@ -19,10 +19,11 @@ from typing import Any
 import torch
 
 from .conditioning import CondEmbedder, CondSpec, Field
-from .dit import DIT_SIZES, DiT2DModel
+from .dit import COND_MODES, DIT_SIZES, DiT2DModel
 
 __all__ = [
     "ARCH_FILENAME",
+    "COND_MODES",
     "DIT_SIZES",
     "CondEmbedder",
     "CondSpec",
@@ -44,6 +45,7 @@ def build_generator(
     dit_size: str = "B",
     patch_size: int = 8,
     class_dropout_prob: float = 0.0,
+    cond_mode: str = "adaln",
     n_channels: int | None = None,
     resolution: int | None = None,
 ) -> torch.nn.Module:
@@ -76,6 +78,7 @@ def build_generator(
         cond_spec=cond_spec,
         patch_size=patch_size,
         class_dropout_prob=class_dropout_prob,
+        cond_mode=cond_mode,
         **DIT_SIZES[dit_size],
     )
 
@@ -88,6 +91,7 @@ def arch_spec(
     class_dropout_prob: float,
     n_channels: int,
     resolution: int,
+    cond_mode: str = "adaln",
     **extra: Any,
 ) -> dict[str, Any]:
     """The dict training records in arch.json. Everything `build_generator` needs."""
@@ -97,6 +101,7 @@ def arch_spec(
         dit_size=dit_size,
         patch_size=int(patch_size),
         class_dropout_prob=float(class_dropout_prob),
+        cond_mode=str(cond_mode),
         n_channels=int(n_channels),
         resolution=int(resolution),
         **extra,
@@ -162,6 +167,8 @@ def build_generator_from_ckpt(cfg, ckpt_dir: str) -> torch.nn.Module:
         dit_size=spec["dit_size"],
         patch_size=int(spec["patch_size"]),
         class_dropout_prob=float(spec["class_dropout_prob"]),
+        # absent in pre-xattn arch.json; those runs are all adaln
+        cond_mode=str(spec.get("cond_mode", "adaln")),
         n_channels=int(spec["n_channels"]),
         resolution=int(spec["resolution"]),
     )

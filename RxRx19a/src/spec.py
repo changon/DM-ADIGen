@@ -110,6 +110,7 @@ class DomainField:
     levels: tuple[str, ...] | None = None  # None -> scan the data
     cardinality: int | None = None         # None -> len(levels), else from data
     nullable: bool = False                 # a continuous field that can be N/A
+    n_freqs: int = 0                       # continuous only: Fourier bands (0 = raw scalar)
     source: str = ""
     note: str = ""
 
@@ -132,10 +133,13 @@ FIELDS: tuple[DomainField, ...] = (
                 note="cardinality from compound_vocab.json"),
     DomainField("is_control", "A", kind="cat",  cardinality=2,
                 note="fixed by definition: a well either is a vehicle or is not"),
-    DomainField("dose",       "A", kind="cont", nullable=True, source="log10_conc",
+    DomainField("dose",       "A", kind="cont", nullable=True, n_freqs=8,
+                source="log10_conc",
                 note="loc/scale from the TRAIN split, treated rows only; a vehicle "
                      "well has no dose -> NaN -> learned null, never 0.0 (which is "
-                     "a valid 1 uM dose)"),
+                     "a valid 1 uM dose). n_freqs>0 widens the one scalar the "
+                     "estimand rides on into a band code the adaLN vector can "
+                     "resolve; 0 feeds the raw standardised value"),
 
     # --- C / E: the context tensor, in COLUMN ORDER ------------------------
     DomainField("cell_type",  None,                  note="constant on this population (HRCE)"),

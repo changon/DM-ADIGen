@@ -79,6 +79,7 @@ def _parse_args():
     p.add_argument("--device", default="cpu", help="cpu (default) or cuda.")
     add_adjustment_set_cli(p)
     p.add_argument("--pool", choices=("all", "holdout", "kept"), default="all",  help="Real rows to measure on: all / eval holdout / only rows surviving the rarity ablation.")
+    p.add_argument("--no_population_filter", action="store_true", help="Score on every cell_type, not just cfg.population.cell_type. Reproduces the pre-2026-09-02 behaviour, in which ~59%% of a panel compound's rows were VERO -- a population the generator never trained on and has no field to condition on.")
     p.add_argument("--min_dose_n", type=int, default=20,  help="Minimum real rows for a (compound,dose) group to count.")
     p.add_argument("--cap_per_group", type=int, default=400,   help="Cap images per (compound,dose) group (speed).")
     p.add_argument("--cap_ref", type=int, default=2000,   help="Cap images per reference centroid (Mock / untreated-inf).")
@@ -89,7 +90,7 @@ def _parse_args():
     p.add_argument("--all_compounds", action="store_true",  help="Score every compound (1,669) instead of the 16-compound panel. Needs the embedding cache.")
     p.add_argument("--smoke", action="store_true",  help="Tiny run: 2 hits + 2 negs, small caps.")
     p.add_argument("--encoder", choices=("domain", "openphenom", "inception"), default="domain",  help="Feature space: domain ResNet18, Recursion openphenom, or inception.")
-    p.add_argument("--source", choices=("real", "generated", "augmented"), default="real",  help="Dataset the estimand uses: real (oracle), generated (every row replaced), or augmented (survivors + fill-in).")
+    p.add_argument("--source", choices=("real", "generated", "augmented", "roundtrip"), default="real",  help="Dataset the estimand uses: real (oracle), generated (every row replaced), or augmented (survivors + fill-in).")
     p.add_argument("--gen_anchors", action="store_true", help="Take the Mock / untreated-infected anchors from generated images too. Default: always real, so scales match.")
     p.add_argument("--dit_subdir", default="dit_naive_fm",   help="Generator arm to sample from (--source generated|augmented).")
     p.add_argument("--dit_subdir_exact", action="store_true", help="Use --dit_subdir verbatim, not rarity-tagged. Filling an ablation from a full-data arm is a CEILING, not a method.")
@@ -235,7 +236,16 @@ def main():
     dis = np.array([str(x) for x in meta["disease_condition"]])
     infected = (dis == cfg.population.disease_condition).astype(np.int64)
 
-    pool_mask = np.ones(len(comp), dtype=bool)
+    # `load_splits` restricts training to cfg.population (disease_condition AND
+    # cell_type); rows outside it stay on disk as real references. Scoring a
+    # generator on them measures a population it never trained on and cannot
+    # condition on -- 59% of a panel compound's rows are VERO.
+    cell = np.array([str(x) for x in meta["cell_type"]])
+    in_pop = np.ones(len(comp), dtype=bool)
+    if cfg.population.cell_type is not None and not args.no_population_filter:
+        in_pop &= cell == cfg.population.cell_type
+
+    pool_mask = in_pop.copy()
     if args.pool == "holdout":
         ho = load_splits(cfg)["holdout_idx"]
         pool_mask = np.zeros(len(comp), dtype=bool)
@@ -340,7 +350,36 @@ def main():
                 k = int(rng.integers(0, _qual_seen))
                 if k < args.quality_n:
                     _qual[k] = [int(i), imgs[j].detach().cpu()]
-    if args.source != "real":
+
+    # -- roundtrip: real images through the VAE encode/decode, NO diffusion.
+    # The ceiling on any latent-space generator: it can at best emit latents
+    # matching real ones, and those still decode to this, not to the real image.
+    if args.source == "roundtrip":
+        from src.data.dataset import (  # noqa: E402
+            LatentSpec, decode_latents, default_latent_path, encode_images,
+            load_vae)
+        _lspec = LatentSpec.load(default_latent_path(cfg))
+        _vae = load_vae(_lspec.vae, device)
+        print(f"[eval] source=roundtrip  VAE={_lspec.vae}  "
+              f"(encode->decode only, no diffusion)", flush=True)
+
+        def embed_roundtrip(idx):
+            idx = np.asarray(idx)
+            imgs = _load_real_images(cfg, idx, num_workers=args.num_workers,
+                                     batch_size=args.batch_size)
+            outs = []
+            for s0 in range(0, len(imgs), args.batch_size):
+                chunk = imgs[s0:s0 + args.batch_size].to(device)
+                z = encode_images(_vae, chunk, device)
+                outs.append(decode_latents(_vae, z, cfg.image.n_channels).cpu())
+            rt = torch.cat(outs, dim=0)
+            if args.quality_n:
+                _stash(idx, rt)
+            return _embed_tensor(rt)
+
+        embed_raw = embed_roundtrip
+
+    if args.source in ("generated", "augmented"):
         from src.data.build_dataset import context_for_rows  # noqa: E402
         from src.eval.generation import (  # noqa: E402
             LatentCtx, SampleTarget, _build_model, _generate_batch,
@@ -430,8 +469,12 @@ def main():
             fit_idx = fit_idx[rng.choice(len(fit_idx), args.cap_ref, replace=False)]
         print(f"[eval] TVN: fitting on {len(fit_idx)} {args.tvn_fit} rows "
               f"(center={args.tvn_center}, reg={args.tvn_reg})", flush=True)
+        # Fit on REAL vehicle wells ALWAYS. embed_raw is the generator under
+        # --source generated, and fitting the whitening on generated wells
+        # calibrates it to the generator's own collapsed covariance while the
+        # anchors below stay real -- an incoherent frame that inflated G ~6x.
         tvn = TVN(reg=args.tvn_reg).fit(
-            embed_raw(fit_idx),
+            _real_embed_raw(fit_idx),
             None if batch_key is None else batch_key[fit_idx])
         print(f"[eval] TVN: {len(tvn.group_means_)} batch means", flush=True)
 
@@ -441,6 +484,7 @@ def main():
                 None if batch_key is None else batch_key[np.asarray(idx)])
 
         tvn_meta = {"fit": args.tvn_fit, "center": args.tvn_center,
+                    "fit_source": "real",
                     "reg": args.tvn_reg, "n_fit_rows": int(len(fit_idx)),
                     "n_batches": len(tvn.group_means_)}
 
@@ -488,8 +532,26 @@ def main():
 
     Y_uinf = Y(mu_uinf)                       # == G by construction
     Y_ctrlmix = Y(mu_ctrlmix)                 # OLD anchor projection
+
+    # WITHIN-SOURCE vehicle anchor. `rescue` measures a generated centroid against
+    # a REAL mock anchor, so the real-vs-generated offset never cancels; the ate_*
+    # fields below contrast each source against ITS OWN vehicle instead, which is
+    # what makes them a treatment effect rather than a domain gap. Same ruler
+    # (u_hat, G stay real) so the two sources are still on one scale.
+    mu_uinf_src = (mu_uinf if args.source == "real"
+                   else centroid(uinf_mask, args.cap_ref)[0])
+    Y_uinf_src = Y(mu_uinf_src)
     print(f"[eval] infect_gap G={G:.3f}  Y_uinf={Y_uinf:.3f}  "
           f"Y_mock=0  Y_control_mixture={Y_ctrlmix:.3f}")
+    print(f"[eval] within-source vehicle anchor Y={Y_uinf_src:.3f} "
+          f"({Y_uinf_src / G:+.3f} G); offset vs real vehicle "
+          f"{(Y_uinf_src - Y_uinf) / G:+.3f} G", flush=True)
+
+    def _ate(y):
+        """Rescue relative to this source's OWN vehicle. 0 = no better than
+        vehicle, 1 = all the way to mock. Identical to `rescue` on --source real,
+        where Y_uinf_src == G by construction."""
+        return (Y_uinf_src - y) / G
 
     # -- per compound, dose-resolved ----------------------------------------
     results = []
@@ -513,6 +575,7 @@ def main():
             y_d = Y(mu_d)
             dose_rows.append({"log10_conc": float(d), "n": nd,
                               "Y": y_d, "rescue": (G - y_d) / G,
+                              "ate": _ate(y_d),
                               "cos_mock": _cos(mu_d, mu_mock),
                               "cos_uinf": _cos(mu_d, mu_uinf)})
 
@@ -521,6 +584,16 @@ def main():
         rescue_pool = (G - y_pool) / G
         old_ate = y_pool - Y_ctrlmix          # the dml_ate-style mixture contrast
 
+        # Dose slope, not max. `rescue_best` is a max over 8 noisy dose points, so
+        # it tracks the dose curve's SPREAD (r=0.99 with its sd, on real data too)
+        # and carries a selection bias that differs between sources. A slope
+        # differences out the compound-specific offset instead of averaging it in.
+        ate_slope = None
+        if len(dose_rows) >= 3:
+            xs = np.array([r["log10_conc"] for r in dose_rows], dtype=np.float64)
+            ys = np.array([r["ate"] for r in dose_rows], dtype=np.float64)
+            ate_slope = float(np.polyfit(xs, ys, 1)[0])
+
         best = max(dose_rows, key=lambda r: r["rescue"]) if dose_rows else None
         rec = {
             "name": nm, "idx": cid, "label": label, "n": n_c,
@@ -528,6 +601,10 @@ def main():
             "old_ate_mixture": old_ate,
             "rescue_best": (best["rescue"] if best else rescue_pool),
             "best_dose_log10_conc": (best["log10_conc"] if best else None),
+            "ate_pooled": _ate(y_pool),
+            "ate_slope": ate_slope,
+            "ate_max": (max(r["ate"] for r in dose_rows) if dose_rows
+                        else _ate(y_pool)),
             "cos_mock_pooled": _cos(mu_pool, mu_mock),
             "cos_uinf_pooled": _cos(mu_pool, mu_uinf),
             "dose_curve": dose_rows,
@@ -549,6 +626,11 @@ def main():
         return (float(np.mean(v[labels == 1])) if (labels == 1).any() else float("nan"),
                 float(np.mean(v[labels == 0])) if (labels == 0).any() else float("nan"))
 
+    def _lab_block(v):
+        h, n = split_mean(v)
+        return {"hits_mean": h, "neg_mean": n, "separation": h - n,
+                "auroc": _auroc(v, labels)}
+
     h_best, n_best = split_mean(rescue_best)
     h_pool, n_pool = split_mean(rescue_pool)
     h_old, n_old = split_mean(old_ate)
@@ -557,6 +639,8 @@ def main():
     effects = {
         "infect_gap_G": G,
         "Y_control_mixture": Y_ctrlmix,
+        "Y_vehicle_within_source": Y_uinf_src,
+        "vehicle_offset_G": (Y_uinf_src - Y_uinf) / G,
         "n_scored": int(len(ok)),
         "n_skipped": int(len(results) - len(ok)),
         "n_hits": int((labels == 1).sum()),
@@ -571,6 +655,8 @@ def main():
         "rescue_pooled": {"hits_mean": h_pool, "neg_mean": n_pool,
                           "separation": h_pool - n_pool,
                           "auroc": _auroc(rescue_pool, labels)},
+        "ate_pooled": _lab_block(np.array([r.get("ate_pooled", 0.0) for r in ok])),
+        "ate_slope": _lab_block(np.array([(r.get("ate_slope") or 0.0) for r in ok])),
         # The retired mixture-anchored contrast
         "old_mixture_ate": {"hits_mean": h_old, "neg_mean": n_old,
                             "separation": n_old - h_old,
@@ -602,10 +688,31 @@ def main():
                      # If these disagree the two runs scored different compound sets, and `vs_labels.auroc` is not directly comparable to the oracle's.
                      "n_matched": int(len(pairs)),
                      "n_unmatched": int(len(ok) - len(pairs))}
-        for key in ("rescue_best", "rescue_pooled"):
-            est = np.array([e[key] for e, _ in pairs], dtype=np.float64)
-            tru = np.array([t[key] for _, t in pairs], dtype=np.float64)
+        for key in ("rescue_best", "rescue_pooled",
+                    "ate_pooled", "ate_slope", "ate_max"):
+            kp = [(e, t) for e, t in pairs
+                  if e.get(key) is not None and t.get(key) is not None]
+            if not kp:
+                continue
+            est = np.array([e[key] for e, _ in kp], dtype=np.float64)
+            tru = np.array([t[key] for _, t in kp], dtype=np.float64)
             vs_oracle[key] = _accuracy(est, tru)
+            vs_oracle[key]["n"] = int(len(kp))
+
+        # The strongest comparison available: every (compound, dose) arm, matched
+        # one to one against the balanced-design truth. ~120 points with a known
+        # answer, instead of 16 scored against curated labels.
+        est_d, tru_d = [], []
+        for e, t in pairs:
+            tc = {round(r["log10_conc"], 3): r for r in t.get("dose_curve", [])}
+            for r in e.get("dose_curve", []):
+                m = tc.get(round(r["log10_conc"], 3))
+                if m is not None and "ate" in r and "ate" in m:
+                    est_d.append(r["ate"]); tru_d.append(m["ate"])
+        if len(est_d) >= 3:
+            vs_oracle["ate_per_arm"] = _accuracy(np.array(est_d, dtype=np.float64),
+                                                 np.array(tru_d, dtype=np.float64))
+            vs_oracle["ate_per_arm"]["n"] = int(len(est_d))
         if truth_doc.get("encoder") != args.encoder:
             print(f"[eval] WARNING: truth encoder={truth_doc.get('encoder')} but this "
                   f"run used {args.encoder}; the two are not on a common scale.")
@@ -675,12 +782,15 @@ def main():
         # Provenance. Without this a generated/augmented panel is indistinguishable from the real oracle except by filename
         "source": args.source,
         "anchors": "generated" if args.gen_anchors else "real",
-        "generator": (None if args.source == "real" else {
+        "generator": (None if args.source in ("real", "roundtrip") else {
             "dit_subdir": args.dit_subdir, "gen_epoch": args.gen_epoch,
             "which_wgt": args.which_wgt, "guidance_scale": args.guidance_scale,
             "num_inference_steps": args.num_inference_steps,
         }),
         "seed": args.seed,
+        "population_cell_type": (None if args.no_population_filter
+                                 else cfg.population.cell_type),
+        "n_rows_in_population": int(in_pop.sum()),
         # per_compound stays top level: ten downstream scorers index it.
         "per_compound": results,
         "effects": effects,
@@ -688,11 +798,17 @@ def main():
         "quality": quality,
     }
     # Tag non-default encoders into the filename: `rescue_panel.json` 
+    # TVN belongs in the tag: it changes the feature space, so a raw and a
+    # whitened run are different results, not reruns of the same one.
     etag = "" if args.encoder == "domain" else f"_{args.encoder}"
+    if args.tvn:
+        etag += f"_tvn-{args.tvn_fit}-{args.tvn_center}"
     # Same for the dataset axis: a generated run depends on which arm, epoch and seed produced it. 
     # Untagged they would all overwrite rescue_panel.json -- the real-data oracle downstream scorers read as ground truth.
     if args.source == "real":
         stag = ""
+    elif args.source == "roundtrip":
+        stag = "_roundtrip"
     else:
         stag = f"_{args.source}_{gen_subdir}_ep{args.gen_epoch:04d}"
         if abs(args.guidance_scale - 1.0) > 1e-6:
@@ -701,17 +817,21 @@ def main():
             stag += f"_s{args.seed}"
 
     #  `--pool kept` measures the  SURVIVING rows of one specific ablation, so it is a different panel from the full-data oracle and must not land on its path. 
+    # Every artifact written before 2026-09-02 pooled all cell types. Tag the
+    # filtered runs so they cannot land on those paths.
+    cttag = ("" if (args.no_population_filter or cfg.population.cell_type is None)
+             else f"_{cfg.population.cell_type}")
     if args.pool == "all":
-        ptag = ""
+        ptag = cttag
     elif args.pool == "kept":
-        ptag = f"_poolkept_{rcfg.tag}"
+        ptag = f"{cttag}_poolkept_{rcfg.tag}"
     else:
-        ptag = f"_pool{args.pool}"
+        ptag = f"{cttag}_pool{args.pool}"
     out_path = args.out or os.path.join(
         cfg.paths.train_output_dir, "eval_artifacts",
         f"rescue_panel{etag}{ptag}{stag}.json")
     oracle_path = os.path.join(cfg.paths.train_output_dir, "eval_artifacts",
-                               f"rescue_panel{etag}.json")
+                               f"rescue_panel{etag}{cttag}.json")
     if ((args.source != "real" or args.pool != "all")
             and os.path.abspath(out_path) == os.path.abspath(oracle_path)):
         raise RuntimeError(
@@ -723,7 +843,9 @@ def main():
 
     print(f"\n=== EFFECTS (n={effects['n_scored']} scored, "
           f"{effects['n_hits']} hits / {effects['n_negatives']} negatives) ===")
-    for nm, v in (("rescue (best dose)", "rescue_best"),
+    for nm, v in (("ATE vs own vehicle (pooled)", "ate_pooled"),
+                  ("ATE dose slope", "ate_slope"),
+                  ("rescue (best dose)", "rescue_best"),
                   ("rescue (dose-pooled)", "rescue_pooled"),
                   ("OLD mixture-anchored", "old_mixture_ate")):
         d = vs_labels[v]

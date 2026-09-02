@@ -168,6 +168,7 @@ def _generate_batch(
     seed: int,
     guidance_scale: float = 1.0,
     latent_ctx: "LatentCtx | None" = None,
+    return_latents: bool = False,
 ) -> torch.Tensor:
     """Generate one batch of images for the provided targets. 
     Returns (B, 5, 128, 128) in [-1, 1] -- ALWAYS pixels.
@@ -217,8 +218,11 @@ def _generate_batch(
         x = scheduler.step(pred, t, x).prev_sample
     if latent_ctx is not None:
         # Back to pixels
-        return latent_ctx.decode(x)
-    return x.clamp(-1, 1)
+        out = latent_ctx.decode(x)
+    else:
+        out = x.clamp(-1, 1)
+    # `return_latents` hands back the pre-decode tensor too, so we can check differences before codec
+    return (out, x) if return_latents else out
 
 
 # ---------------------------------------------------------------------------

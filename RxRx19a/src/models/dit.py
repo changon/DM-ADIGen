@@ -45,6 +45,11 @@ from diffusers.utils import BaseOutput
 
 from .conditioning import CondEmbedder, CondSpec
 
+# adaln: every field is summed into one vector -> one modulation for all patches.
+# xattn: the same adaLN path, PLUS role-A fields as cross-attention tokens, so a
+# patch can weight a field by its own content. Additive and zero-initialised.
+COND_MODES = ("adaln", "xattn")
+
 try:
     from timm.models.vision_transformer import Attention, Mlp, PatchEmbed
 except ImportError as e:  # pragma: no cover
@@ -118,13 +123,45 @@ class TimestepEmbedder(nn.Module):
 # Core DiT blocks (verbatim from the reference implementation)
 # ---------------------------------------------------------------------------
 
-class DiTBlock(nn.Module):
-    """A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning."""
+class CrossAttention(nn.Module):
+    """Image tokens (Q) attend to conditioning tokens (K, V).
+    """
 
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+    def __init__(self, hidden_size, num_heads):
+        super().__init__()
+        if hidden_size % num_heads:
+            raise ValueError(f"hidden_size {hidden_size} not divisible by {num_heads} heads")
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.q = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.kv = nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+        self.proj = nn.Linear(hidden_size, hidden_size, bias=True)
+
+    def forward(self, x, ctok):
+        B, N, C = x.shape
+        K = ctok.shape[1]
+        q = self.q(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        kv = (self.kv(ctok).reshape(B, K, 2, self.num_heads, self.head_dim)
+              .permute(2, 0, 3, 1, 4))
+        o = torch.nn.functional.scaled_dot_product_attention(q, kv[0], kv[1])
+        return self.proj(o.transpose(1, 2).reshape(B, N, C))
+
+
+class DiTBlock(nn.Module):
+    """A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+
+    `cross_attn=True` adds a conditioning-token sublayer. Its output projection
+    is zero-initialised, so the block starts identical to the adaLN-only model.
+    """
+
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, cross_attn=False,
+                 **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.norm_x = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6) \
+            if cross_attn else None
+        self.cross_attn = CrossAttention(hidden_size, num_heads) if cross_attn else None
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")  # noqa: E731
@@ -135,10 +172,12 @@ class DiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True),
         )
 
-    def forward(self, x, c):
+    def forward(self, x, c, ctok=None):
         (shift_msa, scale_msa, gate_msa,
          shift_mlp, scale_mlp, gate_mlp) = self.adaLN_modulation(c).chunk(6, dim=1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        if self.cross_attn is not None and ctok is not None:
+            x = x + self.cross_attn(self.norm_x(x), ctok)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -239,8 +278,11 @@ class DiT2DModel(nn.Module):
         num_heads: int = 12,
         mlp_ratio: float = 4.0,
         class_dropout_prob: float = 0.0,
+        cond_mode: str = "adaln",
     ):
         super().__init__()
+        if cond_mode not in COND_MODES:
+            raise ValueError(f"cond_mode must be one of {COND_MODES}, got {cond_mode!r}")
         if sample_size % patch_size != 0:
             raise ValueError(
                 f"sample_size ({sample_size}) must be divisible by patch_size ({patch_size})"
@@ -263,7 +305,8 @@ class DiT2DModel(nn.Module):
 
         self.x_embedder = PatchEmbed(sample_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.cond_embedder = CondEmbedder(cond_spec, hidden_size)
+        self.cond_embedder = CondEmbedder(
+            cond_spec, hidden_size, cfg_null=class_dropout_prob > 0)
 
         num_patches = self.x_embedder.num_patches
         # Fixed (sin-cos) positional embedding — frozen. Kept, so checkpoints can be loaded in.
@@ -271,8 +314,22 @@ class DiT2DModel(nn.Module):
             "pos_embed", torch.zeros(1, num_patches, hidden_size), persistent=True
         )
 
+        # xattn is a superset of adaln: the adaLN path is unchanged and the cross-attn output projection starts at zero
+        self.cond_mode = cond_mode
+        self._xattn = cond_mode == "xattn"
+        if self._xattn:
+            n_act = sum(1 for f in cond_spec if f.role == "A")
+            if n_act == 0:
+                raise ValueError(
+                    "cond_mode='xattn' needs at least one role-A field to use as a "
+                    "conditioning token; this spec has none.")
+            # A learned code per slot, so the model can tell the fields apart. 
+            self.cond_token_type = nn.Parameter(torch.zeros(1, n_act, hidden_size))
+
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
+                     cross_attn=self._xattn)
+            for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, out_channels)
         self.gradient_checkpointing = False
@@ -311,6 +368,13 @@ class DiT2DModel(nn.Module):
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        # Zero the cross-attn output projection: the xattn pathway starts closed and opens only as it earns gradient, exactly as adaLN-Zero does.
+        if self._xattn:
+            nn.init.normal_(self.cond_token_type, std=0.02)
+            for block in self.blocks:
+                nn.init.constant_(block.cross_attn.proj.weight, 0)
+                nn.init.constant_(block.cross_attn.proj.bias, 0)
 
         # Zero-out output layers:
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
@@ -384,11 +448,17 @@ class DiT2DModel(nn.Module):
         x = self.x_embedder(sample) + self.pos_embed                       # (N, T, D)
         c = self.t_embedder(t) + self.cond_embedder(cond, drop, terms_out)  # (N, D)
 
+        # Same embedders as the adaLN sum, kept separate so attention can address each field; None under cond_mode='adaln', which skips the branch.
+        ctok = None
+        if self._xattn:
+            ctok = (self.cond_embedder.field_tokens(cond, drop) + self.cond_token_type).to(x.dtype)
+
         for block in self.blocks:
             if self.gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(block, x, c, use_reentrant=False)
+                x = torch.utils.checkpoint.checkpoint(block, x, c, ctok,
+                                                      use_reentrant=False)
             else:
-                x = block(x, c)                                            # (N, T, D)
+                x = block(x, c, ctok)                                      # (N, T, D)
 
         x = self.final_layer(x, c)                       # (N, T, patch**2 * C_out)
         out = self.unpatchify(x)                         # (N, C_out, H, W)

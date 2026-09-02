@@ -37,7 +37,8 @@ from src.data.rarity import (  # noqa: E402
     rarity_from_args,
     tagged_nuisance_dir,
 )
-from src.spec import CaseConfig, default_config  # noqa: E402
+from src.spec import (  # noqa: E402
+    CaseConfig, add_adjustment_set_cli, config_from_args, default_config)
 
 
 # ---------------------------------------------------------------------------
@@ -287,11 +288,12 @@ def main():
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--force_retrain", action="store_true")
+    add_adjustment_set_cli(p)
     add_rarity_cli_args(p)
     a = p.parse_args()
     rcfg = rarity_from_args(a)
     train(
-        default_config(),
+        config_from_args(a),
         epochs=a.epochs, batch_size=a.batch_size, lr=a.lr,
         val_frac=a.val_frac, num_workers=a.num_workers, seed=a.seed,
         force_retrain=a.force_retrain, rarity=rcfg,

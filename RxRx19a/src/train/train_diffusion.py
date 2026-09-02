@@ -29,7 +29,8 @@ from src.spec import (  # noqa: E402
     CaseConfig, add_adjustment_set_cli, config_from_args, default_config,
     invariance_env_fields)
 from src.models import (  # noqa: E402
-    DIT_SIZES, arch_spec, build_generator, read_arch_spec, write_arch_spec)
+    COND_MODES, DIT_SIZES, arch_spec, build_generator, read_arch_spec,
+    write_arch_spec)
 from src.processes import make_train_scheduler, training_target  # noqa: E402
 from src.data.splits import load_splits  # noqa: E402
 from src.data.dataset import (  # noqa: E402
@@ -161,6 +162,10 @@ def _validation_loss(
     fm=None,
 ) -> float:
     """Held-out denoising MSE at *factual* conditioning, unweighted.
+
+    Always independent coupling, even when the arm trains with coupling=ot: OT
+    lowers the target variance and so lowers the loss for free. Holding the
+    pairing fixed keeps val_loss one metric that compares across arms.
     """
     was_training = model.training
     model.eval()
@@ -208,6 +213,7 @@ class TrainArgs:
     train_batch_size: int
     learning_rate: float
     lr_warmup_epochs: int
+    reset_lr: float
     checkpoint_every_epochs: int
     resume_epoch: int | None
     resume_from_checkpoint: str | None
@@ -233,6 +239,10 @@ class TrainArgs:
     dr_weights_file: str
     zero_snr: bool
     diffusion_method: str
+    tau_dist: str
+    tau_ln_m: float
+    tau_ln_s: float
+    coupling: str
     dr_weight_normalize: int
     invariance_lambda: float
     invariance_env: str
@@ -245,6 +255,7 @@ class TrainArgs:
     environment_set: str | None
     population_compounds: str | None
     include_env: bool
+    dose_encoding: str
 
 
 def _parse_args() -> TrainArgs:
@@ -254,6 +265,8 @@ def _parse_args() -> TrainArgs:
     p.add_argument("--train_batch_size", type=int, default=8)
     p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--lr_warmup_epochs", type=int, default=2)
+    p.add_argument("--reset_lr", type=float, default=0.0,
+                   help="On resume only: restart the LR schedule at this value. load_state restores the saved scheduler, so --learning_rate is otherwise ignored when resuming. 0 = off (keep the checkpoint's decayed LR).")
     p.add_argument("--checkpoint_every", type=int, default=20, help="Save a checkpoint every N epochs.")
     p.add_argument("--resume_epoch", type=int, default=None)
     p.add_argument("--resume_from_checkpoint", type=str, default=None)
@@ -265,15 +278,19 @@ def _parse_args() -> TrainArgs:
     p.add_argument("--val_cap", type=int, default=2000, help="Max holdout rows used to estimate the validation. 0 = use the full holdout.")
     p.add_argument("--max_steps", type=int, default=0, help="Stop each epoch after N optimizer steps. 0 = full epoch.")
     p.add_argument("--val_every", type=int, default=1,  help="Compute + log validation loss every N epochs.")
-
     p.add_argument("--arch", type=str, default="dit", choices=("dit",), help=" backbone spec ")
     p.add_argument("--dit_size", type=str, default="B", choices=tuple(DIT_SIZES), help="DiT config from the paper (S/B/L/XL).")
     p.add_argument("--patch_size", type=int, default=8,  help="DiT patch size. 8 -> 256 tokens at 128px; 4 -> 1024 tokens (sharper, ~4x the attention cost).")
-    p.add_argument("--cond_mode", type=str, default="adaln", choices=("adaln",), help="Conditioning transport; every field reaches the model via adaLN-Zero.")
+    p.add_argument("--cond_mode", type=str, default="adaln", choices=COND_MODES, help="Conditioning transport. 'adaln' sums every field into one vector, so one modulation applies to all patches. 'xattn' keeps that path and ADDS role-A fields as cross-attention tokens (zero-initialised), letting a patch weight a field by its own content.")
     p.add_argument("--class_dropout_prob", type=float, default=None, help="CFG dropout on the whole treatment; >0 gives guidance a true unconditional branch. Default 0.1.")
+    p.add_argument("--dose_encoding", type=str, default="scalar", choices=("scalar", "fourier", "level"), help="How dose enters conditioning. scalar = standardised value; fourier = Fourier bands; level = one embedding per observed dose. Recorded in arch.json.")
     p.add_argument("--dr_mode", type=str, default="conditional", choices=("conditional", "knn_dr"),  help="Training risk. 'knn_dr' weights the factual loss by fit_knn_dr's w; 'conditional' is unweighted.")
     p.add_argument("--zero_snr", type=int, default=1,  help="1 = zero-terminal-SNR betas + v-prediction; 0 = legacy eps/cosine. Not resume-compatible.")
     p.add_argument("--diffusion_method", type=str, default="ddpm", choices=("ddpm", "fm"), help="'ddpm' = VP cosine + DDIM/DDPM; 'fm' = flow matching via Euler ODE. Not resume-compatible.")
+    p.add_argument("--tau_dist", type=str, default="uniform", choices=("uniform", "logitnormal"), help="fm only. Where training mass lands over tau. 'logitnormal' = sigmoid(m + s*N(0,1)), the SD3 default, concentrating on mid/low noise. Recorded in arch.json.")
+    p.add_argument("--tau_ln_m", type=float, default=0.0, help="logitnormal mean. Convention here is tau=1 DATA, so m>0 shifts mass toward the low-noise end.")
+    p.add_argument("--tau_ln_s", type=float, default=1.0, help="logitnormal scale.")
+    p.add_argument("--coupling", type=str, default="independent", choices=("independent", "ot"), help="fm only. How a data row is paired with a noise draw. 'independent' = fresh randn per row, leaving the target x0-noise with irreducible variance at every tau. 'ot' = minibatch optimal-transport permutation, which preserves both marginals (so the estimand is unchanged) and cuts target variance. Recorded in arch.json.")
     p.add_argument("--dr_weight_normalize", type=int, default=1, help="Rescale weights so losses are comparable from dr vs. non dr")
     p.add_argument("--invariance_lambda", type=float, default=0.0, help="V-REx penalty weight: loss = mean_e[L_e] + lam*Var_e[L_e]")
     p.add_argument("--invariance_env", type=str, default=None, choices=["plate", "experiment", "cell_type"])
@@ -294,6 +311,7 @@ def _parse_args() -> TrainArgs:
         train_batch_size=a.train_batch_size,
         learning_rate=a.learning_rate,
         lr_warmup_epochs=a.lr_warmup_epochs,
+        reset_lr=float(a.reset_lr),
         checkpoint_every_epochs=a.checkpoint_every,
         resume_epoch=a.resume_epoch,
         resume_from_checkpoint=a.resume_from_checkpoint,
@@ -319,6 +337,10 @@ def _parse_args() -> TrainArgs:
         dr_weights_file=a.dr_weights_file,
         zero_snr=bool(a.zero_snr),
         diffusion_method=a.diffusion_method,
+        tau_dist=str(a.tau_dist),
+        tau_ln_m=float(a.tau_ln_m),
+        tau_ln_s=float(a.tau_ln_s),
+        coupling=str(a.coupling),
         dr_weight_normalize=int(a.dr_weight_normalize),
         invariance_lambda=float(a.invariance_lambda),
         invariance_env=a.invariance_env,
@@ -330,6 +352,7 @@ def _parse_args() -> TrainArgs:
         environment_set=a.environment_set,
         population_compounds=a.population_compounds,
         include_env=bool(a.include_env),
+        dose_encoding=str(a.dose_encoding),
     )
 
 
@@ -527,7 +550,9 @@ def main():
     _treated = ~np.asarray(train_ds.inner.ds["is_control"], dtype=bool) # treated
 
     # build spec
-    cond_spec = build_cond_spec(cfg, n_compounds, _lx_train[_treated], include_env=args.include_env)
+    cond_spec = build_cond_spec(cfg, n_compounds, _lx_train[_treated],
+                                include_env=args.include_env,
+                                dose_encoding=args.dose_encoding)
     accelerator.print(
         f"[init] cond_spec A={[f.name for f in cond_spec if f.role == 'A']} "
         f"C={[f.name for f in cond_spec if f.role == 'C']} "
@@ -539,6 +564,7 @@ def main():
         dit_size=args.dit_size,
         patch_size=args.patch_size,
         class_dropout_prob=args.class_dropout_prob,
+        cond_mode=args.cond_mode,
     )
     n_params = sum(p_.numel() for p_ in model.parameters())
     accelerator.print(
@@ -589,11 +615,23 @@ def main():
     # fm: straight-line flow matching (src/processes/flow_matching.py)
     fm = None
     if args.diffusion_method == "fm":
-        from src.processes import make_train_flow_matching
+        from src.processes import make_train_flow_matching, ot_couple
         noise_scheduler = None
-        fm = make_train_flow_matching()
+        fm = make_train_flow_matching(tau_dist=args.tau_dist,
+                                      tau_ln_m=args.tau_ln_m,
+                                      tau_ln_s=args.tau_ln_s)
+        _tau_desc = (f"logitnormal(m={fm.tau_ln_m:g}, s={fm.tau_ln_s:g})"
+                     if fm.tau_dist == "logitnormal" else "uniform")
         accelerator.print(
-            f"[init] flow matching: N={fm.num_train_timesteps} target=velocity(x0-noise)")
+            f"[init] flow matching: N={fm.num_train_timesteps} "
+            f"target=velocity(x0-noise) tau~{_tau_desc} coupling={args.coupling}")
+        # The OT plan treats every row as mass 1/B, but knn_dr targets the
+        # w_i-weighted measure, and w_i may be negative -- OT is undefined on a
+        # signed measure. The plan would be optimal for the wrong measure.
+        if args.coupling == "ot" and args.dr_mode == "knn_dr":
+            accelerator.print(
+                "[init] WARNING: coupling=ot with dr_mode=knn_dr -- the OT plan "
+                "ignores the DR weights it is supposed to reweight toward")
     else:
         noise_scheduler = make_train_scheduler(args.zero_snr)
         accelerator.print(
@@ -622,6 +660,19 @@ def main():
             _checks.insert(0, ("zero_snr", bool(_prior.get("zero_snr", False)),
                                bool(args.zero_snr),
                                "changes prediction_type, i.e. what the net outputs"))
+        # tau_dist changes what is optimised but not the target, so resume stays
+        # legal; arch.json is about to be overwritten, so say so out loud.
+        if args.diffusion_method == "fm":
+            _was_tau = _prior.get("tau_dist", "uniform")
+            if _was_tau != args.tau_dist:
+                accelerator.print(
+                    f"[init] WARNING: resuming a tau_dist={_was_tau!r} checkpoint "
+                    f"with tau_dist={args.tau_dist!r}; arch.json will record the new value")
+            _was_cpl = _prior.get("coupling", "independent")
+            if _was_cpl != args.coupling:
+                accelerator.print(
+                    f"[init] WARNING: resuming a coupling={_was_cpl!r} checkpoint "
+                    f"with coupling={args.coupling!r}; arch.json will record the new value")
         for _key, _was, _now, _why in _checks:
             # look through JSON so tuple-vs-list and int-vs-float from the file compare equal to the freshly built values.
             if json.dumps(_was, sort_keys=True) == json.dumps(_now, sort_keys=True):
@@ -640,6 +691,7 @@ def main():
             dit_size=args.dit_size,
             patch_size=args.patch_size,
             class_dropout_prob=args.class_dropout_prob,
+            cond_mode=args.cond_mode,
             n_channels=int(gen_channels),
             resolution=int(gen_res),
             # --- run-specific keys -----------
@@ -649,6 +701,12 @@ def main():
             latent_norm=bool(latent_spec.normalized) if latent_spec else False,
             zero_snr=bool(args.zero_snr),                              # schedules
             diffusion_method=args.diffusion_method,                    # schedules
+            # Training-time tau distribution. Sampling never reads it; provenance only
+            tau_dist=(fm.tau_dist if fm is not None else None),
+            tau_ln_m=(fm.tau_ln_m if fm is not None else None),
+            tau_ln_s=(fm.tau_ln_s if fm is not None else None),
+            # Training-time noise/data pairing. Sampling never reads it; provenance only
+            coupling=(args.coupling if fm is not None else None),
             # Index scale the denoiser was trained against: N for DDPM, the FM embedder scale (t = tau * N). 
             num_train_timesteps=int(
                 fm.num_train_timesteps if fm is not None
@@ -665,6 +723,26 @@ def main():
         _pin_fused_adamw(optimizer)
         start_epoch = completed_epoch + 1
         accelerator.print(f"[resume] from {resume_dir} -> starting epoch {start_epoch}")
+
+        # load_state restores scheduler.bin, so a resumed run keeps the decayed LR and
+        # ignores --learning_rate. --reset_lr restarts the decay from a chosen value.
+        # The scheduler must bind the INNER optimizer: torch's LRScheduler rejects
+        # accelerate's wrapper, which is not an Optimizer subclass.
+        if args.reset_lr > 0:
+            _inner_opt = getattr(optimizer, "optimizer", optimizer)
+            for _g in _inner_opt.param_groups:
+                _g["lr"] = _g["initial_lr"] = args.reset_lr
+            _fresh = ExponentialLR(
+                _inner_opt, gamma=0.5 ** (1.0 / (steps_per_epoch * args.lr_decay_every))
+            )
+            if hasattr(lr_scheduler, "scheduler"):
+                lr_scheduler.scheduler = _fresh
+            else:
+                lr_scheduler = _fresh
+            accelerator.print(
+                f"[resume] LR schedule reset: lr={args.reset_lr:g} "
+                f"half-life={args.lr_decay_every} epochs"
+            )
 
     if start_epoch >= args.num_epochs:
         accelerator.print(f"[done] start_epoch {start_epoch} >= num_epochs {args.num_epochs}")
@@ -704,6 +782,10 @@ def main():
 
             noise = torch.randn_like(image)
             if fm is not None:
+                # Permuting the NOISE leaves every data row with its own cond,
+                # env_id and dr_w, so only the pairing changes.
+                if args.coupling == "ot":
+                    noise = ot_couple(image, noise)
                 tau = fm.sample_tau(B, device)
                 noisy = fm.add_noise(image, noise, tau)
                 t = fm.model_timesteps(tau)

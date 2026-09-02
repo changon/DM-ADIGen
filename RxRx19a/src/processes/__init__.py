@@ -15,4 +15,4 @@ from .ddpm import (  # noqa: F401
     schedule_kwargs,
     zero_snr_from_arch,
 )
-from .flow_matching import FlowMatching, make_train_flow_matching  # noqa: F401
+from .flow_matching import FlowMatching, make_train_flow_matching, ot_couple  # noqa: F401
