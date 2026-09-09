@@ -30,6 +30,8 @@ pip install torch==2.4.1 torchvision==0.19.1 \
 pip install -r requirements.txt
 ```
 
+
+
 ### OpenPhenom encoder (optional, for `--encoder openphenom`)
 
 `src/eval/openphenom_encoder.py`
@@ -38,21 +40,13 @@ pip install -r requirements.txt
 git clone https://github.com/recursionpharma/maes_microscopy third_party/maes_microscopy
 ```
 
-Weights (`recursionpharma/OpenPhenom`) and the VAE (`ostris/vae-kl-f8-d16`) are pulled with `huggingface_hub.snapshot_download`. **Compute nodes are offline**, so warm the HF cache on the login node once, then run jobs with `HF_HUB_OFFLINE=1`.
-
-### Paths
-
-`src/spec.py` derives everything from `PROJECT_ROOT`, which defaults to this
-directory (`.../DM-ADIGen/RxRx19a`) and is overridable with `RXRX19A_ROOT`.
-
-> `RXRX19A_ROOT` must point at **this** directory (the one holding `src/`), not  
-> at the repo root — the slurm scripts `cd` into it and then run `python -m src...`.
+Weights (`recursionpharma/OpenPhenom`) and the VAE (`ostris/vae-kl-f8-d16`) are pulled with `huggingface_hub.snapshot_download`.
 
 ---
 
 ## 2. Data layout
 
-Unpack the Recursion RxRx19a download **as-is** inside this directory, so the distributed folder name nests once:
+Folder layout looks like the following, noting repeated name
 
 ```
 DM-ADIGen/RxRx19a/            <- PROJECT_ROOT (code: src/, scripts/)
@@ -65,7 +59,7 @@ DM-ADIGen/RxRx19a/            <- PROJECT_ROOT (code: src/, scripts/)
 
 ---
 
-## 2b. What on disk still matches the current spec
+## 2b. specs.
 
 `src/spec.py` holds information on (`FIELDS` → A/C/E roles, the context tensor's column order, `adjustment_set`).
 
@@ -77,19 +71,27 @@ Run in order. Each step is a SLURM launcher under `scripts/`.
 
 ```bash
 sbatch scripts/build_dataset.slurm
-#   python -m src.data.build_dataset --check-paths
-#   --limit N  builds only the first N rows (smoke test)
+#   python -m src.data.build_dataset --check-paths --limit N  # builds only the first N rows for testing
 ```
 
 Reads `metadata.csv`, builds the compound vocab, encodes covariates, attaches the per-site 5-channel image paths, saves an HF Arrow dataset.
 
-### 3.1 — Train/holdout split  →  `data/nuisances*/splits.json`
+### 3.1 — Build the the experimental setup  →  `data/nuisances_tier_k<k>_pg<γ>_s<seed>/`
 
 ```bash
-python -m src.data.splits --holdout-frac 0.20
+python -m src.data.build_tiered_split --plan       # power table, writes nothing
+python -m src.data.build_tiered_split --gamma 0    # unconfounded instance
+python -m src.data.build_tiered_split --gamma 2    # plate-confounded instance
 ```
 
-Stratified on `(disease_condition, compound_idx)`, we get splits that`fit_urr` and `train_diffusion` see `train_idx`, while the eval component is separate.
+Above k is the number of wells kept for holdout eval.
+
+This produces:
+
+- **test data** (k wells per scored evaluations)
+- **train+validation** (well-grouped, stratified 80/20 train/holdout)
+
+Above, the **experiment** introduces confounding by sampling prob of keeping, with probability π ∝ exp(−γ·z_position); α = 1/π recorded as `dr_weights_design.npz`.
 
 ### 3.2 — Encode VAE latents  →  `data/latents.npy`
 
@@ -98,41 +100,53 @@ sbatch scripts/encode_latents.slurm
 #   python scripts/encode_latents.py --batch_size 32 --num_workers 12
 ```
 
-Encodes all 305,520 sites once to `(N, 80, 16, 16)` fp16 with the 16-channel `ostris/vae-kl-f8-d16` VAE. Required by every `--latent 1` training arm.
+Encodes all 305,520 sites once to `(N, 80, 16, 16)` fp16 with the 16-channel `ostris/vae-kl-f8-d16` VAE.
 
-### 3.3 — Nuisances: Riesz alpha, then DR weights
+### 3.3 — Nuisances: alpha weights and cmean targets (all into the split dir)
+
+The **learned alpha, URR,** has two estimators:
 
 ```bash
-sbatch scripts/fit_urr.slurm          # -> data/nuisances/alpha_urr_fold{0,1}.pt
-sbatch scripts/fit_knn_dr.slurm       # -> data/nuisances/dr_weights_knn.npz
-#   python -m src.nuisances.fit_urr    --device cuda
-#   python -m src.nuisances.fit_knn_dr --device cuda
+# closed-form discrete URR: smoothed count ratio nu(a)/f_train(a). CPU.
+python -m src.nuisances.export_urr_weights --nuisance_dir <dir> --mode counts \
+    --out dr_weights_counts.npz          # validates against the design truth in-run
+
+# Riesz fit, then export:
+sbatch scripts/fit_urr.slurm --nuisance_dir <dir> --nu_rows <dir>/nu_rows_design.npy
+python -m src.nuisances.export_urr_weights --nuisance_dir <dir> --mode net
 ```
 
-`fit_urr` must run first — `fit_knn_dr` scores its cross-fitted alpha nets.
-`fit_knn_dr` is only needed for the `knn_dr` arm; the `conditional` arm skips both.
-For a rarity ablation: `sbatch scripts/fit_knn_dr.slurm <compound_frac> <keep_frac> <seed>`.
+We can incorporate a regularization for causal learning: add auxiliary loss encouraging that **conditional mean targets align** (`--cmean_lambda`):
+
+```bash
+sbatch scripts/cmean.slurm --nuisance_dir <dir>    # -> <dir>/cmean.npz
+```
 
 ### 3.4 — Train the generator arms  →  `runs/<subdir>/checkpoint-NNNN/`
 
 ```bash
-# sbatch scripts/train_dit_arm.slurm <dr_mode> <base_subdir> [cfrac kfrac seed]
-sbatch scripts/train_dit_arm.slurm conditional dit_conditional   # comparison arm
-sbatch scripts/train_dit_arm.slurm knn_dr      dit_dr        # DR arm
+# the launcher 
+NUIS=data/nuisances_tier_k2_pg0_s42 CONDMODE=xattn ENVSET=experiment INVLAM=1.0 \
+EPOCHS=100 CKPT_EVERY=25 sbatch scripts/dose_enc_arm.slurm scalar full
 ```
 
-Latent DiT-B/2, adaLN-Zero conditioning on `(t, compound, dose, is_control, infected, …)`, CFG dropout 0.1, 4×A6000, 100 epochs, batch 128. Useful env vars:
+The generator implied by this: latent DiT-B, patch 2, flow matching, **xattn conditioning** (role-A fields — compound, dose, is_control — enter as cross-attention tokens on top of the adaLN path `include_env=0`), scalar dose, uniform tau, V-REx over experiment.
+
+Some useful env vars:
 
 
-| var                   | effect                                                            |
-| --------------------- | ----------------------------------------------------------------- |
-| `DIFFUSION_METHOD=fm` | flow matching instead of DDPM (own subdir; not resume-compatible) |
-| `POS_GAMMA=1`         | confounded ablation (dose × plate-edge) instead of MCAR           |
-| `TRAIN_SEED=1`        | replicate run, tagged `_ts1` (a separate output dir)              |
-| `DRW=<file>`          | alternate kNN weight file (IPW / AIPW-raw ablations)              |
+| var                                           | effect                                       |
+| --------------------------------------------- | -------------------------------------------- |
+| `NUIS=<dir>`                                  | the split dir                                |
+| `DRMODE=knn_dr DRWFILE=dr_weights_design.npz` | α-weighted loss (design / counts / net file) |
+| `CMEAN=3.0`                                   | conditional-mean auxiliary loss weight       |
+| `CONDMODE=xattn`                              | cross-attention conditioning (vs `adaln`)    |
+|                                               |                                              |
 
 
-### 3.5 — Eval instruments (once, cached)
+Resume is automatic on requeue; `scripts/warm_restart_arm.slurm` restarts the LR schedule from a checkpoint (`--reset_lr`).
+
+### 3.5 — Eval setup. Caches the encoding data.
 
 ```bash
 sbatch scripts/train_fe.slurm 20 16          # domain ResNet18 (~2.3 h/epoch)
@@ -141,64 +155,58 @@ sbatch scripts/precompute_embeddings.slurm   # embed all real rows -> feat_cache
 
 ### 3.6 — Evaluate
 
-Real-data oracle first (no generator, minutes), then each arm against it:
+The train/test pair per arm:
 
 ```bash
-# oracle -> runs/eval_artifacts/rescue_panel.json
-sbatch scripts/eval.slurm
+NUIS=data/nuisances_tier_k2_pg0_s42
+ARM=dose_scalar_full_xattn_Eexperiment_lam1.0_tierk2pg0s42
+T=runs/eval_artifacts/rescue_panel_openphenom_tvn-vehicle-experiment_HRCE
 
-# a generator arm, scored against that oracle
-sbatch scripts/eval.slurm "" "" "" --source generated --dit_subdir dit_conditional \
-       --truth runs/eval_artifacts/rescue_panel.json
+# true effect computations: compute the in-sample (train wells) and out-of-sample (reserve wells) 'true effects'
+sbatch --array=0-0 scripts/panel_seeds.slurm --pool train   --nuisance_dir $NUIS
+sbatch --array=0-0 scripts/panel_seeds.slurm --pool reserve --nuisance_dir $NUIS
 
-# quick pipeline check
-sbatch scripts/eval.slurm "" "" "" --smoke
+# the generated pairings, compared to the true effects above.
+sbatch --array=0-0 scripts/panel_seeds.slurm --pool train   --nuisance_dir $NUIS \
+    --source generated --dit_subdir $ARM --gen_epoch 99 --truth ${T}_pooltrain.json
+sbatch --array=0-0 scripts/panel_seeds.slurm --pool reserve --nuisance_dir $NUIS \
+    --source generated --dit_subdir $ARM --gen_epoch 99 --truth ${T}_poolreserve.json
 ```
 
+`--array=0-N` runs N+1 seeds (generation noise); aggregate with`scripts/panel_agg.py`. 
 
-
-```bash
-python -m src.eval.evaluate --device cuda --num_workers 8 --source real
-```
+Latent-space scoring: `scripts/score_reserve.slurm` (reserve truth) and `scripts/rank_library.py`(all 1,669 compounds).
 
 ## 4. Evaluation, in more detail
 
 `src/eval/evaluate.py` runs:
 
-1. **EFFECTS** — per-compound treatment effect on the rescue axis, plus hits-vs-negatives separation and AUROC over the curated 16-compound panel (`--all_compounds` scores all 1,669 instead).
-2. **ACCURACY** (`--truth`) — MSE / bias / Spearman of those effects against the real-data oracle. *This* is the number that says whether a generator reproduces the causal quantity.
-3. **QUALITY** — FID + KID (Inception) and FID + MMD (domain ResNet18), marginal and per dose-bin, on row-matched (real, generated) pairs, plus the TRTS conditioning check.
+1. **EFFECTS** — per-compound (and per-dose) ATE on the infection axis.
+2. **ACCURACY** — `vs_literature` (separation of curated actives from inactive controls) and `vs_oracle` (`--truth`): pearson /  spearman / bias / calibration slope per statistic
+3. **QUALITY** — FID/KID (Inception) + FID/MMD (domain), marginal and per dose-bin, plus the classifier conditioning probe.
 
-Useful flags: 
+- `--pool {all,train,holdout,reserve}` picks the rows
+- `train` vs`reserve` is the in-sample/out-of-sample pair
+- `--encoder {domain,openphenom,inception}`
+- `--nuisance_dir` supplies every split-dependent input. 
 
-`--encoder {domain,openphenom,inception}` 
-
-`--pool {all,holdout,kept}`,
-`--guidance_scale`, `--num_inference_steps`, `--gen_epoch`.
-
-Output (atomic): `runs/eval_artifacts/rescue_panel*.json`.
+Output: `runs/eval_artifacts/rescue_panel*.json`; `--save_centroids` adds a `_centroids.npz` sidecar (full displacement vectors, for`scripts/vector_ate.py`).
 
 ---
 
 ## 5. Repo layout
 
-- `src/spec.py` — the contract: treatment columns, covariates, image channels/resolution, dose grid, population restriction, and all I/O paths.
+- `src/spec.py` — the contract: FIELDS (the single role declaration, A/C/E), action/covariate/image specs, population, all I/O paths.
 - `src/data/`
   - `build_dataset.py` — metadata/images → HF tabular dataset.
-  - `splits.py` — stratified train/holdout split.
-  - `dataset.py` — images/latents + tabular rows → training batches; VAE loading.
-  - `rarity.py` — the scarcity / confounding ablation (`--rare-*` flags, dir tags).
+  - `build_tiered_split.py` — **the experiment builder**: reserve, split, tiers, design weights, ν pool → in one dir.
+  - `dataset.py` — latents/images + rows → batches; cond spec + tensors (`cond_from_arrays` owns the dose→NaN-for-controls rule); VAE loading.
 - `src/nuisances/`
-  - `alpha_net.py` — Riesz `alpha` architecture.
-  - `fit_urr.py` — URR Riesz fitting and loss
-  - `knn_dr.py` / `fit_knn_dr.py` — NN AIPW weight. Derive `dr_weights_knn.npz`, the only nuisance artifact the trainer reads.
-  - `alpha_truth_check.py` — known-truth check on the estimator.
-- `src/models/` — `dit.py` (DiT with adaLN-Zero), `conditioning.py` (`CondSpec`).
-- `src/processes/` — `ddpm.py` , `flow_matching.py`
-- `src/train/train_diffusion.py` — the trainer; writes `arch.json` next to the checkpoints so eval reconstructs the model with no flags to remember.
-- `src/eval/` — `evaluate.py` (entry point), `generation.py`, `dist_metrics.py`,
-`feature_extractor.py` (domain ResNet18), `openphenom_encoder.py` (+ TVN),
-`prediction_transfer.py`.
-- `scripts/` — SLURM launchers plus standalone analysis scripts  
-(`rxrx19a_multiarm_dr.py`, `sdedit_probe.py`, `xy_effect.py`, …).
+  - `alpha_net.py` / `fit_urr.py` —  Riesz α (with `--shrink_to_one`).
+  - `export_urr_weights.py` — fitted or **counts** α to an npz → `dr_weights_*.npz`.
+  - `precompute_cmean.py` — per-action latent means for the τ=0 aux loss.
+- `src/models/` — `dit.py` (DiT, adaLN-Zero + optional cross-attention conditioning)
+- `src/processes/` — `ddpm.py`, `flow_matching.py`.
+- `src/train/train_diffusion.py` — the trainer including α-weighted loss, cmean aux loss, invariance loss;  writes `arch.json` so eval reconstructs the model based on one file
+- `src/eval/` — `evaluate.py` (entry point), `generation.py`, `dist_metrics.py`, `feature_extractor.py` (domain ResNet18),`openphenom_encoder.py` (+ TVN), `prediction_transfer.py`.
 

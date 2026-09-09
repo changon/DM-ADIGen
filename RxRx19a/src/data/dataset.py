@@ -277,8 +277,7 @@ DOSE_NONE = "none"          # level-0 label for a well with no dose (vehicle)
 def dose_levels(log10_conc_train: np.ndarray | torch.Tensor) -> tuple[str, ...]:
     """Level labels for a categorical dose, index order, with `none` at 0.
 
-    Labels are the formatted log10 values, so `arch.json` carries the grid a
-    checkpoint was trained on and eval cannot silently re-bin against another.
+    Labels are the formatted log10 values, so `arch.json` carries the grid a checkpoint was trained on and eval cannot silently re-bin against another.
     """
     x = np.asarray(log10_conc_train, dtype=np.float64)
     x = np.unique(x[np.isfinite(x)])
@@ -403,8 +402,7 @@ def cond_from_arrays(spec: CondSpec, *, compound, log10_conc, is_control,
                      context, device=None) -> dict[str, torch.Tensor]:
     """The `{field: tensor}` dict the model expects, from parallel arrays.
 
-    `context` is (N, F) codes in CONTEXT_FIELDS order; 
-    fields are looked up BY NAME through CONTEXT_COL. 
+    `context` is (N, F) codes in CONTEXT_FIELDS order;  fields are looked up BY NAME through CONTEXT_COL. 
     """
     def _t(x, dtype=None):
         v = x if torch.is_tensor(x) else torch.as_tensor(x)
@@ -435,6 +433,4 @@ def cond_from_arrays(spec: CondSpec, *, compound, log10_conc, is_control,
 
 def cond_from_batch(batch, spec: CondSpec, device=None) -> dict[str, torch.Tensor]:
     """Training-batch wrapper around `cond_from_arrays`."""
-    return cond_from_arrays(
-        spec, compound=batch["compound_idx"], log10_conc=batch["log10_conc"],
-        is_control=batch["is_control"], context=batch["context"], device=device)
+    return cond_from_arrays( spec, compound=batch["compound_idx"], log10_conc=batch["log10_conc"],  is_control=batch["is_control"], context=batch["context"], device=device)

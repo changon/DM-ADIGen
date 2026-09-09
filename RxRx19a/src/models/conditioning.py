@@ -379,13 +379,11 @@ class CondEmbedder(nn.Module):
         for p in self.nulls.values():
             nn.init.normal_(p, std=0.02)
 
-    def calibrate(self, probes: Mapping[str, torch.Tensor] | None = None,
-                  target: float | None = None,
-                  n_probe: int = 4096) -> dict[str, float]:
+    def calibrate(self, probes: Mapping[str, torch.Tensor] | None = None, target: float | None = None, n_probe: int = 4096) -> dict[str, float]:
         """Scale each continuous field's output layer so terms used in conditioning are comparable.
 
             With probes, we get values to know the loc/scale of training, enabling us to standardize meaningfully across all contexts.
-            Wihtout it, randn is used as a stand in for normalization. this is subject to conditioning imbalance.
+            Without it, randn is used as a stand in for normalization. this is subject to conditioning imbalance.
 
         Returns the applied factors, keyed by field, for logging.
         """
@@ -465,7 +463,7 @@ class CondEmbedder(nn.Module):
     def field_tokens(self, cond: Mapping[str, torch.Tensor],
                      drop: torch.Tensor | None = None,
                      roles: tuple[str, ...] = ("A",)) -> torch.Tensor:
-        """Per-field terms kept SEPARATE, as (N, k, hidden) tokens. The adaLN path sums these into one vector, which forces one modulation for each patch
+        """Per-field terms kept SEPARATE, as (N, k, hidden) tokens. The adaLN path sums these into one vector, which forces one modulation for each patch, xattn maintains each token separately for the xattn
         """
         names = [f.name for f in self.spec if f.role in roles]
         if not names:
@@ -480,8 +478,7 @@ class CondEmbedder(nn.Module):
         return torch.stack(
             [self._term(self.spec[nm], cond, drop, n) for nm in names], dim=1)
 
-    def _cat_term(self, f: Field, v: torch.Tensor,
-                  drop: torch.Tensor | None) -> torch.Tensor:
+    def _cat_term(self, f: Field, v: torch.Tensor, drop: torch.Tensor | None) -> torch.Tensor:
         idx = v.long()
         if idx.dim() != 1:
             idx = idx.reshape(idx.shape[0])

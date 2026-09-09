@@ -51,8 +51,9 @@ class TVN:
                            for x, g in zip(X, groups)])
         cov = np.cov(Xc, rowvar=False)
         w, V = np.linalg.eigh(cov)
+        self.eigs_raw_ = w.copy()                     # compute spectrum for dx
         w = np.clip(w, 0.0, None) + self.reg * float(np.mean(np.clip(w, 0.0, None)))
-        self.W_ = V / np.sqrt(w)                      # (d, d): project then scale
+        self.W_ = V / np.sqrt(w)                      # (d, d): project then scale, whitening matrix
         return self
 
     def transform(self, X: np.ndarray, groups=None) -> np.ndarray:

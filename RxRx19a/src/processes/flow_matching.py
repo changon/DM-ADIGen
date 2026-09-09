@@ -76,27 +76,5 @@ class FlowMatching:
         return SimpleNamespace(prev_sample=sample + self._dt * model_output)
 
 
-def ot_couple(x0: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
-    """Reorder `noise` so each row is paired with its minibatch-OT partner in x0.
-
-    A permutation preserves BOTH marginals, so p(x|a) and the estimand are
-    unchanged; only the pairing -- and the variance of the target x0 - noise --
-    differs. Solved per process on the local batch.
-    """
-    from scipy.optimize import linear_sum_assignment
-
-    B = x0.shape[0]
-    if B < 2:
-        return noise
-    a = x0.reshape(B, -1).float()
-    b = noise.reshape(B, -1).float()
-    cost = torch.cdist(a, b, p=2).pow(2)
-    _, col = linear_sum_assignment(cost.detach().cpu().numpy())
-    return noise[torch.as_tensor(col, device=noise.device, dtype=torch.long)]
-
-
-def make_train_flow_matching(num_train_timesteps: int = 1000,
-                             tau_dist: str = "uniform", tau_ln_m: float = 0.0,
-                             tau_ln_s: float = 1.0) -> FlowMatching:
-    return FlowMatching(num_train_timesteps, tau_dist=tau_dist,
-                        tau_ln_m=tau_ln_m, tau_ln_s=tau_ln_s)
+def make_train_flow_matching(num_train_timesteps: int = 1000, tau_dist: str = "uniform", tau_ln_m: float = 0.0, tau_ln_s: float = 1.0) -> FlowMatching:
+    return FlowMatching(num_train_timesteps, tau_dist=tau_dist, tau_ln_m=tau_ln_m, tau_ln_s=tau_ln_s)

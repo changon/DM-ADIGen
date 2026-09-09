@@ -31,12 +31,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.data.dataset import RxRx19aDataset  # noqa: E402
 from src.data.splits import load_splits  # noqa: E402
-from src.data.rarity import (  # noqa: E402
-    RarityConfig,
-    add_rarity_cli_args,
-    rarity_from_args,
-    tagged_nuisance_dir,
-)
 from src.spec import (  # noqa: E402
     CaseConfig, add_adjustment_set_cli, config_from_args, default_config)
 
@@ -118,15 +112,9 @@ class _LabeledRxRx(Dataset):
 # Checkpoint I/O
 # ---------------------------------------------------------------------------
 
-def feature_extractor_paths(
-    cfg: CaseConfig, rcfg: RarityConfig | None = None,
-) -> tuple[str, str]:
-    """Per-rarity feature-extractor checkpoint path.
-
-    Each ablation gets its own extractor (option (b)). When `rcfg` is None or inactive, returns the canonical (full-data) path used by the default eval.
-    """
-    suffix = f"_{rcfg.tag}" if (rcfg is not None and rcfg.active) else ""
-    out_dir = os.path.join(cfg.paths.train_output_dir, f"eval_artifacts{suffix}")
+def feature_extractor_paths(cfg: CaseConfig) -> tuple[str, str]:
+    """The canonical (full-data) extractor checkpoint path used by eval."""
+    out_dir = os.path.join(cfg.paths.train_output_dir, "eval_artifacts")
     return (
         os.path.join(out_dir, "feature_extractor.pt"),
         os.path.join(out_dir, "feature_extractor_meta.json"),
@@ -136,11 +124,10 @@ def feature_extractor_paths(
 def load_feature_extractor(
     cfg: CaseConfig | None = None,
     device: torch.device | str = "cpu",
-    rarity: RarityConfig | None = None,
 ) -> tuple[DomainResNet18, dict[str, int]]:
     """Load a previously trained extractor + the disease label encoder."""
     cfg = cfg or default_config()
-    ckpt_path, meta_path = feature_extractor_paths(cfg, rarity)
+    ckpt_path, meta_path = feature_extractor_paths(cfg)
     if not os.path.isfile(ckpt_path) or not os.path.isfile(meta_path):
         raise FileNotFoundError(
             f"Feature extractor not found. Train it first with "
@@ -164,8 +151,7 @@ def load_feature_extractor(
 
 def _split_within(pool: np.ndarray, val_frac: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
     """Internal 90/10 used for early stopping. `pool` is the canonical
-    train_idx (with rarity applied if active), so neither side leaks into the
-    holdout used by evaluate.py."""
+    train_idx, so neither side leaks into the holdout used by evaluate.py."""
     rng = np.random.default_rng(seed)
     perm = rng.permutation(pool.shape[0])
     n_val = int(round(pool.shape[0] * val_frac))
@@ -181,14 +167,8 @@ def train(
     num_workers: int = 4,
     seed: int = 0,
     force_retrain: bool = False,
-    rarity: RarityConfig | None = None,
 ) -> None:
-    rarity = rarity or RarityConfig()
-    # When rarity is active, the canonical train_idx lives in the tagged nuisance dir; redirect cfg.paths.nuisance_dir so load_splits finds it.
-    if rarity.active:
-        cfg.paths.nuisance_dir = tagged_nuisance_dir(cfg, rarity)
-
-    ckpt_path, meta_path = feature_extractor_paths(cfg, rarity)
+    ckpt_path, meta_path = feature_extractor_paths(cfg)
     if os.path.isfile(ckpt_path) and not force_retrain:
         print(f"[feature_extractor] checkpoint already exists at {ckpt_path}; skipping.")
         return
@@ -206,8 +186,7 @@ def train(
     val_ds = _LabeledRxRx(cfg, val_idx, label_enc)
     print(f"[feature_extractor] pool n={pool.shape[0]} "
           f"(holdout={splits['holdout_idx'].shape[0]} excluded), "
-          f"train n={len(train_ds)}, val n={len(val_ds)}"
-          + (f" [rarity={rarity.tag}]" if rarity.active else ""))
+          f"train n={len(train_ds)}, val n={len(val_ds)}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DomainResNet18(n_channels=cfg.image.n_channels, n_classes=n_classes).to(device)
@@ -271,7 +250,6 @@ def train(
                     "label_encoder": label_enc,
                     "val_acc": val_acc,
                     "epochs_run": ep + 1,
-                    "rarity": rarity.to_dict(),
                     "pool_size": int(pool.shape[0]),
                     "holdout_size_excluded": int(splits["holdout_idx"].shape[0]),
                 }, f, indent=2)
@@ -289,14 +267,12 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--force_retrain", action="store_true")
     add_adjustment_set_cli(p)
-    add_rarity_cli_args(p)
     a = p.parse_args()
-    rcfg = rarity_from_args(a)
     train(
         config_from_args(a),
         epochs=a.epochs, batch_size=a.batch_size, lr=a.lr,
         val_frac=a.val_frac, num_workers=a.num_workers, seed=a.seed,
-        force_retrain=a.force_retrain, rarity=rcfg,
+        force_retrain=a.force_retrain,
     )
 
 

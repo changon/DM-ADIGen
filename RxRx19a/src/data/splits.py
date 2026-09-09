@@ -23,14 +23,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.spec import (
     CaseConfig, add_adjustment_set_cli, config_from_args, default_config)  # noqa: E402
-from src.data.rarity import (  # noqa: E402
-    RarityConfig,
-    add_rarity_cli_args,
-    rarity_from_args,
-    save_rarity_meta,
-    subsample_train_idx,
-    tagged_nuisance_dir,
-)
 
 
 SPLITS_FILENAME = "splits.json"
@@ -83,34 +75,22 @@ def make_splits(
     holdout_frac: float = 0.20,
     seed: int | None = None,
     force: bool = False,
-    rarity: RarityConfig | None = None,
 ) -> dict:
     """Compute (or reuse) the stratified split.
 
-    With `rarity` active the caller must have already pointed `cfg.paths.nuisance_dir` at the tagged directory. 
-    Subsampling applies to `train_idx` only, so the holdout matches the full-data run and metrics stay comparable.
-
-    Returns train_idx, holdout_idx, holdout_frac, seed, n_total, n_strata, and a `rarity` block when active.
+    Returns train_idx, holdout_idx, holdout_frac, seed, n_total, n_strata.
     """
     cfg = cfg or default_config()
     seed = cfg.seed if seed is None else seed
-    rarity = rarity or RarityConfig()
     out_path = _splits_path(cfg)
 
     if os.path.isfile(out_path) and not force:
         with open(out_path) as f:
             cached = json.load(f)
-        cached_rarity = cached.get("rarity", {"active": False})
-        rarity_matches = (
-            cached_rarity.get("active", False) == rarity.active
-            and cached_rarity.get("tag", "") == rarity.tag
-        )
-
         # define the pop of interest. not just all samples.
         if (cached.get("holdout_frac") == holdout_frac
                 and cached.get("seed") == seed
-                and cached.get("population", {}) == population_filters(cfg)
-                and rarity_matches):
+                and cached.get("population", {}) == population_filters(cfg)):
             return {
                 "train_idx": np.asarray(cached["train_idx"], dtype=np.int64),
                 "holdout_idx": np.asarray(cached["holdout_idx"], dtype=np.int64),
@@ -118,7 +98,6 @@ def make_splits(
                 "seed": cached["seed"],
                 "n_total": cached["n_total"],
                 "n_strata": cached["n_strata"],
-                "rarity": cached_rarity,
             }
 
     ds = load_from_disk(cfg.paths.tabular_dataset_dir)
@@ -163,11 +142,6 @@ def make_splits(
     train_idx, holdout_idx = pop_rows[_tr], pop_rows[_ho]
     n_strata = int(np.unique(strata_key[pop_rows]).shape[0])
 
-    rarity_info: dict = {"rare_compounds": []}
-    if rarity.active:
-        train_idx, _rare_ids, rarity_info = subsample_train_idx(cfg, train_idx, rarity)
-        save_rarity_meta(cfg.paths.nuisance_dir, rarity, rarity_info)
-
     payload = {
         "holdout_frac": holdout_frac,
         "seed": seed,
@@ -180,7 +154,6 @@ def make_splits(
         "n_holdout": int(holdout_idx.shape[0]),
         "train_idx": train_idx.tolist(),
         "holdout_idx": holdout_idx.tolist(),
-        "rarity": {**rarity.to_dict(), **rarity_info},
     }
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -189,8 +162,7 @@ def make_splits(
     print(f"[splits] wrote {out_path}: "
           f"n_total={n_total} train={payload['n_train']} "
           f"holdout={payload['n_holdout']} ({holdout_frac:.0%}) "
-          f"n_strata={n_strata}"
-          + (f" rarity={rarity.tag}" if rarity.active else ""))
+          f"n_strata={n_strata}")
 
     return {
         "train_idx": train_idx,
@@ -199,29 +171,21 @@ def make_splits(
         "seed": seed,
         "n_total": n_total,
         "n_strata": n_strata,
-        "rarity": payload["rarity"],
     }
 
 
 def load_splits(cfg: CaseConfig | None = None) -> dict:
     """Load an existing splits.json. Calls `make_splits` to create one if it doesn't exist yet (using defaults).
-    when loading a rarity-tagged split, set `cfg.paths.nuisance_dir` to the tagged directory (see `tagged_nuisance_dir`).
     """
     cfg = cfg or default_config()
     out_path = _splits_path(cfg)
     if not os.path.isfile(out_path):
         base = os.path.basename(cfg.paths.nuisance_dir)
-        if "_rare" in base:
+        if base.startswith("nuisances_"):
             raise FileNotFoundError(
-                f"no splits.json in the rarity-tagged dir {cfg.paths.nuisance_dir}.\n"
-                f"  load_splits() cannot create one: it does not receive the "
-                f"RarityConfig, so it would write an UNABLATED split into a "
-                f"directory whose name promises an ablation -- and every "
-                f"downstream consumer would then load it as if it were ablated.\n"
-                f"  Build it first:\n"
-                f"    python -m src.data.splits --rare-compound-frac ... "
-                f"--rare-keep-frac ... --rare-confound-pos-gamma ... "
-                f"[--population_compounds ...] [--adjustment_set ...]")
+                f"no splits.json in {cfg.paths.nuisance_dir}. load_splits() will "
+                f"not create one in a prebuilt split dir: build it with "
+                f"src.data.build_tiered_split.")
         return make_splits(cfg)
     with open(out_path) as f:
         cached = json.load(f)
@@ -232,7 +196,6 @@ def load_splits(cfg: CaseConfig | None = None) -> dict:
         "seed": cached["seed"],
         "n_total": cached["n_total"],
         "n_strata": cached["n_strata"],
-        "rarity": cached.get("rarity", {"active": False}),
     }
 
 
@@ -242,16 +205,10 @@ def main():
     p.add_argument("--seed", type=int, default=None,
                    help="Defaults to cfg.seed.")
     p.add_argument("--force", action="store_true")
-    add_rarity_cli_args(p)
     add_adjustment_set_cli(p)
     a = p.parse_args()
-    rcfg = rarity_from_args(a)
     cfg = config_from_args(a)
-    if rcfg.active:
-        cfg.paths.nuisance_dir = tagged_nuisance_dir(cfg, rcfg)
-        print(f"[splits] rarity active: tag={rcfg.tag} -> {cfg.paths.nuisance_dir}")
-    make_splits(cfg=cfg, holdout_frac=a.holdout_frac, seed=a.seed,
-                force=a.force, rarity=rcfg)
+    make_splits(cfg=cfg, holdout_frac=a.holdout_frac, seed=a.seed, force=a.force)
 
 
 if __name__ == "__main__":

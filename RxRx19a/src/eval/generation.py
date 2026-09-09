@@ -65,20 +65,17 @@ class LatentCtx:
                             else bool(latent_norm))
 
     @classmethod
-    def from_ckpt(cls, cfg, ckpt_dir: str, device) -> "LatentCtx | None":
+    def from_ckpt(cls, cfg, ckpt_dir: str, device, vae_path: str = "") -> "LatentCtx | None":
         from src.models import read_arch_spec
         a = read_arch_spec(ckpt_dir) or {}
         if not a.get("latent"):
             return None
         from src.data.dataset import LatentSpec, default_latent_path, load_vae
         spec = LatentSpec.load(default_latent_path(cfg))
+        # The consistency check stays on spec.vae: it is about the encoder that produced the latents
         if a.get("vae") and a["vae"] != spec.vae:
-            raise RuntimeError(
-                f"checkpoint was trained on latents from {a['vae']!r} but the "
-                f"latents on disk were encoded with {spec.vae!r}"
-            )
-        return cls(spec, load_vae(spec.vae, device), cfg.image.n_channels,
-                   latent_norm=bool(a.get("latent_norm", False)))
+            raise RuntimeError(f"checkpoint was trained on latents from {a['vae']!r} but the latents on disk were encoded with {spec.vae!r}")
+        return cls(spec, load_vae(vae_path or spec.vae, device), cfg.image.n_channels, latent_norm=bool(a.get("latent_norm", False)))
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         from src.data.dataset import decode_latents, denormalize_latents
@@ -142,16 +139,14 @@ def _targets_from_rows(cfg: CaseConfig, ds, pick: np.ndarray) -> list[SampleTarg
     ctx = context_for_rows(cfg, ds, pick)
     return [
         SampleTarget(int(c), float(l), int(ic), tuple(int(v) for v in row), int(inf))
-        for c, l, ic, row, inf in zip(
-            compound_idx, log10_conc, is_control, ctx, infected)
+        for c, l, ic, row, inf in zip( compound_idx, log10_conc, is_control, ctx, infected)
     ]
 
 
 def _sample_targets_from_real(
     cfg: CaseConfig, indices: np.ndarray, n_targets: int, seed: int,
 ) -> list[SampleTarget]:
-    """Draw n_targets actions-at-contexts uniformly with replacement from the rows referenced by `indices` in the HF dataset.
-    """
+    """Draw n_targets actions-at-contexts uniformly with replacement from the rows referenced by `indices` in the HF dataset."""
     ds = load_from_disk(cfg.paths.tabular_dataset_dir).select(indices.tolist())
     rng = np.random.default_rng(seed)
     return _targets_from_rows(cfg, ds, rng.integers(0, len(ds), size=n_targets))
@@ -169,11 +164,14 @@ def _generate_batch(
     guidance_scale: float = 1.0,
     latent_ctx: "LatentCtx | None" = None,
     return_latents: bool = False,
+    row_seeds: "list[int] | None" = None,
 ) -> torch.Tensor:
-    """Generate one batch of images for the provided targets. 
+    """Generate one batch of images for the provided targets.
     Returns (B, 5, 128, 128) in [-1, 1] -- ALWAYS pixels.
 
     If `latent_ctx` is given the diffusion runs in VAE latent space (80,16,16) and the result is decoded back to pixels before returning
+
+    `row_seeds` seeds each row's init noise separately. Without it the whole batch shares one generator, so a row's sample depends on its position in the batch and changes whenever batching does.
     """
     B = len(targets)
     if latent_ctx is not None:
@@ -182,26 +180,27 @@ def _generate_batch(
     else:
         H = W = cfg.image.resolution                # 128
         n_ch = cfg.image.n_channels                 # 5
-    g = torch.Generator(device=device).manual_seed(seed)
-    x = torch.randn(B, n_ch, H, W, generator=g, device=device)
+    if row_seeds is None:
+        g = torch.Generator(device=device).manual_seed(seed)
+        x = torch.randn(B, n_ch, H, W, generator=g, device=device)
+    else:
+        if len(row_seeds) != B:
+            raise ValueError(f"row_seeds has {len(row_seeds)} entries for {B} targets")
+        x = torch.stack([ torch.randn(n_ch, H, W, device=device,  generator=torch.Generator(device=device).manual_seed(int(s))) for s in row_seeds])
 
     spec = _cond_spec(model)
     compound = torch.tensor([t.compound_idx for t in targets], dtype=torch.long, device=device)
     lx = torch.tensor([t.log10_conc for t in targets], dtype=torch.float32, device=device)
     ic = torch.tensor([t.is_control for t in targets], dtype=torch.long, device=device)
-    ctx = torch.tensor(np.array([t.context for t in targets]), dtype=torch.long,
-                       device=device)
+    ctx = torch.tensor(np.array([t.context for t in targets]), dtype=torch.long,  device=device)
 
     use_guidance = abs(guidance_scale - 1.0) > 1e-6
     null_cfg = use_guidance and _supports_cfg_null(model)
     scheduler.set_timesteps(n_inference_steps, device=device)
     # One conditioning dict for the whole trajectory
-    cond = cond_from_arrays(spec, compound=compound, log10_conc=lx,
-                            is_control=ic, context=ctx, device=device)
+    cond = cond_from_arrays(spec, compound=compound, log10_conc=lx, is_control=ic, context=ctx, device=device)
     if use_guidance and not null_cfg:
-        ref_cond = cond_from_arrays(
-            spec, compound=torch.zeros_like(compound), log10_conc=lx,
-            is_control=torch.ones_like(ic), context=ctx, device=device)
+        ref_cond = cond_from_arrays(spec, compound=torch.zeros_like(compound), log10_conc=lx, is_control=torch.ones_like(ic), context=ctx, device=device)
     drop_all = torch.ones(B, dtype=torch.bool, device=device) if null_cfg else None
     for t in scheduler.timesteps:
         model_in = x.to(memory_format=torch.channels_last)
@@ -209,9 +208,8 @@ def _generate_batch(
         if use_guidance:
             if null_cfg:
                 # Same cond dict: `drop` every role-A field (compound, is_control, dose) and leave C/E
-                # this a treatment marginal rather than no tx sample.
-                pred_ref = model(model_in, t, cond, drop=drop_all,
-                                 return_dict=False)[0]
+                # note, technically speaking, this a treatment marginal rather than no tx sample.
+                pred_ref = model(model_in, t, cond, drop=drop_all, return_dict=False)[0]
             else:
                 pred_ref = model(model_in, t, ref_cond, return_dict=False)[0]
             pred = pred_ref + guidance_scale * (pred - pred_ref)

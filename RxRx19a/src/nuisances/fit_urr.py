@@ -25,19 +25,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from datasets import load_from_disk  # noqa: E402
 
-from src.data.rarity import (  # noqa: E402
-    add_rarity_cli_args,
-    rarity_from_args,
-    tagged_nuisance_dir,
-)
 from src.data.build_dataset import (  # noqa: E402
     covariate_blocks, load_covariate_encoder)
 from src.data.splits import load_splits  # noqa: E402
 from src.nuisances.alpha_net import AlphaNet  # noqa: E402
 from src.nuisances.knn_dr import ess, tail_index  # noqa: E402
 from src.spec import (  # noqa: E402
-    add_adjustment_set_cli, alpha_cov_fields, config_from_args, default_config,
-    format_role_summary, invariance_env_fields)
+    add_adjustment_set_cli, alpha_cov_fields, config_from_args, format_role_summary, invariance_env_fields)
 
 CONST_BASELINE = -1.0 
 
@@ -45,7 +39,7 @@ CONST_BASELINE = -1.0
 DIVERGENCE_L = 1e3
 DIVERGENCE_A = 1e3
 
-def urr_loss(net, cov, comp, lx, ic, inf, comp_t, lx_t, ic_t, ridge: float = 0.0):
+def urr_loss(net, cov, comp, lx, ic, inf, comp_t, lx_t, ic_t, ridge: float = 0.0, shrink: float = 0.0):
     """L = E[alpha(X,A)^2] - 2 E[alpha(X,At)],   At ~ f_A drawn independently of X.
 
     (cov, inf) are the row's covariates X. (comp, lx, ic) is its FACTUAL action A.
@@ -56,12 +50,12 @@ def urr_loss(net, cov, comp, lx, ic, inf, comp_t, lx_t, ic_t, ridge: float = 0.0
 
     cov_e = cov.unsqueeze(1).expand(B, M, -1).reshape(B * M, -1)
     inf_e = inf.view(B, 1).expand(B, M).reshape(B * M)
-    a_prd = net(cov_e, comp_t.reshape(-1), lx_t.reshape(-1),
-                ic_t.reshape(-1), inf_e).squeeze(-1).view(B, M)          # (B,M)  at (X_i, At)
+    a_prd = net(cov_e, comp_t.reshape(-1), lx_t.reshape(-1),  ic_t.reshape(-1), inf_e).squeeze(-1).view(B, M)          # (B,M)  at (X_i, At)
 
     sq = (a_obs ** 2).mean()
-    return sq - 2.0 * a_prd.mean() + ridge * sq, a_obs
-
+    # shrink anchors alpha at the null (==1): with ~15 rows per discrete action the unpenalised minimiser memorises count noise (ESS ~1%).
+    pen = shrink * ((a_obs - 1.0) ** 2).mean() if shrink else 0.0
+    return sq - 2.0 * a_prd.mean() + ridge * sq + pen, a_obs
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
@@ -70,9 +64,9 @@ def main():
     p.add_argument("--batch_size", type=int, default=1024)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-4)
-    p.add_argument("--n_perm", type=int, default=4,
-                   help="Marginal-draw actions per row (>=2).")
+    p.add_argument("--n_perm", type=int, default=4, help="Marginal-draw actions per row (>=2).")
     p.add_argument("--ridge", type=float, default=0.0)
+    p.add_argument("--shrink_to_one", type=float, default=0.0, help="Penalty weight on (alpha-1)^2: defaults alpha to the null unless the data insists. The failed 2026-09-08 fits (ESS ~1%%, inverted vs design) had 0.")
     p.add_argument("--eval_every", type=int, default=250)
     p.add_argument("--patience", type=int, default=15)
     p.add_argument("--val_frac", type=float, default=0.15)
@@ -81,24 +75,24 @@ def main():
     p.add_argument("--target_support", default="common", choices=("common", "all"), help="Support of the target intervention distribution nu.")
     p.add_argument("--out_prefix", default="alpha_urr",  help="Basename for the saved nets/meta (default alpha_urr -> alpha_urr_fold{0,1}.pt + alpha_urr_meta.json).")
     p.add_argument("--nu_source", default="train", choices=("train", "full"),  help="Where the TARGET intervention distribution nu is drawn from")
+    p.add_argument("--nu_rows", default="", help="Explicit .npy of row indices defining nu (e.g. the UNTHINNED train pool of a tiered split, so alpha targets the design action distribution). Overrides --nu_source.")
     p.add_argument("--positive", type=int, default=1, help="Softplus head: alpha >= 0, as a density ratio must be.")
     p.add_argument("--cell_type", default="all", choices=("all", "HRCE", "VERO"),  help="STRATIFY on cell line instead of adjusting for it. motivated by rxrx19a")
+    p.add_argument("--nuisance_dir", type=str, default="", help="Override cfg.paths.nuisance_dir with a prebuilt split dir (build_tiered_split.py). Supplies splits.json, vocab, covariate encoder; the fitted alpha lands there.")
     add_adjustment_set_cli(p)
-    add_rarity_cli_args(p)
     args = p.parse_args()
     if args.n_perm < 2:
         raise ValueError("n_perm >= 2")
 
     cfg = config_from_args(args)
-    rcfg = rarity_from_args(args)
     dev = torch.device(args.device)
 
-    # load in rarity info
-    base_nz = cfg.paths.nuisance_dir
-    if rcfg.active:
-        cfg.paths.nuisance_dir = tagged_nuisance_dir(cfg, rcfg)
-        print(f"[urr] rarity active: tag={rcfg.tag} -> {cfg.paths.nuisance_dir}")
-    nz = cfg.paths.nuisance_dir
+    if args.nuisance_dir:
+        if not os.path.isfile(os.path.join(args.nuisance_dir, "splits.json")):
+            raise FileNotFoundError(f"{args.nuisance_dir} has no splits.json")
+        cfg.paths.nuisance_dir = args.nuisance_dir
+
+    base_nz = nz = cfg.paths.nuisance_dir
     os.makedirs(nz, exist_ok=True)
     # n_compounds and cov_dim come from what build_dataset wrote
     with open(os.path.join(base_nz, "compound_vocab.json")) as f:
@@ -128,8 +122,7 @@ def main():
     if len(folds) == len(train_idx):
         folds = folds[_inf_tr]
     train_idx = train_idx[_inf_tr]
-    print(f"[urr] restricted to infected==1: {int(_inf_tr.sum()):,}/"
-          f"{len(_inf_tr):,} train rows")
+    print(f"[urr] restricted to infected==1: {int(_inf_tr.sum()):,}/{len(_inf_tr):,} train rows")
 
     # 3b. which cell line
     _expt_all = np.array([str(x) for x in meta["experiment"]])
@@ -143,8 +136,7 @@ def main():
         print(f"[urr] {label}: kept {int(mask.sum()):,}/{len(mask):,} train rows")
 
     if args.cell_type != "all":
-        _apply_mask(_ct_all[train_idx] == args.cell_type,
-                    f"cell_type=={args.cell_type}")
+        _apply_mask(_ct_all[train_idx] == args.cell_type, f"cell_type=={args.cell_type}")
 
     fold_tr = (folds if len(folds) == len(train_idx) else folds[train_idx]).astype(np.int64)
     cov_dim = cov_all.shape[1]
@@ -154,6 +146,14 @@ def main():
     enc = load_covariate_encoder(
         os.path.join(base_nz, "covariate_encoder.json"), cfg.covariates)
     blocks = covariate_blocks(enc)
+    # A design nu (--nu_rows) is an ACTION-distribution target: the matching
+    # alpha is action-marginal, so default X to empty rather than the role-E
+    # covariates (which stratify the support and truncate nu -- the 2026-09-08
+    # divergence). Explicit --cov_blocks still overrides.
+    if args.nu_rows and args.cov_blocks is None:
+        args.cov_blocks = ""
+        print("[urr] --nu_rows given -> cov_blocks defaulted to EMPTY "
+              "(action-marginal alpha); pass --cov_blocks to override")
     # None = take the shared declaration; "" = an explicit empty override.
     if args.cov_blocks is None:
         print(f"[urr] roles: {format_role_summary(cfg)}")
@@ -166,17 +166,14 @@ def main():
         cov_idx = list(range(cov_dim))
         keep = list(blocks)
     else:
-        print(f"[urr] *** --cov_blocks OVERRIDE {args.cov_blocks!r} (CaseConfig "
-              f"says {list(cfg.adjustment_set)}). The generator must be trained "
-              f"with a matching adjustment_set or validate_against will fire.")
+        print(f"[urr] *** --cov_blocks OVERRIDE {args.cov_blocks!r} (CaseConfig says {list(cfg.adjustment_set)}). The generator must be trained with a matching adjustment_set or validate_against will fire.")
         keep = [b.strip() for b in args.cov_blocks.split(",") if b.strip()]
         bad = [b for b in keep if b not in blocks]
         if bad:
             raise ValueError(f"unknown cov block(s) {bad}; have {list(blocks)}")
         cov_idx = sorted(i for b in keep for i in blocks[b])
     if "plate" in keep:
-        print("[urr] *** WARNING: conditioning on PLATE. f(a|x)=0 on 94.6% of the "
-              "product measure -> alpha is unbounded and this fit WILL diverge. ***")
+        print("[urr] *** WARNING: conditioning on PLATE. f(a|x)=0 on 94.6% of the product measure -> alpha is unbounded and this fit WILL diverge. ***")
 
     # The Population mask. nu is the target intervention distribution,
     pop_mask_all = np.ones(len(comp_all), dtype=bool)
@@ -185,8 +182,7 @@ def main():
         _want_ids = {int(v) for k, v in _vocab.items() if k in set(cfg.population.compounds)}
         _ctl_ids = {int(v) for k, v in _vocab.items() if k == cfg.action.control_token}
         pop_mask_all = np.isin(comp_all, list(_want_ids | _ctl_ids))
-        print(f"[urr] nu restricted to the population: {len(_want_ids)} compounds, "
-              f"{int(pop_mask_all.sum()):,}/{len(pop_mask_all):,} rows eligible")
+        print(f"[urr] nu restricted to the population: {len(_want_ids)} compounds, {int(pop_mask_all.sum()):,}/{len(pop_mask_all):,} rows eligible")
 
     # get support of the target intervention distribution nu, under the chosen X
     strata = [tuple(r) for r in (cov_all[:, cov_idx] > 0.5).astype(np.int8)]
@@ -204,9 +200,7 @@ def main():
         nu_arms = common
         _seen = set().union(*per_stratum.values()) if per_stratum else set()
         _drop = len(_seen) - len(nu_arms)
-        print(f"[urr] arm-level common support: {len(nu_arms)}/{len(_seen)} "
-              f"(compound,dose) arms span all {len(per_stratum)} strata; "
-              f"dropped {_drop} for positivity")
+        print(f"[urr] arm-level common support: {len(nu_arms)}/{len(_seen)} (compound,dose) arms span all {len(per_stratum)} strata; dropped {_drop} for positivity")
     else:
         nu_arms = {a for a, isc in zip(arm_all, ic_all) if isc < 0.5}
         print("[urr] *** WARNING: nu = full marginal. 94.6% of it is unsupported. ***")
@@ -242,20 +236,23 @@ def main():
         print(f"[urr] fold {f_}: fit={len(ti):,}  val={len(vi):,}")
 
         # Rows whose action is drawable under nu, the prod measure
-        if args.nu_source == "full": # original data, get nu
-            full_train = np.asarray(
-                json.load(open(os.path.join(base_nz, "splits.json")))["train_idx"],
-                dtype=np.int64)
+        if args.nu_rows:
+            pool = np.load(args.nu_rows).astype(np.int64)
+            pool = pool[inf_all[pool] == 1]
+            pool = pool[pop_mask_all[pool]]
+            if len(folds) > pool.max():   # rows never in the thinned/confounded train carry fold -1
+                pool = pool[folds[pool] != f_]
+            ti_nu = pool[nu_mask_all[pool]]
+            print(f"[urr] fold {f_}: nu drawn from --nu_rows ({len(ti_nu):,} rows) -- alpha targets that design action distribution")
+        elif args.nu_source == "full": # not in use. use --nu_rows for a design nu.
+            full_train = np.asarray(json.load(open(os.path.join(base_nz, "splits.json")))["train_idx"], dtype=np.int64)
             full_train = full_train[inf_all[full_train] == 1]
-            # "full" means rarity
             full_train = full_train[pop_mask_all[full_train]]
             full_fold = folds[full_train] if len(folds) > full_train.max() else None
             pool = full_train if full_fold is None else full_train[full_fold != f_]
             ti_nu = pool[nu_mask_all[pool]]
-            print(f"[urr] fold {f_}: nu drawn from FULL pool "
-                  f"({len(ti_nu):,} rows) not the ablated one "
-                  f"({int(nu_mask_all[ti].sum()):,}) -- alpha targets the "
-                  f"unablated action distribution")
+            print(f"[urr] fold {f_}: nu drawn from the dir's full train "
+                  f"({len(ti_nu):,} rows)")
         else: # on train mask, get nu
             ti_nu = ti[nu_mask_all[ti]]
         if len(ti_nu) < 1000:
@@ -284,7 +281,7 @@ def main():
             loss, _ = urr_loss(
                 net, T(cov_all[ix]), T(comp_all[ix]), T(lx_all[ix]), T(ic_all[ix]),
                 T(inf_all[ix]), T(comp_all[jx]), T(lx_all[jx]), T(ic_all[jx]),
-                ridge=args.ridge,
+                ridge=args.ridge, shrink=args.shrink_to_one,
             )
             opt.zero_grad()
             loss.backward()
@@ -389,7 +386,7 @@ def main():
     if ok:
         print("\n  VERDICT: alpha is USABLE. It varies with (X, A), E[alpha] ~ 1 emerged")
         print("  on its own, the tail has finite variance, and the ESS is healthy.")
-        print("  Next:  python -m src.nuisances.fit_knn_dr   then  --dr_mode knn_dr")
+        print("  Next:  python -m src.nuisances.export_urr_weights   then  --dr_mode knn_dr")
     else:
         print("\n  VERDICT: alpha is NOT usable -- do NOT train the DR arm on it.")
         if any(not c["learned"] for c in checks.values()):

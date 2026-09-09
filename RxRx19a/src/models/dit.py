@@ -46,8 +46,8 @@ from diffusers.utils import BaseOutput
 from .conditioning import CondEmbedder, CondSpec
 
 # adaln: every field is summed into one vector -> one modulation for all patches.
-# xattn: the same adaLN path, PLUS role-A fields as cross-attention tokens, so a
-# patch can weight a field by its own content. Additive and zero-initialised.
+# xattn: the same adaLN path, PLUS role-A fields as cross-attention tokens, so a patch can weight a field by its own content. Additive and zero-initialised.
+# "diff:  adaLN gives each patch the same conditioning signal; xattn lets each patch weight compound vs. dose vs. control differently by its own content — which is presumably why it helps directional diversity."
 COND_MODES = ("adaln", "xattn")
 
 try:
@@ -124,8 +124,7 @@ class TimestepEmbedder(nn.Module):
 # ---------------------------------------------------------------------------
 
 class CrossAttention(nn.Module):
-    """Image tokens (Q) attend to conditioning tokens (K, V).
-    """
+    """Image tokens (Q) attend to conditioning tokens (K, V)."""
 
     def __init__(self, hidden_size, num_heads):
         super().__init__()
@@ -141,8 +140,7 @@ class CrossAttention(nn.Module):
         B, N, C = x.shape
         K = ctok.shape[1]
         q = self.q(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        kv = (self.kv(ctok).reshape(B, K, 2, self.num_heads, self.head_dim)
-              .permute(2, 0, 3, 1, 4))
+        kv = (self.kv(ctok).reshape(B, K, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4))
         o = torch.nn.functional.scaled_dot_product_attention(q, kv[0], kv[1])
         return self.proj(o.transpose(1, 2).reshape(B, N, C))
 
@@ -150,23 +148,19 @@ class CrossAttention(nn.Module):
 class DiTBlock(nn.Module):
     """A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
 
-    `cross_attn=True` adds a conditioning-token sublayer. Its output projection
-    is zero-initialised, so the block starts identical to the adaLN-only model.
+    `cross_attn=True` adds a conditioning-token sublayer. Its output projection is zero-initialised, so the block starts identical to the adaLN-only model.
     """
 
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, cross_attn=False,
-                 **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, cross_attn=False, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-        self.norm_x = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6) \
-            if cross_attn else None
+        self.norm_x = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6) if cross_attn else None
         self.cross_attn = CrossAttention(hidden_size, num_heads) if cross_attn else None
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")  # noqa: E731
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim,
-                       act_layer=approx_gelu, drop=0)
+        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True),
@@ -383,9 +377,7 @@ class DiT2DModel(nn.Module):
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def calibrate_conditioning(self, probes=None, **kw) -> dict[str, float]:
-        """Passthrough to `CondEmbedder.calibrate`. 
-        Call once after construction, from the trainer (needs data)
-        Returns the applied factors."""
+        """Passthrough to `CondEmbedder.calibrate`. Call once after construction, from the trainer (needs data). Returns the applied factors."""
         return self.cond_embedder.calibrate(probes, **kw)
 
     def enable_gradient_checkpointing(self) -> None:
@@ -455,8 +447,7 @@ class DiT2DModel(nn.Module):
 
         for block in self.blocks:
             if self.gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(block, x, c, ctok,
-                                                      use_reentrant=False)
+                x = torch.utils.checkpoint.checkpoint(block, x, c, ctok, use_reentrant=False)
             else:
                 x = block(x, c, ctok)                                      # (N, T, D)
 
