@@ -11,12 +11,16 @@
 
 # 3. The library
 !RxRx19a/src/**/*.py
+!lincs/src/**/*.py
 
 # 4. Project files
 !RxRx19a/README.md
 !RxRx19a/requirements.txt
+!lincs/requirements.txt
 !LICENSE
 !.gitignore
+
+!lincs/*.md
 
 # 5. Never, even under src/
 __pycache__/
