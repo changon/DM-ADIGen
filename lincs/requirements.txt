@@ -22,11 +22,11 @@
 # NB the env's PyTorch supports up to sm_90, so every GPU job pins
 # `--gres=gpu:nvidia_rtx_a6000` — it cannot run on the Blackwell (sm_120) cards.
 #
-# Ingest (`src.data.build_dataset`) needs pandas / numpy / h5py / datasets.
-# cmapPy and tables are listed because the LINCS spec asks for them; the GCTX
-# reader itself is h5py on the uncompressed file. timm is not required for
-# ingest (later 1D-DiT may use Attention/Mlp only). Do not install OpenPhenom
-# or third_party/maes_microscopy.
+# Ingest (`src.data.build_dataset`) needs pandas / numpy / h5py / datasets:
+# the GCTX reader is raw h5py on the uncompressed file. cmapPy / tables are
+# optional (commented out below). timm is not required for ingest (later 1D-DiT
+# may use Attention/Mlp only). Do not install OpenPhenom or
+# third_party/maes_microscopy.
 
 # --- core numerics / tabular -------------------------------------------------
 numpy==1.23.5
@@ -36,11 +36,13 @@ scikit-learn==1.3.0          # kNN AIPW, isotonic calibration, downstream probes
 pillow==10.4.0
 
 # --- GCTX / HDF5 -------------------------------------------------------------
-# cmapPy 3.3.1 is the current PyPI release; h5py 3.11 / tables 3.8 are the last
-# lines with Python 3.8 wheels (newer h5py/tables dropped 3.8).
-cmapPy==3.3.1
+# h5py 3.11 is the last line with Python 3.8 wheels (it also ships 3.9-3.12).
 h5py==3.11.0
-tables==3.8.0
+# Optional, not used by src/: cmapPy's `parse` (genes x wells DataFrame; transpose
+# it) is only a cross-check of the h5py reader. Its current release is 4.0.1;
+# tables 3.8 is the last line with Python 3.8 wheels.
+# cmapPy==4.0.1
+# tables==3.8.0
 
 # --- HF stack ----------------------------------------------------------------
 datasets==3.1.0              # the Arrow tabular dataset build_dataset.py writes

@@ -33,8 +33,11 @@ Reproduce the ADIGen experiment group on LINCS:
    (MCF7, 24 h — §3.12).
 2. Train two generator arms on the same population and split:
    - **`conditional`**: unweighted factual denoising risk.
-   - **`knn_dr`**: the same net, loss weighted by the kNN AIPW / URR
-     representer $w_i$ (ADIGen).
+   - **`dr`** (`--dr_mode weighted`; RxRx calls it `knn_dr`): the same net,
+     loss weighted per training row by the URR Riesz weight
+     $w_i = \hat\alpha(X_i, A_i)$ from `export_urr_weights` (ADIGen). Vehicle
+     rows keep $w = 1$; the trainer normalises $w$ to mean 1. The kNN AIPW
+     estimator (`fit_knn_dr`) is retired (§5, 2026-09-29).
 3. Ablate the **denoiser backbone** with two architectures that share the
    same conditioning contract (`CondSpec` + adaLN from $t, A, C, E$):
    - **MLP** — treat $Y$ as a 978-d vector.
@@ -55,15 +58,17 @@ Optional later (same scaffolding): V-REx invariance over plate, pathway-score
 $Y$, DDPM vs FM.
 
 Success for v1 is not a paper-ready number. It is: one filtered population on
-disk, URR + kNN weights that pass the existing ESS / tail gate, both backbones
+disk, URR weights that pass the existing ESS / tail gate, both backbones
 trainable under both risks, and an eval JSON that reports $\hat\tau$ vs the
 oracle.
 
 **v1 is a null check for DR.** On the base population $C = \varnothing$ and no
-role-E field reaches $\alpha$ (§3.3), so $\alpha$ depends on $A$ only and
-`knn_dr` ≈ `conditional` by construction (`fit_knn_dr` prints
-"DR == conditional" in exactly this case). Expect the two arms to agree within
-seed noise. A DR-vs-conditional *difference* needs a confounding mechanism. The
+role-E field reaches $\alpha$ (§3.3), so $\alpha$ depends on $A$ only.
+With `export_urr_weights --mode counts` and $\nu$ = the train pool, every
+weight is exactly 1, so `dr` *is* `conditional`. With `--mode net` the
+normalised weights are ≈1.004 on treated wells and ≈0.942 on DMSO (analytic,
+§3.3). v1's `dr` arms use the `net` weights, with `counts` as the fallback
+(P1, §3.13). Expect the two arms to agree within seed noise. A DR-vs-conditional *difference* needs a confounding mechanism. The
 RxRx one does not transfer, so §3.8 replaces it with steps C and A. RxRx19a is
 in the same position: its base arm measured $\alpha = 1.000$, ESS 100%.
 
@@ -94,7 +99,7 @@ different **outcome object**, **files**, **population**, **plate design**, and
 
 ### 2.2 What that implies for code
 
-The ADIGen **algorithm** (URR $\alpha$, kNN AIPW $w$, weighted denoising,
+The ADIGen **algorithm** (URR $\alpha$, $\alpha$-weighted denoising risk,
 CFG on role-$A$, `arch.json`) does not care that $Y$ is an image. Almost
 every **I/O and architecture** module in RxRx19a does:
 
@@ -104,8 +109,9 @@ every **I/O and architecture** module in RxRx19a does:
   to reuse `DiT2DModel`.
 - **`AlphaNet` and `fit_urr`** concatenate an **`infected`** bit and then
   **drop all non-infected train rows**. On LINCS that filter is meaningless
-  and would empty or distort the sample. `fit_knn_dr` passes the same bit
-  into `AlphaNet` when scoring.
+  and would empty or distort the sample. `export_urr_weights` reads the same
+  bit to pick the rows it scores, and passes it into `AlphaNet` in `net`
+  mode.
 - **`ContextEncoder`** hardcodes `disease_condition`, `site`, well-letter
   `edge`, and lazily builds its levels from the raw `metadata.csv`. LINCS
   columns are `cell_id`, `det_plate`, `det_well`, `pert_time`.
@@ -138,12 +144,17 @@ Keep these contracts identical so nuisances and the trainer compose:
   dose is **NaN / learned null**, never `0.0` (0 can be a real dose) and
   never the raw `-666`.
 - One `FIELDS` declaration with roles $A / C / E$ and `adjustable`;
-  `adjustment_set` is shared by `fit_urr`, `fit_knn_dr`, and the generator.
+  `adjustment_set` is shared by `fit_urr`, `export_urr_weights`, and the
+  generator.
 - Tabular HF dataset with `compound_idx`, `log10_conc`, `is_control`,
   `cov_vec`; nuisances never need $Y$.
-- `dr_weights_knn.npz` `{row_id, w, alpha_raw}` aligned to `train_idx`.
+- `dr_weights_<source>.npz` `{row_id, w}` aligned to `train_idx`, with
+  source `counts` / `urr` (net) from `export_urr_weights`, or `design`
+  (known thinning weights, §3.8). The trainer picks one with
+  `--dr_weights_file`.
 - Denoiser call `model(sample, timestep, cond, drop=None) -> .sample`.
-- Two risks: `--dr_mode {conditional, knn_dr}`.
+- Two risks: `--dr_mode {conditional, weighted}` (RxRx: `knn_dr`; renamed,
+  P7).
 
 ---
 
@@ -170,17 +181,18 @@ lincs/                    # LINCS_ROOT: holds src/, as RxRx19a/ is RXRX19A_ROOT
     spec.py               # LINCS CaseConfig / FIELDS / OutcomeSpec / paths
     data/
       build_dataset.py    # GCTX → HF table + expr.npy; plate QC; syn_c; ContextEncoder from the FILTERED table
-      splits.py           # copy; cache-key population, arm strata
+      splits.py           # copy: load_splits + stratification engine; cache key = population + table fingerprint
+      build_tiered_split.py  # rewrite of RxRx's: reserve (k=0 default) / split / thinning -> splits.json, dr_weights_design.npz
       expr_stats.py       # NEW: plate DMSO centres + per-gene stats from TRAIN rows
       synthetic.py        # NEW: syn_c assignment + injected effect (step C, §3.8)
       dataset.py          # in-memory vector loader + copied build_cond_spec / cond_from_* / dose_probe
-      rarity.py           # copy MCAR; confound helper rewritten for syn_c / cell_id (§3.8)
+      build_nu_rows.py    # nu pool = unthinned train rows minus reserve (v1: the train rows)
     nuisances/
       alpha_net.py        # drop infected input
       fit_urr.py          # drop infected==1 restriction, --cell_type, experiment reads
-      knn_dr.py           # copy
-      fit_knn_dr.py       # copy, drop RxRx-only columns and the infected arg
-      alpha_truth_check.py
+      knn_dr.py           # copy: fit_urr / export import ess, tail_index (knn_dr_weights unused)
+      export_urr_weights.py  # copy: net (primary) | counts (fallback) -> dr_weights_{urr,counts}.npz; no infected
+      precompute_cmean.py # copy, optional (P9): per-arm train means of y for the FM cmean loss
     models/
       conditioning.py     # copy as-is
       mlp.py              # NEW vector denoiser
@@ -327,10 +339,16 @@ then the median over genes. Drop plates whose spread exceeds
 
 1. per-plate centre: per-gene median of that plate's **train** DMSO wells
    (18–28 DMSO per plate, ~14–22 after holdout);
-2. per-gene mean / std of the centred **train** rows (decision 5).
+2. per-gene **mean of the centred train DMSO wells** and per-gene **std of
+   all centred train rows** (decision 5, amended 2026-09-29), plus each
+   gene's fraction of values at the Level 3 cap of 15.0 (GAPDH: 41.5%; kept,
+   and reported).
 
 `dataset.py` applies `y = (x − centre[plate] − mean) / std`, then the step-C
-injection if active (§3.8).
+injection if active (§3.8). Because the mean comes from vehicle wells,
+z = 0 is the vehicle in every gene. A mean over all train rows would put
+DMSO a median 0.09 SD (max 0.40) off zero, 34% of it driven by the
+proteasome arms (measured).
 
 Rationale: the plate explains 65% of DMSO variance, and each compound's wells
 sit on its own plates. Uncentred, $\mathbb{E}[Y \mid a]$ carries the batch
@@ -388,19 +406,27 @@ Keep `plate_center="none"` as an ablation.
   plate levels.
 - Write `nuisance_meta.json` `{n_compounds, cov_dim}` here too (§3.5).
 
-**Splits** — copy `splits.py`.
+**Splits** — the split layer of `build_tiered_split` (P4, §3.8.1). v1 is
+the instance with no scored compounds and no thinning; `load_splits` and the
+stratification engine are copied from `splits.py`.
 
 - The table is already filtered, so `population_filters` becomes a **cache
-  key** `(cell_id, pert_time, pert_types, compounds-hash)`, asserted against
-  the table, **not** an equality mask. RxRx masks
+  key** `(cell_id, pert_time, pert_types, compounds-hash)` plus the table
+  fingerprint from `nuisance_meta.json` (a rebuilt table invalidates the
+  split), asserted against the table, **not** an equality mask. RxRx masks
   `str(ds[col]) == want`, which fails on a set-valued `pert_types` and on
   `"24.0" != "24"`: the population is silently empty.
 - `population.compounds` reads `ds["treatment"]` → read `pert_id`.
 - Stratum: `(compound_idx, dose_level)`, i.e. the arm. With ~3 wells per arm
-  `round(0.2 · 3) = 1`, so each arm keeps 2 train wells and puts 1 in
-  holdout. The **realised holdout is ≈⅓, not 20%**; log it. Stratifying on
-  compound alone (18 wells → 4 held out) would leave ~0.5% of arms with no
-  training well.
+  `round(0.2 · 3) = 1`, so each 3-well arm keeps 2 train wells and puts 1 in
+  holdout. Measured on the built table, the **realised holdout is 28.5%, not
+  20%** (and not ⅓): `round(0.2 · 2) = 0`, so the 692 two-well arms stay
+  whole, and 725 arms have no holdout well. Log it (P3, §3.13). Stratifying
+  on compound alone (18 wells → 4 held out) would leave ~0.6% of arms with
+  no training well (measured: 65).
+- DMSO wells are stratified **by plate** (P3): as one stratum they leave as
+  few as 12 train DMSO wells on a plate, by plate 14. Those wells set the
+  plate centres.
 
 ### 3.3 `spec.py` (rewrite declarations; copy machinery)
 
@@ -451,10 +477,12 @@ removed from $Y$ by plate centring (§3.2). Consequences:
   $\to 0$ on DMSO. That clears the `learned` gate (beats the constant by
   ~0.06, std ~0.24) without reflecting any $X$. Read the gate as a pipeline
   check here.
-- The AIPW plug-in leg restores DMSO weight to ~1, so `knn_dr` ≈
-  `conditional` (§1). **Do not** use `fit_knn_dr --variant ipw` for
-  $\tau(d)$: it leaves the vehicle arm at weight ~0, and the generator would
-  not learn $Y(0)$.
+- `export_urr_weights` scores treated rows only and gives vehicle rows
+  $w = 1$ by policy, so the vehicle arm keeps its weight and the generator
+  still learns $Y(0)$ (the old concern that raw $\alpha \to 0$ zeroes the
+  vehicle arm does not arise). After the trainer's mean-1 normalisation the
+  `net` weights are ≈1.004 (treated) and ≈0.942 (DMSO); `counts` weights
+  with $\nu$ = the train pool are exactly 1 (§1).
 
 Log `format_role_summary` at every job start. It should report
 `E=['plate']` as INVARIANCE-ONLY.
@@ -466,7 +494,8 @@ n_genes: 978
 expr_path: data/expr.npy             # raw Level 3, float32
 plate_qc_max_spread_ratio: 3.0       # drop plates with DMSO spread > 3× median — decision 6
 plate_center: "dmso_median_train"    # | "none" (ablation) — decision 6
-normalize: "per_gene_train"          # z-score after centring — decision 5
+normalize_mean: "train_dmso"         # per-gene mean of centred TRAIN DMSO wells — decision 5 (amended)
+normalize_std: "train_all"           # per-gene std of all centred TRAIN rows — decision 5
 syn_effect: 0.0                      # step-C injected effect size; 0 = off (§3.8)
 ```
 
@@ -559,25 +588,32 @@ Do **not** wrap 978 into `(B, 1, H, W)` to call `DiT2DModel`.
 
 | Module | Action |
 |---|---|
-| `knn_dr.py` `knn_dr_weights` | **Copy.** Inputs are `cov, compound, log10_conc, is_control, alpha, folds` — no $Y$. |
-| `fit_knn_dr.py` | **Copy** CLI and `.npz` layout. Drop `disease_condition` and the `inf` argument that `_apply` / `score_alpha` pass to `AlphaNet`. Bandwidth default from `spec.py` (§3.12). |
+| `knn_dr.py` | **Copy** as a new file: `fit_urr` and `export_urr_weights` import `ess` / `tail_index` from it. `knn_dr_weights` (kNN AIPW) is not used. |
+| `export_urr_weights.py` | **Copy.** Drop `disease_condition` / `inf`: score treated rows, vehicle rows keep $w = 1$. `--mode net` is the primary source (P1); `--mode counts` is the fallback: closed-form $\nu(a)/f_\text{train}(a)$ with add-k smoothing; key actions on the `dose_level` arm, not RxRx's `round(log10_conc·1000)` (10,944 vs 10,479 keys: float variants split arms), and on (arm, C) once $C \neq \varnothing$ (P2). `--mode net`: the cross-fitted AlphaNet from `fit_urr`. Writes `dr_weights_{counts,urr}.npz` `{row_id, w}`; checks against `dr_weights_design.npz` when it exists. Import torch lazily so `counts` runs as a CPU job without it. |
+| `build_nu_rows.py` | **Rewrite.** $\nu$ = the unthinned train pool minus reserve wells, written as `nu_rows.npy` for `fit_urr --nu_rows` and `export --mode counts`. `build_tiered_split` calls it. v1 has no thinning, so $\nu$ = the train rows. |
 | `alpha_net.py` | **Rewrite input.** Drop `infected`. `in_dim = cov_idx + embed + log10_conc + is_control` (the `+3` becomes `+2`). Keep softplus head / `SP_SHIFT`. |
-| `fit_urr.py` | **Copy URR loss** $L = \mathbb{E}[\alpha(X,A)^2] - 2\mathbb{E}[\alpha(X,A_t)]$. **Delete** the `infected==1` train restriction, the `disease_condition` array, `--cell_type {HRCE,VERO}` and the `experiment` / `cell_type` reads. Take control ids from `__control__` (RxRx compares vocab keys to the empty `control_token`, which never matches). Population mask = filters already applied at build (optionally `--population_compounds`). Keep cross-fit folds, common-support $\nu$, ESS/tail gate, `nuisance_meta.json`. |
-| `alpha_truth_check.py` | Port if useful; not on the critical path. |
+| `fit_urr.py` | **Copy URR loss** $L = \mathbb{E}[\alpha(X,A)^2] - 2\mathbb{E}[\alpha(X,A_t)]$. **Delete** the `infected==1` train restriction, the `disease_condition` array, `--cell_type {HRCE,VERO}` and the `experiment` / `cell_type` reads. Take control ids from `__control__` (RxRx compares vocab keys to the empty `control_token`, which never matches). Population mask = filters already applied at build (optionally `--population_compounds`). Cross-fit folds **stratified on the `dose_level` arm** (P5) instead of RxRx's random halves; `--nu_rows`; common support and $\nu$ keyed on the `dose_level` arm, not `round(log10_conc, 6)` (P2); ESS/tail gate; `nuisance_meta.json`. |
+| `alpha_truth_check.py`, `fit_knn_dr.py` | **Not ported.** Removed from RxRx in `78d4284`; kNN AIPW retired 2026-09-29. |
+| `precompute_cmean.py` | **Copy, optional** (P9). Means of normalised `y` (not VAE latents) over TRAIN rows, keyed on the `dose_level` arm (vehicles one key); `--min_n` configurable (RxRx default 8 keeps 34 of 10,479 arms; coverage logged); stores `train_idx`, which the trainer checks. Feeds the FM-only `--cmean_lambda` loss (default 0 = off). |
 
-**Arms are tiny.** With ~2 train wells per arm, the kNN bucket (compound,
-is_control, dose within bandwidth) has ≈1 candidate in the other fold. `k=12`
-is unattainable: expect `neighbours/query ≈ 1` and noisy per-row $w$.
-Stratify the cross-fit fold assignment on the arm, so each arm's two train
-wells land in different folds. With random folds, about half the arms have no
-cross-fold neighbour and keep $w = \alpha$.
+**Arms are tiny.** With ~2 train wells per arm, `counts` estimates each
+arm's $\nu(a)/f_\text{train}(a)$ from counts of ~2, so smoothing
+(`--smooth_k`, 0.5) matters once the train pool is thinned (step C / A). In
+v1, $\nu$ = the train pool and the ratio is exactly 1. `net` is cross-fitted:
+a row is scored by the net fit on the other fold. With random folds, 35% of
+treated train rows have no well of their own arm in the other fold (their
+compound is always there, measured); arm-stratified folds fix that (P5).
+Arms are keyed on `dose_level` everywhere: `fit_urr` support, fold strata,
+`counts` keys, and the tiered split's scored arms (RxRx rounds log-dose to
+3 d.p.). Float variants (0.37 vs 0.3704 µM) would otherwise split arms,
+10,944 vs 10,479 (P2).
 
-`--adjustment_set` / rarity tags / `role_tag` directories stay. The trainer
-reads `n_compounds` from `nuisance_meta.json`, so the `conditional` arm
-silently depends on `fit_urr`. Have `build_dataset` write it. Better, have the
-trainer take `n_compounds = len(compound_vocab.json)` from the **base**
-nuisance dir: a rarity-tagged dir only gets `nuisance_meta.json` once
-`fit_urr` has run there.
+`--adjustment_set` / `role_tag` directories stay. The trainer reads
+`n_compounds` from `nuisance_meta.json`; `build_dataset` now writes it
+(Phase 0), so the `conditional` arm no longer depends on `fit_urr`. A
+tiered-split dir (§3.8.1) copies `nuisance_meta.json`, `compound_vocab.json`
+and `covariate_encoder.json` from the base dir, as RxRx's
+`build_tiered_split` does.
 
 ### 3.6 Training (adapt one file)
 
@@ -603,7 +639,13 @@ Edits:
   choices become `plate` (~375 wells per plate, ~250 in train).
 - Re-tune batch size / epochs: RxRx defaults (`--train_batch_size 8`, epochs
   over 305k sites) do not transfer to ~25k train rows.
-- `--dr_mode {conditional,knn_dr}` unchanged.
+- `--dr_mode {conditional, weighted}`, renamed from RxRx's `knn_dr` (P7), and
+  `--dr_weights_file` (`dr_weights_urr.npz` from `net`, the default for
+  `weighted`; `dr_weights_counts.npz`; or `dr_weights_design.npz`). The
+  trainer checks `row_id == train_idx` and normalises $w$ to mean 1.
+- `--cmean_lambda` (default 0 = off) and `--cmean_file`, copied (P9): the
+  $\tau = 0$ conditional-mean auxiliary loss, **FM only**. Record both in
+  `arch.json`.
 - `--diffusion_method {ddpm,fm}` unchanged (`FlowMatching.add_noise`
   already handles `ndim`).
 - CFG dropout default 0.1 on role $A$.
@@ -613,15 +655,22 @@ Edits:
 | arm id | `--arch` | `--dr_mode` | notes |
 |---|---|---|---|
 | `mlp_conditional` | mlp | conditional | baseline |
-| `mlp_dr` | mlp | knn_dr | ADIGen (≈ baseline on v1, §1) |
+| `mlp_dr` | mlp | weighted | ADIGen, `net` weights (≈ baseline on v1, §1; P1) |
 | `dit1d_conditional` | dit1d | conditional | architecture ablation |
-| `dit1d_dr` | dit1d | knn_dr | ADIGen × 1D-DiT |
+| `dit1d_dr` | dit1d | weighted | ADIGen × 1D-DiT |
 
-Plus DDPM vs FM only after the four arms above train. Do not cross
+Plus DDPM vs FM only after the four arms above train, and the `cmean`
+ablation (P9: `--cmean_lambda` 0 vs > 0, FM arms only). Do not cross
 `--latent` or OpenPhenom into this matrix.
 
-Still **three jobs**, not one command: `fit_urr` → `fit_knn_dr` →
-`train_diffusion --dr_mode knn_dr`. Document that in the LINCS README.
+The weighted arm is two or three jobs, not one command:
+
+- `net` (primary): `fit_urr --nu_rows …` → `export_urr_weights --mode net`
+  → `train_diffusion --dr_mode weighted --dr_weights_file dr_weights_urr.npz`;
+- `counts` (fallback): `export_urr_weights --mode counts` (CPU) →
+  `train_diffusion --dr_mode weighted --dr_weights_file dr_weights_counts.npz`.
+
+Document that in the LINCS README.
 Write Python `-m` commands; SLURM wrappers later.
 
 ### 3.7 Evaluation (rewrite)
@@ -688,76 +737,108 @@ Rebuild MLP vs 1D-DiT from `arch.json` only.
 
 `--encoder {domain,openphenom,inception}` is **out**.
 
-### 3.8 Rarity / confounding (after v1: step C, then step A — decision 7)
+### 3.8 Confounding (after v1: step C, then step A — decision 7)
 
-Copy `RarityConfig` + MCAR drops (`compound_frac` / `keep_frac`); MCAR works
-at compound level as-is.
-
-**Why the RxRx lever is replaced (measured).** `_confound_cells` uses
-(compound, dose, edge) cells. A LINCS arm sits at one well position (only 72
-of 10,944 arms span edge and interior), so each cell is a whole arm with ~2
-train wells, and `--rare-confound-min-cell 2` leaves nothing to drop: the
-allocator reports CLAMPED. Plate, batch, and plate map have no within-arm
-variation, and plate centring (decision 6) removes their effect on `Y` anyway.
-The replicate index spans arms but carries ~2% of DMSO variance. The
-confounder therefore has to be something other than the plate:
+**Why the RxRx lever is replaced (measured).** RxRx's tiered split selects
+wells by position: a plate + row + column vehicle baseline. A LINCS arm sits
+at one well position (only 72 of 10,944 arms span edge and interior), and
+plate, batch, and plate map have no within-arm variation. Plate centring
+(decision 6) removes their effect on `Y` anyway, and the replicate index
+spans arms but carries ~2% of DMSO variance. The confounder therefore has to
+be something other than the plate:
 
 - **Step C** — a semi-synthetic covariate on MCF7, as a sanity check with a
   known effect.
 - **Step A** — cell line, on a 5-line population, for real-data results.
 
-Run C to completion before building A.
+Run C to completion before building A. The vehicle is RxRx's current
+**tiered split** (P6); `rarity.py` (MCAR drops, `_confound_cells`,
+`_allocate_drops`, `min_cell`) is outdated and not ported.
 
-#### 3.8.1 Shared mechanism (both steps)
+#### 3.8.1 Shared mechanism: the tiered split
 
-The RxRx recipe is kept: the full data is unconfounded, the **training** rows
-of some rare compounds are dropped depending on (dose × C), and the oracle is
+`src/data/build_tiered_split.py` rewrites RxRx's builder for LINCS. It keeps
+the three independent layers and `_calibrate_pi`, and replaces the RxRx
+panel, the outcome-derived position score, and the image arms. One instance
+is one split dir, `<nuisance_dir>_tier_<C>_k<k>_g<γ>_s<seed>/` (RxRx:
+`nuisances_tier_k<k>_pg<γ>_s<seed>`). The full data stays unconfounded, only
+**training** wells of scored compounds are thinned, and the oracle is
 computed on the full, unablated pool.
 
-- **Rare compounds come from responders.** Only ~29% of MCF7 arms clear
-  1.5× the 3-well noise floor, and confounded selection cannot bias a compound
-  that does not respond.
+1. **Reserve** (`--k_reserve`, **default 0** on LINCS): k wells per scored
+   arm, drawn before anything else, never trained on, as out-of-sample
+   truth. RxRx needs ≥ k + 3 wells per scored arm. At k = 2 only 593 LINCS
+   arms and 94 compounds (all six doses) qualify, so the default truth is the
+   full-pool oracle (§3.7, `--pool all`). The layer stays available for
+   high-n arms.
+2. **Split:** the P3 split (arm strata, DMSO stratified by plate,
+   `holdout_frac` 0.2, table fingerprint in the cache key). v1 is this
+   builder with no scored compounds and no thinning (P4), so v1 and steps C /
+   A share one split implementation and, at a given seed, one holdout.
+3. **Thinning:** for each scored compound, every train well $i$ gets
+   retention $\pi_i \propto \exp(-\gamma z_i)$, calibrated so that
+   $\sum_i \pi_i$ = `keep_frac` · $n$ and clipped to [`pmin`, 1] (RxRx
+   `_calibrate_pi`; `pmin` default 0.05). Survivors are drawn, and redrawn
+   until every positivity cell (below) keeps ≥ 1 train well. Kept wells of
+   scored compounds get the design weight $1/\pi_i$, every other row 1. γ = 0
+   gives constant $\pi$: the uniform (MCAR) control at the same `keep_frac`.
+
+Outputs, as in RxRx:
+- `splits.json`: thinned `train_idx`, `holdout_idx`, and a `tier` block with
+  γ, `pmin`, `keep_frac`, the covariate, and the scored compounds;
+- `dr_weights_design.npz`: the true weights $1/\pi$;
+- `nu_rows.npy` (`build_nu_rows`): the unthinned train pool minus reserve;
+- `tier_meta.json`: per-compound $\pi$, kept counts, and the expected naive
+  vs IPW bias;
+- copies of `nuisance_meta.json`, `compound_vocab.json`, and
+  `covariate_encoder.json`.
+
+`--plan` prints the expected bias per γ and writes nothing.
+
+- **Scored (rare) compounds come from responders.** Only ~29% of MCF7 arms
+  clear 1.5× the 3-well noise floor, and confounded selection cannot bias a
+  compound that does not respond.
   - `responders.json`: compounds whose full-data oracle $\|\hat\tau\|$ (max
     over doses) exceeds 1.5× the noise floor. It is written once per
-    population from the Phase 4 `--source real` oracle, before any ablation.
-  - `pick_rare_compounds` draws `--rare-compound-frac` of the responders.
-  - Choosing *where* to test from outcomes is an experiment-design choice; the
-    within-compound drops depend on $(A, C)$ only.
-- **Selection score:** `z = γ · standardize(z_dose · z_C)`, with
-  `z_dose = ±1` for the high / low dose half (levels 4–6 vs 1–3 of the
-  compound's 6) and `z_C = ±1` for the two levels or groups of C. Reuse
-  `_allocate_drops`.
-- **Rewrite `_confound_cells`** to take `--rare-confound-covariate
-  {syn_c,cell_id}` instead of hardcoded edge. The cell granularity differs by
-  step (below). Add the covariate to `RarityConfig.tag`.
-- **`--rare-confound-min-cell 1`** (tag suffix `_mc1`): the positivity floor
-  is one row per cell. RxRx's 2 leaves nothing to drop at LINCS cell sizes.
-- **$\nu$ must see the unablated design.** Run `fit_urr --nu_source full
-  --out_prefix alpha_urr_nufull` and `fit_knn_dr --alpha_prefix
-  alpha_urr_nufull`. The default `alpha_urr` draws targets from the ablated
-  pool, and the RxRx code notes it is then blind to the ablation by
-  construction.
-- **Arms per step** (MLP only; same split and seed; γ > 0 plus a γ = 0 MCAR
+    population from the Phase 4 `--source real` oracle, before any thinning.
+  - `--n_tier_compounds` (or a fraction) of the responders are scored.
+  - Choosing *where* to test from outcomes is an experiment-design choice. The
+    within-compound thinning depends on $(A, C)$ only; RxRx's position score
+    was estimated from outcomes, and LINCS's is not.
+- **Selection score:** $z_i$ = `standardize(z_dose · z_C)` within the compound,
+  with `z_dose = ±1` for the high / low dose half (levels 4–6 vs 1–3 of the
+  compound's 6) and `z_C = ±1` for the two levels or groups of C.
+- **Positivity cells** differ by step (below). The covariate and its groups
+  go into the dir tag and the `tier` block.
+- **$\nu$ must see the unablated design.** $\nu$ = `nu_rows.npy`, passed to
+  `fit_urr --nu_rows` and read by `export_urr_weights --mode counts`. If
+  $\nu$ came from the thinned pool, $\alpha$ would be blind to the thinning
+  by construction.
+- **Design truth.** `export_urr_weights` compares its weights with
+  `dr_weights_design.npz` (correlation on the design-weighted rows).
+- **Arms per step** (MLP only; same split and seed; γ > 0 plus the γ = 0
   control at the same `keep_frac`):
 
-  | arm | `--adjustment_set` | `--dr_mode` | role |
+  | arm | `--adjustment_set` | `--dr_mode` / weights | role |
   |---|---|---|---|
-  | `naive` | `''` | conditional | shows the bias the ablation creates |
+  | `naive` | `''` | conditional | shows the bias the thinning creates |
   | `conditional` | C | conditional | g-formula baseline |
-  | `knn_dr` | C | knn_dr | ADIGen |
+  | `dr` | C | weighted, `dr_weights_urr.npz` (`counts` fallback) | ADIGen |
+  | `dr_design` (reference) | C | weighted, `dr_weights_design.npz` | true weights: separates weight-estimation error from the generator |
 
   Train at least 2 seeds per arm, so that "DR beats conditional" is judged
   against seed noise.
 - **Eval:** `--pool all` on the unablated population. Generate at the real
   rows of that pool, whose C is balanced by design, so pairing A with the
-  rows' C is the product measure. Report metrics separately for rare vs
-  non-rare compounds, and for the low vs high dose half.
+  rows' C is the product measure. Report metrics separately for scored vs
+  unscored compounds, and for the low vs high dose half.
 - **Success:**
-  1. `naive` shows bias on rare compounds at γ > 0 and none at γ = 0.
-  2. `knn_dr`'s error on rare compounds is below `conditional`'s by more than
-     seed noise.
-  3. Non-rare compounds are unchanged.
-  4. The URR gate passes with $\alpha$ genuinely varying in $C$ (unlike v1).
+  1. `naive` shows bias on scored compounds at γ > 0 and none at γ = 0.
+  2. `dr`'s error on scored compounds is below `conditional`'s by more than
+     seed noise, and close to `dr_design`'s.
+  3. Unscored compounds are unchanged.
+  4. The URR gate passes with $\alpha$ genuinely varying in $C$ (unlike v1),
+     and the exported weights track `dr_weights_design.npz`.
 
 #### 3.8.2 Step C — semi-synthetic covariate on MCF7
 
@@ -778,27 +859,28 @@ computed on the full, unablated pool.
 - **The oracle uses the same injection.** `evaluate --source real` takes
   `--syn_effect` / `--syn_seed` and records them, and `--truth` refuses a
   mismatch with the arm's `arch.json`.
-- **Cells are (compound, dose half, `syn_c`)**, about 3 train rows each. Per
-  arm, the ~2 train wells split about 1 + 1 across `syn_c`, so arm-level cells
-  hold ~1 row and nothing could be dropped from them.
-  - `--rare-confound-min-cell 1` then bounds how far selection can go: at most
-    2 of 3 rows per cell, so default `--rare-keep-frac 0.4`. `rarity_meta.json`
-    reports the realised value.
-- **Positivity is per compound-half, not per arm.** After selection, some
-  rare-compound arms keep train wells in only one `syn_c` level.
-  - `fit_urr --target_support common` would drop those arms from $\nu$, which
-    are exactly the arms the test is about. **Use `--target_support all` in
-    step C.**
-  - This is safe here: every (compound, half, `syn_c`) cell keeps ≥1 row, and
-    the `syn_c` effect is the same additive shift for every arm, so both the
-    $\alpha$ net and the generator can share it across doses.
-  - The ESS / tail gate remains the check.
+- **Positivity cells are (compound, dose half, `syn_c`)**, about 3 train
+  rows each. Per arm, the ~2 train wells split about 1 + 1 across `syn_c`,
+  so arm-level cells would hold ~1 row and could not be thinned.
+  - Keeping ≥ 1 row per cell bounds how far selection can go (at most 2 of 3
+    rows per cell), so the default is `--keep_frac 0.4`. `tier_meta.json`
+    reports the realised kept fraction.
+- **Positivity is per compound-half, not per arm.** After thinning, some
+  scored arms keep train wells in only one `syn_c` level.
+  - `fit_urr --target_support common` would drop those arms from $\nu$, and
+    they are exactly the arms the test is about. **Use `--target_support all`
+    in step C.**
+  - This is safe here: every (compound, half, `syn_c`) cell keeps ≥ 1 row,
+    and the `syn_c` effect is the same additive shift for every arm, so both
+    the $\alpha$ net and the generator can share it across doses.
+  - `counts` (fallback) keys on (arm, `syn_c`) (P2).
+  - The ESS / tail gate and the design-weight comparison remain the checks.
 - **The ground truth is known.** The bias lives along `v`. Report the signed
   projection $\langle \hat\tau_\text{gen}(a) - \hat\tau_\text{oracle}(a),
-  v\rangle$ for rare-compound arms by dose half, alongside the aggregate
-  metrics of §3.7.
-- **Sweep:** γ ∈ {0, 1} at `--syn_effect 1.0` first. Add γ = 2 or
-  `--syn_effect 0.5 / 2` only if the first result is ambiguous.
+  v\rangle$ for scored arms by dose half, alongside the aggregate metrics of
+  §3.7.
+- **Sweep:** γ ∈ {0, 1} at `--syn_effect 1.0` first; use `--plan` to size γ.
+  Add γ = 2 or `--syn_effect 0.5 / 2` only if the first result is ambiguous.
 
 #### 3.8.3 Step A — cell line on a 5-line population
 
@@ -817,7 +899,7 @@ computed on the full, unablated pool.
   - Overlap (measured): ≥99.8% of MCF7 arms appear in each of these lines.
   - HELA and YAPC are excluded: they miss ~10% of arms.
   - Size: ~172k treated + ~10k DMSO wells.
-  - It is a **separate population**. `PopulationSpec` gains a `name`
+  - It is a **separate population**. `PopulationSpec` has a `name`
     (`mcf7_24h` default, `core5_24h`), selected with `--population`, which
     sets `Paths` to `data/<name>/…` and `runs/<name>/…`. Name it in every
     result.
@@ -825,22 +907,23 @@ computed on the full, unablated pool.
 - **Outcome**, same rules per plate (plates are single-line):
   - plate QC with the 3× rule, using each line's median spread;
   - DMSO-median centring on train wells;
-  - per-gene z-score pooled over lines.
+  - per-gene z-score pooled over lines (mean from train DMSO, std from all
+    train rows; decision 5).
 - **Roles:** `cell_id` is promoted with `--adjustment_set cell_id`. $\alpha$
   gets 5 one-hot columns, and the generator conditions on `cell_id` as C
   (never dropped by CFG).
 - **Estimand:** $\tau(c, d)$ averaged over the 5 lines, with the line mix of
   the pool (near-uniform by design). Per-line $\tau$ is secondary.
-- **Cells are (compound, `dose_level`, `cell_id`)**, about 2 train rows each.
-  With `--rare-confound-min-cell 1`, every rare arm keeps ≥1 row in every
-  line.
-  - So **arm-level positivity survives the ablation**, and
+- **Positivity cells are (compound, `dose_level`, `cell_id`)**, about 2 train
+  rows each. Keeping ≥ 1 row per cell means every scored arm keeps ≥ 1 row in
+  every line.
+  - So **arm-level positivity survives the thinning**, and
     `--target_support common` works as in RxRx.
-  - Selection can drop at most ~half of a rare compound's rows (1 of ~2 per
-    cell), so default `--rare-keep-frac 0.6`. 0.5 is the floor.
+  - Selection can remove at most ~half of a scored compound's rows (1 of ~2
+    per cell), so the default is `--keep_frac 0.6`, with 0.5 as the floor.
 - **`z_C`:** a fixed split of the 5 lines into two groups, declared in
-  `spec.py` before any step-A result is seen and recorded in the tag.
-- **Bias readout:** for rare compounds, the error of the line-pooled
+  `spec.py` before any step-A result is seen and recorded in the dir tag.
+- **Bias readout:** for scored compounds, the error of the line-pooled
   $\hat\tau_\text{gen}$ vs the oracle, plus its correlation with the oracle's
   group contrast $\hat\tau_{G_2} - \hat\tau_{G_1}$. Confounding pulls
   estimates toward the over-kept group.
@@ -858,14 +941,15 @@ Every “copy” below is a **file copy** `RxRx19a/src/…` → `lincs/src/…`
 |---|---|
 | `models/conditioning.py` | as-is |
 | `processes/__init__.py`, `ddpm.py`, `flow_matching.py` | as-is (ndim-safe) |
-| `nuisances/knn_dr.py` | as-is |
-| `data/rarity.py` (MCAR, tags, CLI, `_allocate_drops`) | copy; `_confound_cells` rewritten for `syn_c` / `cell_id`, responders-only rare set (§3.8) |
+| `nuisances/knn_dr.py` | as-is (only `ess` / `tail_index` are used) |
+| `nuisances/export_urr_weights.py` | copy; no `infected`; `dose_level` action keys; controls $w = 1$ (§3.5) |
+| `nuisances/precompute_cmean.py` | copy, optional (P9): `y` instead of latents, `dose_level` arm keys, configurable `--min_n` |
 | `data/dataset.py` `build_cond_spec`, `cond_from_arrays`, `cond_from_batch`, `dose_probe` | copy (spec-driven, not image code) |
 | `spec.py` helpers (`role_tag`, CLI, `CaseConfig` guards) | copy; new FIELDS / paths / OutcomeSpec |
 | `train/train_diffusion.py` loop | copy; y-rank (train + val), `--arch`, drop VAE, V-REx key |
 | `models/dit.py` `DiTBlock`, `TimestepEmbedder`, `DIT_SIZES`, adaLN init, `get_1d_sincos_pos_embed_from_grid` | copy into `dit1d.py` |
 | `eval/dist_metrics.py` Frechet / MMD / KID on feature matrices | copy; drop Inception + `torchvision`; feed $Y$ |
-| `data/splits.py` stratification engine | copy; cache-key population, arm strata |
+| `data/splits.py` `load_splits` + stratification engine | copy; cache key = population + table fingerprint; arm strata; DMSO by plate |
 
 **Rewrite**
 
@@ -874,13 +958,14 @@ Every “copy” below is a **file copy** `RxRx19a/src/…` → `lincs/src/…`
 | `data/build_dataset.py` | GCTX + LINCS joins/filters; write `expr.npy` not PNG paths |
 | `data/expr_stats.py` (new) | plate DMSO centres + per-gene stats need the split |
 | `data/synthetic.py` (new) | step-C `syn_c` assignment + injected effect |
+| `data/build_tiered_split.py`, `build_nu_rows.py` | keep the three layers and `_calibrate_pi`; replace the RxRx panel, outcome-derived position score, and image arms with responders-only scored compounds, dose-half × C selection, per-step positivity cells, `k_reserve = 0` default (§3.8.1) |
 | `spec.py` `PopulationSpec.name` / `--population` | step A is a second population with its own paths |
 | `spec.py` `FIELDS`, `Paths`, `PopulationSpec`, `ImageSpec` | different columns and $Y$ |
 | `data/dataset.py` loader | in-memory vector loader; drop PIL / image VAE |
 | `ContextEncoder` | `det_plate` / `det_well`; no disease/site; built from the filtered table |
 | `models/mlp.py`, `models/dit1d.py` | new backbones |
 | `models/__init__.py` `arch.json` | `arch=mlp\|dit1d`, `n_genes`; dispatch in `build_generator_from_ckpt` |
-| `nuisances/alpha_net.py` + `fit_urr.py` + `fit_knn_dr.py` scoring | no `infected` |
+| `nuisances/alpha_net.py` + `fit_urr.py` + `export_urr_weights.py` scoring | no `infected` |
 | `eval/evaluate.py`, `generation.py` | gene ATE, not rescue/FID/OpenPhenom; no clamp |
 | OpenPhenom, `feature_extractor.py`, `encode_latents` | not applicable |
 
@@ -893,6 +978,8 @@ Every “copy” below is a **file copy** `RxRx19a/src/…` → `lincs/src/…`
 - `third_party/maes_microscopy`
 - RxRx `scripts/*.slurm` (missing here anyway)
 - RxRx `_confound_cells` edge × dose lever (§3.8)
+- `fit_knn_dr.py`, `alpha_truth_check.py`, `knn_dr_weights` (kNN AIPW retired 2026-09-29)
+- `data/rarity.py` (removed from RxRx in `78d4284`; superseded by the tiered split, P6)
 
 ### 3.10 Phased work
 
@@ -902,14 +989,20 @@ compound count, `dose_level` counts, landmark shape `(n, 978)`, vehicle
 fraction, DMSO wells per plate. The cell-line coverage table is done (§3.12).
 
 **Phase 1 — table consumers**
-`splits.py`, `expr_stats.py`, `dataset.py`, `fit_urr` (no infected),
-`fit_knn_dr`. Gate: URR beats constant baseline, `mean(alpha)≈1`, ESS/n not
-collapsed. On v1 this gate passes trivially (§3.3). Also check that the
-centred DMSO wells have per-plate means ≈0 and that plate's share of DMSO
-variance drops from 65%.
+`splits.py` + the split layer of `build_tiered_split` (v1 instance: no
+reserve, no thinning), `build_nu_rows`, `expr_stats.py`, `dataset.py`,
+`fit_urr` (no infected), `export_urr_weights` (`net`; `counts` as fallback). Gate: URR beats constant baseline,
+`mean(alpha)≈1`, ESS/n not collapsed. On v1 this gate passes trivially
+(§3.3), so also check the known answers: the net gives
+$\alpha \approx 1/(1-\pi_0) = 1.066$ on treated rows and ≈0 on DMSO, and the
+`counts` weights are exactly 1. Centring gate (P11), on **held-out** DMSO
+wells: per-plate means ≈0, and plate's share of DMSO variance drops from
+0.67 toward the ~0.20 measured in §3.2. On train DMSO wells the check is
+trivial, because they set the centres.
 
 **Phase 2 — MLP arms**
 MLP + trainer + DDPM (FM optional). `mlp_conditional` then `mlp_dr`.
+Port `precompute_cmean` and `--cmean_lambda` (off by default; P9).
 Smoke on `--limit` / `--max_steps`.
 
 **Phase 3 — 1D-DiT arms**
@@ -918,12 +1011,14 @@ Confirm `arch.json` rebuild.
 
 **Phase 4 — eval**
 Real oracle JSON, then each of the four generator arms with `--truth`.
-Gene-space MMD. No image metrics.
+Gene-space MMD. No image metrics. Then the `cmean` ablation (P9) on FM arms.
 
 **Phase 5 — step C: semi-synthetic confounder on MCF7 (§3.8.2)**
 `synthetic.py` (the `syn_c` column already exists from Phase 0), responders
-from the Phase 4 oracle, rewritten `_confound_cells`, `--nu_source full`
-nuisances. Train `naive` / `conditional` / `knn_dr` at γ ∈ {0, 1}, ≥2 seeds.
+from the Phase 4 oracle, the step-C tiered-split instance (§3.8.1), $\nu$
+from the unthinned pool, `export_urr_weights` checked against the design
+weights. Train `naive` / `conditional` / `dr` (+ `dr_design`) at
+γ ∈ {0, 1}, ≥2 seeds.
 Score them against the injected oracle. Gate for Phase 6: the success
 criteria of §3.8.1 hold, or the failure is understood and written up.
 
@@ -950,7 +1045,7 @@ URR step) for a GPU box. Put it under `src/` because `.gitignore` drops
 `lincs/scripts/`, and an untracked file cannot go through the review §4
 requires.
 
-### 3.12 Phase 0 decisions (resolved and frozen)
+### 3.12 Phase 0 decisions (resolved and frozen; 3 and 5 amended 2026-09-29)
 
 1. **Cell line: `MCF7`.** A metadata scan of the 24 h
    `trt_cp ∪ ctl_vehicle` slice found 35,623 chemical and 2,084 vehicle
@@ -974,16 +1069,31 @@ requires.
    plus 173 off-grid wells from 13 compounds kept at their own dose.
    RxRx's `ActionSpec.continuous_grid` is declared but read by no code, so
    evaluation must use `dose_level` explicitly. The kNN bandwidth
-   `0.026920511435899325` stays frozen in `spec.py`. Its median-spacing
-   derivation is dominated by the near-duplicates, but within each compound
-   it gives the same dose groups as 0.2 (checked), so it is harmless.
+   (`0.026920511435899325`) was frozen in `spec.py` for `fit_knn_dr`. That
+   estimator is retired, so the field is **removed** from `ActionSpec`
+   (P8, 2026-09-29); the value is kept here for the record. No
+   `(compound, dose_level)` cell spans more than it (measured), so it never
+   disagreed with `dose_level`.
 4. **Headline backbone: MLP.** Both MLP and 1D-DiT remain required and are
    reported; MLP is the main DR result because no trusted 1-d gene topology
    justifies privileging 1D-DiT.
-5. **Normalization: per-gene train mean/std.** The policy is frozen as
-   `OutcomeSpec.normalize="per_gene_train"`. `expr_stats` (after splits)
-   computes it from training rows only, after plate centring, and persists it
-   in `expr_meta.json`. Samples are z-scores, so generation must not clamp.
+5. **Normalization: per-gene z-score after centring — amended 2026-09-29
+   (P10).**
+   - **Mean:** the per-gene mean of the centred **train DMSO** wells
+     (`OutcomeSpec.normalize_mean="train_dmso"`), so that z = 0 is the
+     vehicle. Before the amendment it was the mean of all centred train rows,
+     which puts DMSO a median 0.09 SD (max 0.40) off zero; 34% of that mean
+     came from the proteasome arms.
+   - **Std:** unchanged, the per-gene std of **all** centred train rows
+     (`normalize_std="train_all"`). It is a median 1.15× the DMSO noise,
+     up to 4.7× for strong responders.
+   - **Genes:** all 978 are kept, including GAPDH (at the 15.0 cap in 41.5%
+     of wells; 9 other genes exceed 1%). `expr_meta.json` reports each gene's
+     fraction at the cap.
+
+   `expr_stats` (after splits) computes both from training rows only, after
+   plate centring, and persists them in `expr_meta.json`. Samples are
+   z-scores, so generation must not clamp.
 6. **Outcome centring and plate QC — accepted 2026-09-28.**
    - Subtract the per-plate, per-gene median of that plate's **train** DMSO
      wells, with no scaling (`OutcomeSpec.plate_center="dmso_median_train"`).
@@ -1000,9 +1110,12 @@ requires.
 
    Both use:
    - responders-only rare compounds;
-   - dose-half × C selection with `--rare-confound-min-cell 1`;
-   - `--nu_source full` nuisances;
-   - the `naive` / `conditional` / `knn_dr` arms with a γ = 0 control.
+   - dose-half × C selection by probabilistic thinning in the tiered split
+     (§3.8.1; P6), with known design weights;
+   - $\nu$ from the unthinned design pool (`fit_urr --nu_rows`,
+     `export_urr_weights`);
+   - the `naive` / `conditional` / `dr` arms (+ `dr_design` reference) with
+     a γ = 0 control.
 
    Step A starts only after step C's gate and step A's own
    effect-modification gate.
@@ -1010,6 +1123,58 @@ requires.
 Do not change these decisions between the four v1 arms. A different compound
 universe or cell line defines a separate population and result set. Step A's
 `core5_24h` is such a population, and it does not replace decision 1.
+
+### 3.13 Phase 1 decisions (resolved 2026-09-29)
+
+Numbers are measured on the built `mcf7_24h` table (37,340 wells) unless
+marked analytic.
+
+- **D1 — DR weights come from `export_urr_weights`.** `fit_knn_dr.py` (kNN
+  AIPW) is outdated: RxRx removed it in `78d4284`, and LINCS follows. The
+  weighted risk is $\sum_i w_i\,\ell_i$ with $w_i = \hat\alpha(X_i, A_i)$ on
+  treated rows and $w = 1$ on vehicle rows, normalised to mean 1. It has no
+  kNN plug-in / correction legs.
+- **P1 — `net` weights are primary; `counts` is the fallback.** v1's `dr`
+  arms train on `net` weights (≈1.004 treated / 0.942 DMSO after
+  normalisation, analytic). That exercises the `fit_urr` → export → trainer
+  path step C needs. `counts` (≡ 1 in v1) runs as a check and stays
+  available if the net fails its gate.
+- **P2 — Arms are keyed on `dose_level`** everywhere an arm is keyed:
+  `fit_urr` common support and $\nu$, the fold strata (P5), the tiered
+  split's scored arms, and the `counts` keys. Once C is non-empty, keys are
+  (arm, C). This still matters under P1: RxRx's float keys give 10,944 arms
+  instead of 10,479 (0.37 vs 0.3704 µM split), which shrinks common support
+  in steps C / A.
+- **P3 — Split:** `holdout_frac` 0.2 with arm strata (realised 28.5%, train
+  26.7k); DMSO stratified by plate (min 14 train DMSO per plate, vs 12 as one
+  stratum); the table fingerprint in the cache key.
+- **P4 — v1's split is the tiered builder's split layer** (no scored
+  compounds, no thinning), with `load_splits` and the stratification engine
+  copied from `splits.py`. One split implementation serves v1 and steps C / A.
+- **P5 — Cross-fit folds are stratified on the arm.** With random halves,
+  35% of treated train rows have no well of their own arm in the other fold.
+- **P6 — The confounding vehicle is RxRx's current tiered split** (reserve /
+  split / probabilistic thinning with design weights, `build_nu_rows`).
+  `rarity.py` is outdated and not ported. `k_reserve` defaults to 0 (only 593
+  arms / 94 compounds could support k = 2); truth is the full-pool oracle.
+  §3.8 is rewritten accordingly.
+- **P7 — The flag is renamed** `--dr_mode {conditional, weighted}` (RxRx:
+  `knn_dr`); the weights file picks the source. Arm ids stay `*_dr`.
+- **P8 — `ActionSpec.continuous_kernel_bandwidth` is removed** from
+  `spec.py`; the value is recorded in §3.12.
+- **P9 — `cmean` is ported as a configurable, optional loss** and ablated:
+  `precompute_cmean.py` (normalised `y`, `dose_level` arm keys,
+  configurable `--min_n`; the RxRx default of 8 covers 34 of 10,479 arms) and
+  the trainer's `--cmean_lambda` (default 0 = off) / `--cmean_file`. It is FM
+  only, so the ablation runs on FM arms.
+- **P10 — Decision 5 amended:** the mean comes from centred train DMSO; the
+  std stays over all centred train rows; GAPDH and the other capped genes are
+  kept and reported (§3.12).
+- **P11 — The centring gate is measured on held-out DMSO wells** (§3.10).
+
+Compute: `fit_urr` imports torch but AlphaNet is tiny, so it runs as a CPU
+job (`ma` under the headroom rule). `export --mode counts` needs no torch
+once the import is lazy.
 
 ---
 
@@ -1027,37 +1192,61 @@ the ADIGen contract.
 
 ### Phase 0 — spec + ingest
 
-- [ ] `lincs/src/spec.py`: LINCS `FIELDS` (plate E non-adjustable; well
+- [x] `lincs/src/spec.py`: LINCS `FIELDS` (plate E non-adjustable; well
       row/col role None; `cell_id` / `syn_c` role None, adjustable),
       `OutcomeSpec`, `Paths` (`lincs/lincs/GSE70138`), `PopulationSpec`
       (with `name`); helpers copied from RxRx19a then adapted
-- [ ] Phase 0 decisions frozen in `spec.py` (cell line, compound universe,
-      dose handling, per-gene norm, plate centring + QC) — §3.12
-- [ ] `lincs/src/data/build_dataset.py`: h5py GCTX read joined on `inst_id`,
+- [x] Phase 0 decisions frozen in `spec.py` (cell line, compound universe,
+      dose handling, per-gene norm, plate centring + QC) — §3.12.
+      Reopened and re-closed 2026-09-29 for the amended decisions 3 and 5:
+      - `ActionSpec.continuous_kernel_bandwidth` and its `decisions_record`
+        entry removed (P8);
+      - `OutcomeSpec.normalize` replaced by `normalize_mean="train_dmso"` /
+        `normalize_std="train_all"` (P10);
+      - `mcf7_24h` and `mcf7_24h_limit1500` rebuilt. The table, `expr.npy`,
+        and every encoder and vocab file are byte-identical to before; only
+        `population_qc.json`'s decisions record changed;
+      - `check_build` now also asserts that a build's recorded decisions equal
+        the current `decisions_record` (35 checks, all pass on both builds).
+- [x] `lincs/src/data/build_dataset.py`: h5py GCTX read joined on `inst_id`,
       filters, plate QC → `population_qc.json`, `-666` handling,
       `dose_level`, `syn_c` (balanced per arm / per plate DMSO), HF table +
       `expr.npy` / `gene_order.json` / vocabs / `context_encoder.json` (from
       the filtered table) / `nuisance_meta.json`
-- [ ] `lincs/requirements.txt` (RxRx pins + h5py; cmapPy optional)
-- [ ] Smoke on `--limit`: \(n\), compound count, `dose_level` counts,
+- [x] `lincs/requirements.txt` (RxRx pins + h5py; cmapPy optional)
+- [x] Smoke on `--limit`: \(n\), compound count, `dose_level` counts,
       `(n, 978)`, vehicle fraction, DMSO per plate, plates dropped by QC
 
 ### Phase 1 — table consumers + nuisances
 
-- [ ] `splits.py`: copied engine; cache-key population; arm strata; realised
-      holdout fraction logged
-- [ ] `expr_stats.py`: train-DMSO plate centres + per-gene stats →
-      `expr_meta.json`
+- [x] §3.13 decisions D1, P1–P11 chosen and recorded (2026-09-29)
+- [ ] `splits.py`: copied `load_splits` + stratification engine; cache key =
+      population key + table fingerprint; arm strata; DMSO stratified by
+      plate; realised holdout fraction logged (P3)
+- [ ] `build_tiered_split.py`: reserve (`k_reserve` 0 default) / split /
+      thinning layers with `_calibrate_pi`; v1 instance = no scored
+      compounds, no thinning → `splits.json` + `nu_rows.npy` (P4, P6)
+- [ ] `build_nu_rows.py`: \(\nu\) = unthinned train pool minus reserve
+- [ ] `expr_stats.py`: train-DMSO plate centres; per-gene mean from centred
+      train DMSO, std from all centred train rows (decision 5, amended);
+      per-gene fraction at the 15.0 cap → `expr_meta.json`
+- [ ] Centring gate on **held-out** DMSO (P11): per-plate means ≈0; plate
+      share of DMSO variance 0.67 → ~0.20
 - [ ] `dataset.py`: in-memory vector loader (no PIL / image VAE) + copied
       `build_cond_spec` / `cond_from_*` / `dose_probe`
-- [ ] `rarity.py`: copied MCAR + tags (confound helper rewritten in Phase 5)
 - [ ] `alpha_net.py`: copied; **no `infected` input**
-- [ ] `knn_dr.py`: copied as a new file (algorithm unchanged)
+- [ ] `knn_dr.py`: copied as a new file (`ess` / `tail_index` for `fit_urr`
+      and export)
 - [ ] `fit_urr.py`: copied URR loss; no `infected==1` restriction, no
-      `--cell_type` / `experiment`; arm-stratified folds
-- [ ] `fit_knn_dr.py`: copied; no `inf` arg; writes `dr_weights_knn.npz`
+      `--cell_type` / `experiment`; `--nu_rows`; support and \(\nu\) keyed on
+      the `dose_level` arm (P2); arm-stratified cross-fit folds (P5)
+- [ ] `export_urr_weights.py`: copied; no `inf`; vehicle rows \(w = 1\);
+      `net` (primary, P1) and `counts` (fallback; `dose_level` arm keys,
+      (arm, C) when C is non-empty); compares with `dr_weights_design.npz`
+      when present; writes `dr_weights_{urr,counts}.npz` `{row_id, w}`
 - [ ] URR gate: beats constant baseline, `mean(alpha)≈1`, ESS/n usable
-      (trivial on v1 — §3.3)
+      (trivial on v1 — §3.3); known answers hold: net
+      \(\alpha \approx 1.066\) on treated / ≈0 on DMSO, `counts` \(w \equiv 1\)
 - [ ] Trainer gets `n_compounds` without a hidden `fit_urr` dependency
       (`compound_vocab.json` or `build_dataset`'s `nuisance_meta.json`)
 
@@ -1070,10 +1259,14 @@ the ADIGen contract.
 - [ ] `models/__init__.py`: `arch=mlp` in `arch.json` (`n_genes`, no image
       VAE keys); `build_generator_from_ckpt` dispatches on `arch`
 - [ ] `train/train_diffusion.py`: copied loop; rank-agnostic loss in train
-      and validation; `--arch mlp`; `--dr_mode`; no `--latent`; V-REx key
+      and validation; `--arch mlp`; `--dr_mode {conditional, weighted}` +
+      `--dr_weights_file` (P7); no `--latent`; V-REx key
+- [ ] `nuisances/precompute_cmean.py` + trainer `--cmean_lambda` (default 0)
+      / `--cmean_file`, FM only; `--min_n` configurable, coverage logged (P9)
 - [ ] `src/tests/test_lincs_shapes.py` (or equivalent) for a GPU box
 - [ ] `mlp_conditional` arm trainable
-- [ ] `mlp_dr` arm trainable (after URR + kNN)
+- [ ] `mlp_dr` arm trainable (after `fit_urr` + `export_urr_weights --mode
+      net`)
 
 ### Phase 3 — 1D-DiT arms
 
@@ -1093,6 +1286,8 @@ the ADIGen contract.
       `--pool all` per-arm aggregates + holdout aggregates; real and
       generated \(\mu(0)\); `--truth` accuracy; no OpenPhenom / rescue panel
 - [ ] Oracle (`--source real`) + all four v1 generator arms scored
+- [ ] `cmean` ablation (P9): FM `mlp_conditional` / `mlp_dr` with
+      `--cmean_lambda` 0 vs > 0, scored with `--truth`
 
 ### Phase 5 — step C: semi-synthetic confounder on MCF7 (§3.8.2)
 
@@ -1103,13 +1298,17 @@ the ADIGen contract.
 - [ ] `evaluate.py`: `--syn_effect` / `--syn_seed` on the real oracle;
       `--truth` refuses mismatches; signed bias along `v` by dose half,
       rare vs non-rare
-- [ ] `rarity.py`: `--rare-confound-covariate`, (compound, dose half,
-      `syn_c`) cells, responders-only rare set, covariate in the tag
-- [ ] Nuisances with `--adjustment_set syn_c --target_support all
-      --nu_source full` (`alpha_urr_nufull`); gate passes with \(\alpha\)
-      varying in `syn_c`
-- [ ] `naive` / `conditional` / `knn_dr` × γ ∈ {0, 1} × ≥2 seeds trained
-      and scored
+- [ ] `build_tiered_split` step-C instance: responders-only scored
+      compounds, \(z\) = dose half × `syn_c`, positivity cells (compound,
+      dose half, `syn_c`), `keep_frac` 0.4, γ ∈ {0, 1}; `--plan` bias table;
+      `dr_weights_design.npz`, `nu_rows.npy`, `tier_meta.json`
+- [ ] Nuisances: `fit_urr --adjustment_set syn_c --target_support all
+      --nu_rows …` + `export_urr_weights --mode net` (`counts` fallback keyed
+      on (arm, `syn_c`));
+      gate passes with \(\alpha\) varying in `syn_c`; weights track
+      `dr_weights_design.npz` where \(\pi\) is known
+- [ ] `naive` / `conditional` / `dr` (+ `dr_design`) × γ ∈ {0, 1} × ≥2
+      seeds trained and scored
 - [ ] Step-C verdict against the §3.8.1 success criteria written up (gate
       for Phase 6)
 
@@ -1121,12 +1320,14 @@ the ADIGen contract.
       every artifact and result
 - [ ] Ingest, plate QC (per-line median), splits, `expr_stats`, Phase 4
       oracle and `responders.json` for `core5_24h`
-- [ ] `rarity.py`: (compound, `dose_level`, `cell_id`) cells; line groups
-      declared in `spec.py`
-- [ ] Nuisances with `--adjustment_set cell_id --target_support common
-      --nu_source full`; gate passes
-- [ ] `naive` / `conditional` / `knn_dr` × γ ∈ {0, γ>0} × ≥2 seeds trained
-      and scored; group-contrast bias readout
+- [ ] `build_tiered_split` step-A instance: positivity cells (compound,
+      `dose_level`, `cell_id`), `keep_frac` 0.6; line groups declared in
+      `spec.py`
+- [ ] Nuisances: `fit_urr --adjustment_set cell_id --target_support common
+      --nu_rows …` + `export_urr_weights --mode net`; gate passes; weights
+      track `dr_weights_design.npz`
+- [ ] `naive` / `conditional` / `dr` (+ `dr_design`) × γ ∈ {0, γ>0} × ≥2
+      seeds trained and scored; group-contrast bias readout
 
 ### Phase 7 — optional
 
@@ -1177,3 +1378,30 @@ pre-review text is in `IMPLEMENT.md.orig` (untracked).
 | Step C confounds at (compound, dose half) with `--target_support all` | ~2 train wells per arm leave (arm, `syn_c`) cells with ~1 row |
 | Step A confounds at (compound, `dose_level`, `cell_id`) with `--target_support common` | ~2 train rows per cell keep arm-level positivity at `min_cell 1` |
 | `syn_c` and `cell_id` declared adjustable, role `None` | promotable per arm; inert in v1 |
+
+### Decisions 2026-09-29
+
+| Decision | Basis |
+|---|---|
+| D1: DR weights from `export_urr_weights` (`counts` / `net`); `fit_knn_dr` (kNN AIPW) retired as outdated | RxRx `78d4284` replaced `fit_knn_dr` / `alpha_truth_check` with `export_urr_weights` (+ `precompute_cmean`); the LINCS plan follows. Vehicle rows keep $w = 1$ by policy, so the old "`ipw` zeroes the vehicle arm" concern is gone |
+| Stale text updated: §1, §2.2, §2.3, §3.1, §3.3, §3.5, §3.6, §3.8.1, §3.9, §3.10, §3.12, §4 | kNN buckets, `alpha_raw`, `--nu_source full` / `alpha_urr_nufull` → `--nu_rows` + export |
+| Realised holdout corrected: 28.5% at `holdout_frac` 0.2, not ⅓ | measured on the built table: `round(0.2·2) = 0` keeps 692 two-well arms whole |
+| §3.8 mechanism flagged, not rewritten | RxRx `78d4284` also removed `rarity.py` in favour of `build_tiered_split`; open decision P6 |
+| Phase 1 open decisions P1–P11 listed in §3.13 | to be chosen before Phase 1 code |
+
+### Phase 1 decisions chosen (2026-09-29)
+
+| Decision | Plan changes |
+|---|---|
+| P1 `net` primary, `counts` fallback | §1, §3.5, §3.6 jobs, TODO |
+| P2 `dose_level` arm keys everywhere (still needed under P1) | §3.5, §3.13 |
+| P3 holdout 0.2, arm strata, DMSO by plate, fingerprint in cache key | §3.2 splits |
+| P4 v1 split = tiered builder's split layer | §3.2, §3.8.1, TODO |
+| P5 arm-stratified folds | §3.5 `fit_urr` row |
+| P6 RxRx tiered split replaces `rarity.py`; `k_reserve` 0 default; `dr_design` reference arm added | §3.1, §3.8 rewritten, §3.9, §3.10, §3.12 decision 7, TODO Phases 5–6 |
+| P7 `--dr_mode {conditional, weighted}` | §1, §2.3, §3.6, §3.8 |
+| P8 kNN bandwidth removed from `spec.py` | §3.12 decision 3; Phase 0 box reopened |
+| P9 `cmean` ported, optional (`--cmean_lambda` 0 default), ablated on FM arms | §3.1, §3.5, §3.6, §3.9, §3.10, TODO Phases 2 and 4 |
+| P10 decision 5 amended: DMSO mean, all-row std, all genes kept | §3.2, §3.3 `OutcomeSpec`, §3.12 decision 5, TODO Phase 1; Phase 0 box reopened |
+| P11 centring gate on held-out DMSO | §3.10, TODO Phase 1 |
+| Phase 0 fix for P8 / P10 applied in `spec.py`; builds regenerated; `check_build` checks the decisions record | TODO Phase 0 box re-closed |
