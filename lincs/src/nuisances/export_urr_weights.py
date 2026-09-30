@@ -1,8 +1,8 @@
 """Turn fitted URR alpha into the dr_weights npz that training uses.
 
 Copied from RxRx19a/src/nuisances/export_urr_weights.py, then adapted
-(IMPLEMENT.md §3.5; D1, P1, P2). Bridges fit_urr -> train_diffusion: writes
-{row_id, w} aligned to the split's train_idx.
+(IMPLEMENT.md §3.5; D1, P1, P2; decision 2026-09-30). Writes {row_id, w}
+aligned to the split's train_idx, for train_diffusion --dr_weights_file.
 
 Weight policy:
   - treated train rows: w = alpha(x, a)
@@ -11,18 +11,28 @@ Weight policy:
 The trainer normalises w to mean 1.
 
 Modes:
-  net    (primary, P1) the cross-fitted AlphaNet from fit_urr: a fold-f row is
-         scored by <prefix>_fold{f}.pt, the net fit on the OTHER fold (RxRx's
-         export used fold{1-f}, the net fit on the row itself). Each fold's
-         treated mean must reproduce fit_urr's out-of-fold mean.
+  net    (v1 primary, P1) the cross-fitted AlphaNet from fit_urr: a fold-f row
+         is scored by <prefix>_fold{f}.pt, the net fit on the OTHER fold
+         (RxRx's export used fold{1-f}, the net fit on the row itself). Each
+         fold's treated mean must reproduce fit_urr's out-of-fold mean.
          -> dr_weights_urr.npz
-  counts (fallback) the closed-form discrete URR nu(a) / f_train(a) with add-k
-         smoothing, keyed on the dose_level arm (P2), and on (arm, C) when the
-         adjustment set C is non-empty; nu = nu_rows.npy. No torch.
+  counts the discrete URR as a count ratio, w = (n_nu(key) + k) / (n_train(key) + k)
+         over treated rows, nu = nu_rows.npy (the unthinned train pool). No torch.
          -> dr_weights_counts.npz
-v1 known answers: counts gives w = 1 exactly (nu = the train pool); net gives
-~1/(1 - pi0) = 1.066 on treated rows. In a thinning instance the weights are
-compared with dr_weights_design.npz.
+         - v1 (no thinning): key = the dose_level arm (P2), plus C when the
+           adjustment set is non-empty. nu = train, so w = 1 exactly (fallback, P1).
+         - thinning instance (steps C / A; primary, decision 2026-09-30): key =
+           the design's positivity cell, (compound, dose half, syn_c) or
+           (compound, dose_level, cell_id), from splits.POSITIVITY_KEYS. Every
+           cell keeps >= 1 train well by construction and the design weight is
+           constant within it, so with k = 0 this is the post-stratified design
+           weight n_unthinned / n_kept: 1 on unthinned cells. No cross-fitting:
+           the weights use (A, C) only, never Y, at a few cells per compound.
+           The net is not used here: per fold, most (arm, C) cells have no
+           factual fit row, so it cannot be cross-fitted (fit_urr refuses).
+v1 known answers: counts gives w = 1 exactly; net gives ~1/(1 - pi0) = 1.066
+on treated rows. In a thinning instance the weights are compared with
+dr_weights_design.npz (P_c / pi).
 
     python -m src.nuisances.export_urr_weights --mode net     [--nuisance_dir ...]
     python -m src.nuisances.export_urr_weights --mode counts  [--nuisance_dir ...]
@@ -47,7 +57,7 @@ from datasets import load_from_disk  # noqa: E402
 from src.data.build_dataset import (  # noqa: E402
     _atomic_write, covariate_blocks, load_covariate_encoder)
 from src.data.splits import (  # noqa: E402
-    arm_keys, load_splits, population_rows, resolve_split_file)
+    POSITIVITY_KEYS, arm_keys, load_splits, population_rows, positivity_cells, resolve_split_file)
 from src.nuisances.knn_dr import ess  # noqa: E402
 from src.spec import (  # noqa: E402
     add_adjustment_set_cli, add_paths_cli, alpha_cov_fields, apply_paths_args, config_from_args)
@@ -56,22 +66,20 @@ DEFAULT_OUT = {"net": "dr_weights_urr.npz", "counts": "dr_weights_counts.npz"}
 
 
 def counts_weights(rows: np.ndarray, nu: np.ndarray, key: np.ndarray, smooth_k: float) -> np.ndarray:
-    """Closed-form discrete URR per action key: p_nu(k) / p_train(k), add-k smoothed
-    over the actions of the scored rows. Identical pools give exactly 1."""
+    """Discrete URR as a count ratio per key: (n_nu(k) + smooth_k) / (n_rows(k) + smooth_k),
+    for each of `rows`. A key thinning did not touch gives exactly 1."""
     acts, tr_cnt = np.unique(key[rows], return_counts=True)
     nu_map = dict(zip(*np.unique(key[nu], return_counts=True)))
-    A = len(acts)
-    p_tr = (tr_cnt + smooth_k) / (len(rows) + smooth_k * A)
-    p_nu = (np.array([nu_map.get(k, 0) for k in acts]) + smooth_k) / (len(nu) + smooth_k * A)
-    w_by_act = dict(zip(acts, (p_nu / p_tr).astype(np.float32)))
+    nu_cnt = np.array([nu_map.get(k, 0) for k in acts], dtype=np.float64)
+    w_by_act = dict(zip(acts, ((nu_cnt + smooth_k) / (tr_cnt + smooth_k)).astype(np.float32)))
     return np.array([w_by_act[k] for k in key[rows]], dtype=np.float32)
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("--mode", choices=("net", "counts"), default="net", help="'net' (primary): the cross-fitted AlphaNet from fit_urr. 'counts' (fallback): smoothed nu(a)/f_train(a) per arm, no torch.")
+    p.add_argument("--mode", choices=("net", "counts"), default="net", help="'net' (v1 primary): the cross-fitted AlphaNet from fit_urr. 'counts': the count ratio n_nu / n_train, per arm in v1 (fallback, == 1) and per positivity cell in a thinning instance (steps C / A, P12); no torch.")
     p.add_argument("--nu_rows", default="nu_rows.npy", help="counts mode: the nu pool (build_tiered_split emits it), relative to the split dir.")
-    p.add_argument("--smooth_k", type=float, default=0.5, help="counts mode: add-k smoothing on both action distributions.")
+    p.add_argument("--smooth_k", type=float, default=0.0, help="counts mode: add-k on both counts (0 = the exact post-stratified weight; every scored key has a train row).")
     p.add_argument("--prefix", default="alpha_urr", help="net mode: fit_urr's --out_prefix.")
     p.add_argument("--out", default=None, help="Default dr_weights_urr.npz (net) / dr_weights_counts.npz (counts).")
     p.add_argument("--clip", type=float, default=0.0, help="Cap on w (0 = off).")
@@ -82,13 +90,15 @@ def main():
     add_paths_cli(p)
     a = p.parse_args()
 
+    if a.smooth_k < 0:
+        p.error("--smooth_k must be >= 0")
     cfg = apply_paths_args(config_from_args(a), a)
     nz = cfg.paths.nuisance_dir
     splits = load_splits(cfg)
     train_idx = splits["train_idx"]
 
     meta = load_from_disk(cfg.paths.tabular_dataset_dir).select_columns(
-        ["cov_vec", "compound_idx", "log10_conc", "is_control", "dose_level", "pert_id"])
+        ["cov_vec", "compound_idx", "log10_conc", "is_control", "dose_level", "pert_id", "syn_c", "cell_id"])
     cov = np.asarray(meta["cov_vec"], dtype=np.float32)
     comp = np.asarray(meta["compound_idx"], dtype=np.int64)
     lx = np.asarray(meta["log10_conc"], dtype=np.float32)
@@ -105,22 +115,36 @@ def main():
     score = ic[train_idx] < 0.5
     rows = train_idx[score]
 
+    tier = splits["tier"]
     if a.mode == "counts":
-        # Closed-form discrete URR: per action, w = p_nu / p_train with smoothing.
         # nu = the design (unthinned) pool, so on a tiered split this estimates the design weights from data.
         nu_path = resolve_split_file(nz, a.nu_rows)
         nu = np.load(nu_path).astype(np.int64)
         if not np.isin(train_idx, nu).all():
             raise ValueError(f"{nu_path} does not contain every train row; it belongs to another split")
         nu = nu[(ic[nu] < 0.5) & pop[nu]]
-        key = arm_keys(comp, np.asarray(meta["dose_level"], dtype=np.float64), ic)
-        if cov_idx:   # (arm, C) once C is non-empty (P2)
-            cstr = np.array(["".join(map(str, r)) for r in (cov[:, cov_idx] > 0.5).astype(np.int8)], dtype=object)
-            key = key + "|C=" + cstr
+        dl = np.asarray(meta["dose_level"], dtype=np.float64)
+        if tier.get("active"):
+            # steps C / A: the design's positivity cell (decision 2026-09-30)
+            conf = tier["confounder"]
+            if keep != [conf]:
+                raise ValueError(f"this split thins on {conf!r}: export its weights with --adjustment_set {conf} "
+                                 f"(got X={keep or 'empty'}); the DR arm adjusts for the thinning covariate")
+            key = positivity_cells(conf, comp, dl, ic, np.asarray(meta[conf]))
+            what = f"positivity cells {POSITIVITY_KEYS[conf]}"
+        else:
+            key = arm_keys(comp, dl, ic)
+            if cov_idx:   # (arm, C) once C is non-empty (P2)
+                cstr = np.array(["".join(map(str, r)) for r in (cov[:, cov_idx] > 0.5).astype(np.int8)], dtype=object)
+                key = key + "|C=" + cstr
+            what = f"dose_level arms (X={keep or 'empty'})"
         out = counts_weights(rows, nu, key, a.smooth_k)
-        print(f"[export] mode=counts: {len(np.unique(key[rows])):,} actions (X={keep or 'empty'}), "
+        print(f"[export] mode=counts: {len(np.unique(key[rows])):,} keys = {what}; "
               f"nu={len(nu):,} treated rows from {os.path.basename(nu_path)}, smooth_k={a.smooth_k}")
     else:
+        if tier.get("active"):
+            raise SystemExit("[export] a thinning instance's weights come from --mode counts (positivity-cell "
+                             "post-stratification, IMPLEMENT.md decision 2026-09-30); the net cannot be cross-fitted here")
         import torch
         from src.nuisances.alpha_net import AlphaNet, spec_path
         dev = torch.device(a.device)
@@ -177,7 +201,7 @@ def main():
     w[score] = out
 
     dst = os.path.join(nz, a.out or DEFAULT_OUT[a.mode])
-    _atomic_write(dst, lambda f: np.savez(f, row_id=train_idx, w=w, mode=np.array(a.mode),
+    _atomic_write(dst, lambda f: np.savez(f, row_id=train_idx, w=w, mode=np.array(a.mode), smooth_k=np.array(a.smooth_k),
                                           split_fingerprint=np.array(splits["split_fingerprint"])), mode="wb")
     wn = w / w.mean()
     nz1 = w[np.abs(w - 1.0) > 1e-6]

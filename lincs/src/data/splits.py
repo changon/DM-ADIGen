@@ -87,6 +87,47 @@ def arm_keys(compound_idx, dose_level, is_control) -> np.ndarray:
                      for c, d, k in zip(comp, dl, ctl)], dtype=object)
 
 
+def dose_half(compound_idx, dose_level, is_control) -> np.ndarray:
+    """(N,) int8: 1 for the high half of each compound's dose levels, 0 for the
+    low half, -1 for vehicles. The levels are the compound's distinct treated
+    dose_levels in the table; of n levels the top n - n//2 are high (4-6 of 6;
+    with an odd count the middle level is high)."""
+    comp = np.asarray(compound_idx, dtype=np.int64)
+    ctl = np.asarray(is_control).astype(bool)
+    dl = np.asarray(dose_level, dtype=np.float64)
+    out = np.full(comp.shape[0], -1, dtype=np.int8)
+    for c in np.unique(comp[~ctl]):
+        m = (comp == c) & ~ctl
+        lv = np.unique(dl[m])
+        out[m] = np.searchsorted(lv, dl[m]) >= lv.size // 2
+    return out
+
+
+# The design's positivity cell per confounder (IMPLEMENT.md §3.8.1-3; decision
+# 2026-09-30): thinning keeps >= 1 train well in each, the design weight is
+# constant within each, and step C / A estimate the DR weights at this key.
+POSITIVITY_KEYS = {"syn_c": ("compound", "dose_half", "syn_c"),
+                   "cell_id": ("compound", "dose_level", "cell_id")}
+
+
+def positivity_cells(confounder: str, compound_idx, dose_level, is_control, c_values) -> np.ndarray:
+    """(N,) the positivity cell of each row for `confounder`; vehicles are CONTROL_ARM.
+        syn_c   -> "<compound_idx>|h<dose half>|syn_c=<v>"
+        cell_id -> "<arm>|cell_id=<v>"   (arm = compound_idx|dose_level)"""
+    ctl = np.asarray(is_control).astype(bool)
+    cv = np.asarray(c_values).astype(str)
+    if confounder == "syn_c":
+        comp = np.asarray(compound_idx, dtype=np.int64)
+        half = dose_half(comp, dose_level, ctl)
+        return np.array([CONTROL_ARM if k else f"{c}|h{h}|syn_c={v}"
+                         for c, h, v, k in zip(comp, half, cv, ctl)], dtype=object)
+    if confounder == "cell_id":
+        arm = arm_keys(compound_idx, dose_level, ctl)
+        return np.array([CONTROL_ARM if k else f"{a}|cell_id={v}"
+                         for a, v, k in zip(arm, cv, ctl)], dtype=object)
+    raise ValueError(f"no positivity cell declared for confounder {confounder!r}; have {list(POSITIVITY_KEYS)}")
+
+
 def split_strata(cell_id, compound_idx, dose_level, is_control, det_plate) -> np.ndarray:
     """(N,) stratum of each row: "arm|<cell_id>|<arm>" for treated wells,
     "dmso|<det_plate>" for vehicles (DMSO stratified by plate, P3). cell_id is

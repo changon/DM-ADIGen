@@ -8,20 +8,24 @@ the ESS / tail gate), then adapted (IMPLEMENT.md §3.5; P2, P5):
     experiment / cell_type reads: the split is already the population;
   - X = alpha_cov_fields(cfg), the adjustment set shared with export and the
     generator (v1: empty); no --cov_blocks override, and --nu_rows does not
-    empty X (step C fits `--adjustment_set syn_c --nu_rows ...`);
+    empty X (RxRx emptied it);
   - arms are (compound_idx, dose_level) (P2) for the common support and nu;
   - cross-fit folds are stratified on that arm (P5), and on the X stratum:
     each arm's rows alternate between the folds, so a row is scored by a net
-    that saw its arm. Folds cover the whole nu pool (train rows and, in a
-    thinning instance, the thinned-away rows, stratified separately), so each
-    fold's P and nu are half-samples of the same design;
+    that saw its arm. Folds cover the nu pool, stratified separately on
+    train vs non-train rows so that each fold's P and nu are half-samples of
+    the same design (thinning instances are refused, so nu = train here);
   - the val rows are drawn from the fold's pool and held out of BOTH legs, and
     every (nu arm, X stratum) of the product leg must have a factual fit row
     (--max_nu_gap_cells): with ~1 row per arm per fold, a nu arm without one
     has P_fit = 0 and alpha = nu / P runs to +inf;
   - control ids come from `__control__`; nu never contains controls;
   - --nu_rows (default nu_rows.npy, relative to the split dir) replaces RxRx's
-    --nu_source; a thinning instance refuses to run without it (§3.8.1);
+    --nu_source;
+  - a thinning instance (steps C / A) is refused (decision 2026-09-30): its
+    (arm, C) cells hold ~1 train well, so in each fold most of them have no
+    factual fit row and alpha cannot be cross-fitted. Its DR weights are
+    `export_urr_weights --mode counts` at the design's positivity cell.
   - outputs are written together at the end and share a run_id; the previous
     <prefix>_meta.json is removed at the start, so export never picks up a
     crashed run's mix of old and new nets.
@@ -130,7 +134,7 @@ def main():
     p.add_argument("--patience", type=int, default=15)
     p.add_argument("--val_frac", type=float, default=0.15)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--target_support", default="common", choices=("common", "all"), help="Support of nu: 'common' = arms with train rows in every X stratum; 'all' = every treated arm of the population (step C).")
+    p.add_argument("--target_support", default="common", choices=("common", "all"), help="Support of nu: 'common' = arms with train rows in every X stratum; 'all' = every treated arm of the population.")
     p.add_argument("--out_prefix", default="alpha_urr",  help="Basename for the saved nets/meta (default alpha_urr -> alpha_urr_fold{0,1}.pt + alpha_urr_meta.json).")
     p.add_argument("--nu_rows", default="nu_rows.npy", help="The .npy of row ids defining nu (the UNTHINNED train pool build_tiered_split writes), relative to the split dir. 'none' = this fold's fit rows (refused on a thinning instance).")
     p.add_argument("--max_nu_gap_cells", type=int, default=0, help="Refuse a fold whose product leg has more (nu arm, X stratum) cells than this without a factual fit row (alpha is unbounded there).")
@@ -171,6 +175,11 @@ def main():
 
     splits = load_splits(cfg)
     train_idx = splits["train_idx"]
+    if splits["tier"].get("active"):
+        raise SystemExit(
+            f"[urr] {nz} is a thinning instance ({splits['tier'].get('confounder')}): its (arm, C) cells hold "
+            f"~1 train well, so alpha cannot be cross-fitted there. Its DR weights come from "
+            f"`export_urr_weights --mode counts` at the design's positivity cell (IMPLEMENT.md decision 2026-09-30).")
 
     # ---------------------------------------------------------------------
     # derive X (column indices): the adjustment set shared with export and the generator
@@ -216,8 +225,6 @@ def main():
 
     # the nu pool: the unthinned design pool (nu_rows.npy), or the train rows ('none')
     use_nu_rows = args.nu_rows.lower() != "none"
-    if not use_nu_rows and splits["tier"].get("active"):
-        raise ValueError("a thinning instance needs --nu_rows: nu must see the unablated design (IMPLEMENT.md §3.8.1)")
     nu_rows_path = resolve_split_file(nz, args.nu_rows) if use_nu_rows else ""
     fold_pool = train_idx
     if nu_rows_path:

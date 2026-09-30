@@ -13,7 +13,8 @@ than the split / stats code paths) and checks the v1 known answers:
   urr        gate usable; v1: alpha ~ 1/(1-pi0) treated, ~0 DMSO
   weights    net weights scored out-of-fold (per-fold means = fit_urr's);
              v1: counts w = 1 exactly; net w ~ 1/(1-pi0) treated, 1 vehicle,
-             ~1.004 / ~0.942 after mean-1 normalisation   [after export]
+             ~1.004 / ~0.942 after mean-1 normalisation   [after export];
+             thinning instance: counts w = n_unthinned / n_kept per positivity cell
   tier       thinning instance, recomputed from the table: rows, z, pi,
              positivity, design weights P_c / pi; unscored holdout = v1's
 Sections run when their artifacts exist. Exits nonzero on any failure.
@@ -272,6 +273,38 @@ def main():
                                  f"|diff| {max(d):.1e})")
         if v1 and name == "dr_weights_counts.npz":
             check(np.all(w == 1.0), "v1 known answer: counts weights are exactly 1 (nu = the train pool)")
+        if tier.get("active") and name == "dr_weights_counts.npz":
+            # positivity-cell post-stratification (decision 2026-09-30), recomputed from the table
+            conf = tier["confounder"]
+            sub = df.loc[~ctl, ["compound_idx", "dose_level"]]
+            lvl = sub.groupby("compound_idx")["dose_level"].rank(method="dense") - 1
+            nlev = sub.groupby("compound_idx")["dose_level"].transform("nunique")
+            hi = np.full(N, -1)
+            hi[~ctl] = (lvl >= nlev // 2).astype(int).values
+            if conf == "syn_c":
+                cell = df["compound_idx"].astype(str) + "|h" + pd.Series(hi).astype(str) + "|" + df["syn_c"].astype(str)
+            else:
+                cell = (df["compound_idx"].astype(str) + "|" + df["dose_level"].map(lambda v: f"{v:.6g}")
+                        + "|" + df["cell_id"].astype(str))
+            cell = cell.values
+            k = float(wz["smooth_k"]) if "smooth_k" in wz else float("nan")
+            check(k == 0.0, f"{name}: exported with smooth_k 0 (the post-stratified weight, P12; got {k:g})")
+            k = 0.0 if not np.isfinite(k) else k
+            n_nu = pd.Series(cell[nu][~ctl[nu]]).value_counts()
+            n_tr = pd.Series(cell[tr][trt]).value_counts()
+            want = np.ones(tr.size)
+            ct = cell[tr][trt]
+            want[trt] = (n_nu.reindex(ct).values + k) / (n_tr.reindex(ct).values + k)
+            scored_c = np.isin(df["compound_idx"].values[tr], list(tier["scored_compounds"].values())) & trt
+            check(np.allclose(w, want, rtol=1e-6, atol=0) and np.all(w[trt & ~scored_c] == 1.0),
+                  f"{name}: w = n_unthinned / n_kept per positivity cell ({conf}; recomputed from the table; "
+                  f"smooth_k {k:g}); 1 on every unscored row")
+            dz_ = np.load(os.path.join(nz, "dr_weights_design.npz"))["w"].astype(np.float64)
+            m = dz_ != 1.0
+            cc = float(np.corrcoef(w[m], dz_[m])[0, 1]) if m.sum() > 2 and dz_[m].std() > 0 else float("nan")
+            print(f"      counts vs design weights on {int(m.sum())} kept scored rows: corr {cc:+.3f}, "
+                  f"mean {w[m].mean():.3f} vs {dz_[m].mean():.3f} (both inverse inclusion; counts is the "
+                  f"realised, design the expected one)")
         if v1 and name == "dr_weights_urr.npz":
             check(abs(w[trt].mean() / r_v1 - 1) < args.known_answer_rtol,
                   f"v1 known answer: net weights treated {w[trt].mean():.4f} vs 1/(1-pi0) = {r_v1:.4f}")

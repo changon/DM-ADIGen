@@ -62,8 +62,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.data.build_dataset import _atomic_write, _write_json  # noqa: E402
 from src.data.build_nu_rows import NU_ROWS_FILENAME, build_nu_rows  # noqa: E402
 from src.data.splits import (  # noqa: E402
-    SPLITS_FILENAME, arm_keys, population_key, population_rows, split_fingerprint,
-    split_layer, split_report, split_strata)
+    POSITIVITY_KEYS, SPLITS_FILENAME, arm_keys, dose_half, population_key, population_rows,
+    split_fingerprint, split_layer, split_report, split_strata)
 from src.spec import (  # noqa: E402
     CaseConfig, add_adjustment_set_cli, add_paths_cli, apply_paths_args, config_from_args)
 
@@ -129,12 +129,12 @@ def default_out_dir(cfg: CaseConfig, base: str, scored: list[str], confounder: s
     return os.path.normpath(base) + tag
 
 
-def thin_compound(rows: np.ndarray, dose_level: np.ndarray, c_val: np.ndarray, levels: list[float],
+def thin_compound(rows: np.ndarray, half: np.ndarray, c_val: np.ndarray,
                   confounder: str, gamma: float, keep_frac: float, pmin: float,
                   rng: np.random.Generator, max_redraws: int) -> dict:
-    """Layer 3 for one scored compound: pi, the kept mask, and its positivity cells."""
-    rank = {lv: i for i, lv in enumerate(levels)}
-    high = np.array([rank[d] >= len(levels) // 2 for d in dose_level[rows]])
+    """Layer 3 for one scored compound: pi, the kept mask, and its positivity cells.
+    `half` is splits.dose_half over the table (1 = high half of the compound's levels)."""
+    high = half[rows] == 1
     if confounder != "syn_c":
         raise NotImplementedError(
             f"--confounder {confounder}: the step-A line groups (z_C) and (compound, dose_level, "
@@ -274,6 +274,7 @@ def main():
         in_train = np.zeros(n_total, dtype=bool)
         in_train[train_idx] = True
         c_val = df[confounder].values
+        half = dose_half(comp, dose_level, ctl)
         drop = np.zeros(n_total, dtype=bool)
         w_of = {}
         inv_vocab = {v: k for k, v in vocab.items()}
@@ -284,7 +285,7 @@ def main():
                 raise ValueError(f"scored compound {inv_vocab[ci]} has {len(levels)} dose level(s); "
                                  f"the dose-half selection needs >= 2")
             try:
-                t = thin_compound(rows, dose_level, c_val, levels, confounder, args.gamma,
+                t = thin_compound(rows, half, c_val, confounder, args.gamma,
                                   keep_frac, args.pmin, thin_rng, args.max_redraws)
             except (ValueError, RuntimeError) as e:
                 raise type(e)(f"scored compound {inv_vocab[ci]}: {e}") from None
@@ -321,6 +322,7 @@ def main():
             "confounder": confounder, "gamma": args.gamma, "keep_frac": keep_frac, "pmin": args.pmin,
             "selection": "z = standardize(z_dose * z_C) within compound; z_dose = +/-1 high/low dose half, z_C = +/-1",
             "positivity_cells": "(compound, dose half, syn_c)",
+            "positivity_key": list(POSITIVITY_KEYS[confounder]),
             "scored_compounds": {a["pert_id"]: a["compound_idx"] for a in tier_arms},
             "n_thinned": int(train_idx.size - final_train.size),
         })

@@ -2,10 +2,11 @@
 
 Rewritten from RxRx19a/src/data/build_nu_rows.py (IMPLEMENT.md §3.5, §3.8.1).
 nu = population rows minus the holdout minus the reserve wells: the design
-action distribution BEFORE thinning. `fit_urr --nu_rows` and
-`export_urr_weights --mode counts` read it, so the learned alpha targets
-nu_design(a) / f_thinned(a), i.e. the design weights. In v1 (no reserve, no
-thinning) nu is exactly the train rows. build_tiered_split calls this.
+action distribution BEFORE thinning. `export_urr_weights --mode counts` reads
+it, so in a thinning instance w = n_nu / n_kept per positivity cell is the
+post-stratified design weight (P12); `expr_stats` fits its statistics on it;
+`fit_urr --nu_rows` uses it in v1. In v1 (no reserve, no thinning) nu is
+exactly the train rows. build_tiered_split calls this.
 
     python -m src.data.build_nu_rows [--data_dir ...] --nuisance_dir data/mcf7_24h/nuisances
 """

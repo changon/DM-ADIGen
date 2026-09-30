@@ -242,6 +242,19 @@ Concretely:
 
 Section 3.9’s “copy” column means this procedure, not a live dependency.
 
+> **Aside — known bug in RxRx19a (recorded only; RxRx19a is not maintained
+> from this plan, so it is not patched here).**
+> `RxRx19a/src/nuisances/export_urr_weights.py:90` scores fold-f rows with
+> `nets[1 - f]`. `fit_urr` saves `alpha_urr_fold{f}.pt` as the net fit on the
+> rows *not* in fold f, i.e. the net meant to score fold f; `fold{1-f}.pt` was
+> fit on fold f itself. The exported `--mode net` weights are therefore
+> in-sample, not cross-fitted, and `fit_urr`'s gate (computed out-of-fold)
+> certifies different weights from the ones exported. It is invisible when α
+> is near-constant and matters once α varies with (X, A). The fix is
+> `net = nets[f]` (or read `eval_model_for_fold[str(f)]` from the meta).
+> The LINCS copy is fixed and checks each fold's exported mean against
+> `fit_urr`'s out-of-fold mean (§5, Phase 1 implementation and review).
+
 ### 3.2 Data pipeline (rewrite ingest; keep table schema)
 
 **Download** as in `SPEC.md` (done: all five files plus the decompressed
@@ -589,22 +602,23 @@ Do **not** wrap 978 into `(B, 1, H, W)` to call `DiT2DModel`.
 | Module | Action |
 |---|---|
 | `knn_dr.py` | **Copy** as a new file: `fit_urr` and `export_urr_weights` import `ess` / `tail_index` from it. `knn_dr_weights` (kNN AIPW) is not used. |
-| `export_urr_weights.py` | **Copy.** Drop `disease_condition` / `inf`: score treated rows, vehicle rows keep $w = 1$. `--mode net` is the primary source (P1); `--mode counts` is the fallback: closed-form $\nu(a)/f_\text{train}(a)$ with add-k smoothing; key actions on the `dose_level` arm, not RxRx's `round(log10_conc·1000)` (10,944 vs 10,479 keys: float variants split arms), and on (arm, C) once $C \neq \varnothing$ (P2). `--mode net`: the cross-fitted AlphaNet from `fit_urr`. Writes `dr_weights_{counts,urr}.npz` `{row_id, w}`; checks against `dr_weights_design.npz` when it exists. Import torch lazily so `counts` runs as a CPU job without it. |
-| `build_nu_rows.py` | **Rewrite.** $\nu$ = the unthinned train pool minus reserve wells, written as `nu_rows.npy` for `fit_urr --nu_rows` and `export --mode counts`. `build_tiered_split` calls it. v1 has no thinning, so $\nu$ = the train rows. |
+| `export_urr_weights.py` | **Copy.** Drop `disease_condition` / `inf`: score treated rows, vehicle rows keep $w = 1$. `--mode net` is the primary source in v1 (P1); `--mode counts` is the fallback there: the count ratio $n_\nu(a)/n_\text{train}(a)$; key actions on the `dose_level` arm, not RxRx's `round(log10_conc·1000)` (10,944 vs 10,479 keys: float variants split arms), and on (arm, C) once $C \neq \varnothing$ (P2). In a thinning instance (steps C / A) `counts` is the source, keyed on the design's positivity cell (P12), and `--mode net` is refused. `--mode net`: the cross-fitted AlphaNet from `fit_urr`. Writes `dr_weights_{counts,urr}.npz` `{row_id, w}`; checks against `dr_weights_design.npz` when it exists. Import torch lazily so `counts` runs as a CPU job without it. |
+| `build_nu_rows.py` | **Rewrite.** $\nu$ = the unthinned train pool minus reserve wells, written as `nu_rows.npy` for `fit_urr --nu_rows` (v1), `export --mode counts` and `expr_stats`. `build_tiered_split` calls it. v1 has no thinning, so $\nu$ = the train rows. |
 | `alpha_net.py` | **Rewrite input.** Drop `infected`. `in_dim = cov_idx + embed + log10_conc + is_control` (the `+3` becomes `+2`). Keep softplus head / `SP_SHIFT`. |
 | `fit_urr.py` | **Copy URR loss** $L = \mathbb{E}[\alpha(X,A)^2] - 2\mathbb{E}[\alpha(X,A_t)]$. **Delete** the `infected==1` train restriction, the `disease_condition` array, `--cell_type {HRCE,VERO}` and the `experiment` / `cell_type` reads. Take control ids from `__control__` (RxRx compares vocab keys to the empty `control_token`, which never matches). Population mask = filters already applied at build (optionally `--population_compounds`). Cross-fit folds **stratified on the `dose_level` arm** (P5) instead of RxRx's random halves; `--nu_rows`; common support and $\nu$ keyed on the `dose_level` arm, not `round(log10_conc, 6)` (P2); ESS/tail gate; `nuisance_meta.json`. |
 | `alpha_truth_check.py`, `fit_knn_dr.py` | **Not ported.** Removed from RxRx in `78d4284`; kNN AIPW retired 2026-09-29. |
 | `precompute_cmean.py` | **Copy, optional** (P9). Means of normalised `y` (not VAE latents) over TRAIN rows, keyed on the `dose_level` arm (vehicles one key); `--min_n` configurable (RxRx default 8 keeps 34 of 10,479 arms; coverage logged); stores `train_idx`, which the trainer checks. Feeds the FM-only `--cmean_lambda` loss (default 0 = off). |
 
-**Arms are tiny.** With ~2 train wells per arm, `counts` estimates each
-arm's $\nu(a)/f_\text{train}(a)$ from counts of ~2, so smoothing
-(`--smooth_k`, 0.5) matters once the train pool is thinned (step C / A). In
-v1, $\nu$ = the train pool and the ratio is exactly 1. `net` is cross-fitted:
+**Arms are tiny.** With ~2 train wells per arm, an (arm, C) cell holds ~1
+train well, too few to estimate a thinned weight per arm or to cross-fit a
+net at that key (P12): steps C / A estimate the weights at the design's
+positivity cell instead. In v1, $\nu$ = the train pool and the ratio is
+exactly 1. `net` is cross-fitted:
 a row is scored by the net fit on the other fold. With random folds, 35% of
 treated train rows have no well of their own arm in the other fold (their
 compound is always there, measured); arm-stratified folds fix that (P5).
 Arms are keyed on `dose_level` everywhere: `fit_urr` support, fold strata,
-`counts` keys, and the tiered split's scored arms (RxRx rounds log-dose to
+v1 `counts` keys, and the tiered split's scored arms (RxRx rounds log-dose to
 3 d.p.). Float variants (0.37 vs 0.3704 µM) would otherwise split arms,
 10,944 vs 10,479 (P2).
 
@@ -665,10 +679,13 @@ ablation (P9: `--cmean_lambda` 0 vs > 0, FM arms only). Do not cross
 
 The weighted arm is two or three jobs, not one command:
 
-- `net` (primary): `fit_urr --nu_rows …` → `export_urr_weights --mode net`
+- v1, `net` (primary): `fit_urr --nu_rows …` → `export_urr_weights --mode net`
   → `train_diffusion --dr_mode weighted --dr_weights_file dr_weights_urr.npz`;
-- `counts` (fallback): `export_urr_weights --mode counts` (CPU) →
-  `train_diffusion --dr_mode weighted --dr_weights_file dr_weights_counts.npz`.
+- v1, `counts` (fallback): `export_urr_weights --mode counts` (CPU) →
+  `train_diffusion --dr_mode weighted --dr_weights_file dr_weights_counts.npz`;
+- steps C / A (P12): `export_urr_weights --mode counts --adjustment_set C`
+  (CPU, positivity-cell weights) → the same `train_diffusion` command with
+  `dr_weights_counts.npz`. `fit_urr` refuses a thinning instance.
 
 Document that in the LINCS README.
 Write Python `-m` commands; SLURM wrappers later.
@@ -819,10 +836,18 @@ Outputs, as in RxRx:
   compound's 6) and `z_C = ±1` for the two levels or groups of C.
 - **Positivity cells** differ by step (below). The covariate and its groups
   go into the dir tag and the `tier` block.
-- **$\nu$ must see the unablated design.** $\nu$ = `nu_rows.npy`, passed to
-  `fit_urr --nu_rows` and read by `export_urr_weights --mode counts`. If
-  $\nu$ came from the thinned pool, $\alpha$ would be blind to the thinning
-  by construction.
+- **$\nu$ must see the unablated design.** $\nu$ = `nu_rows.npy`, read by
+  `export_urr_weights --mode counts`. If $\nu$ came from the thinned pool,
+  $\alpha$ would be blind to the thinning by construction.
+- **DR weights (P12).** `export_urr_weights --mode counts` estimates
+  $\alpha$ at the positivity cell: $w = n_\nu(\text{cell}) /
+  n_\text{kept}(\text{cell})$ on treated train rows, 1 on vehicles. It is
+  the post-stratified version of the design weight: the design weight is
+  constant within a cell, every cell keeps ≥ 1 train well, and unthinned
+  cells get exactly 1. It is not cross-fitted: it uses (A, C) only, never Y,
+  at a few cells per compound. The cross-fitted net cannot be used, because in
+  each fold most (arm, C) cells have no factual fit row (measured in the
+  Phase 5 TODO note); `fit_urr` refuses a thinning instance.
 - **Design truth.** `export_urr_weights` compares its weights with
   `dr_weights_design.npz` (correlation on the design-weighted rows).
 - **Arms per step** (MLP only; same split and seed; γ > 0 plus the γ = 0
@@ -832,7 +857,7 @@ Outputs, as in RxRx:
   |---|---|---|---|
   | `naive` | `''` | conditional | shows the bias the thinning creates |
   | `conditional` | C | conditional | g-formula baseline |
-  | `dr` | C | weighted, `dr_weights_urr.npz` (`counts` fallback) | ADIGen |
+  | `dr` | C | weighted, `dr_weights_counts.npz` (positivity-cell counts, P12) | ADIGen |
   | `dr_design` (reference) | C | weighted, `dr_weights_design.npz` | true weights: separates weight-estimation error from the generator |
 
   Train at least 2 seeds per arm, so that "DR beats conditional" is judged
@@ -846,8 +871,8 @@ Outputs, as in RxRx:
   2. `dr`'s error on scored compounds is below `conditional`'s by more than
      seed noise, and close to `dr_design`'s.
   3. Unscored compounds are unchanged.
-  4. The URR gate passes with $\alpha$ genuinely varying in $C$ (unlike v1),
-     and the exported weights track `dr_weights_design.npz`.
+  4. The `counts` weights vary with $C$ on scored compounds (unlike v1), are
+     1 on unscored ones, and track `dr_weights_design.npz`.
 
 #### 3.8.2 Step C — semi-synthetic covariate on MCF7
 
@@ -876,14 +901,13 @@ Outputs, as in RxRx:
     reports the realised kept fraction.
 - **Positivity is per compound-half, not per arm.** After thinning, some
   scored arms keep train wells in only one `syn_c` level.
-  - `fit_urr --target_support common` would drop those arms from $\nu$, and
-    they are exactly the arms the test is about. **Use `--target_support all`
-    in step C.**
-  - This is safe here: every (compound, half, `syn_c`) cell keeps ≥ 1 row,
-    and the `syn_c` effect is the same additive shift for every arm, so both
-    the $\alpha$ net and the generator can share it across doses.
-  - `counts` (fallback) keys on (arm, `syn_c`) (P2).
-  - The ESS / tail gate and the design-weight comparison remain the checks.
+  - The weights are therefore estimated at the (compound, dose half,
+    `syn_c`) cell, which keeps ≥ 1 train well by construction (P12):
+    `export_urr_weights --mode counts --adjustment_set syn_c`.
+  - The generator still conditions on the arm and `syn_c`; the `syn_c`
+    effect is the same additive shift for every arm, so it can share it
+    across doses.
+  - The design-weight comparison is the check.
 - **The ground truth is known.** The bias lives along `v`. Report the signed
   projection $\langle \hat\tau_\text{gen}(a) - \hat\tau_\text{oracle}(a),
   v\rangle$ for scored arms by dose half, alongside the aggregate metrics of
@@ -926,8 +950,9 @@ Outputs, as in RxRx:
 - **Positivity cells are (compound, `dose_level`, `cell_id`)**, about 2 train
   rows each. Keeping ≥ 1 row per cell means every scored arm keeps ≥ 1 row in
   every line.
-  - So **arm-level positivity survives the thinning**, and
-    `--target_support common` works as in RxRx.
+  - So **arm-level positivity survives the thinning**. The weights are
+    `counts` at this cell, i.e. (arm, `cell_id`) (P12); with ~2 train rows
+    per cell the net cannot be cross-fitted here either.
   - Selection can remove at most ~half of a scored compound's rows (1 of ~2
     per cell), so the default is `--keep_frac 0.6`, with 0.5 as the floor.
 - **`z_C`:** a fixed split of the 5 lines into two groups, declared in
@@ -1054,7 +1079,7 @@ URR step) for a GPU box. Put it under `src/` because `.gitignore` drops
 `lincs/scripts/`, and an untracked file cannot go through the review §4
 requires.
 
-### 3.12 Phase 0 decisions (resolved and frozen; 3 and 5 amended 2026-09-29)
+### 3.12 Phase 0 decisions (resolved and frozen; 3 and 5 amended 2026-09-29; 7 amended 2026-09-30)
 
 1. **Cell line: `MCF7`.** A metadata scan of the 24 h
    `trt_cp ∪ ctl_vehicle` slice found 35,623 chemical and 2,084 vehicle
@@ -1110,7 +1135,8 @@ requires.
      (`plate_qc_max_spread_ratio=3.0`; on MCF7 this drops one plate).
    - Evidence and consequences are in §3.2. `plate_center="none"` is the
      ablation.
-7. **Confounding program — accepted 2026-09-28.** Two steps after v1, in
+7. **Confounding program — accepted 2026-09-28; weight estimation amended
+   2026-09-30 (P12).** Two steps after v1, in
    order (§3.8):
    - **step C**, semi-synthetic `syn_c` on MCF7, as a sanity check with a
      known effect direction;
@@ -1121,8 +1147,8 @@ requires.
    - responders-only rare compounds;
    - dose-half × C selection by probabilistic thinning in the tiered split
      (§3.8.1; P6), with known design weights;
-   - $\nu$ from the unthinned design pool (`fit_urr --nu_rows`,
-     `export_urr_weights`);
+   - $\nu$ from the unthinned design pool, with the DR weights estimated
+     by `export_urr_weights --mode counts` at the positivity cell (P12);
    - the `naive` / `conditional` / `dr` arms (+ `dr_design` reference) with
      a γ = 0 control.
 
@@ -1133,7 +1159,7 @@ Do not change these decisions between the four v1 arms. A different compound
 universe or cell line defines a separate population and result set. Step A's
 `core5_24h` is such a population, and it does not replace decision 1.
 
-### 3.13 Phase 1 decisions (resolved 2026-09-29)
+### 3.13 Phase 1 decisions (resolved 2026-09-29; P12 and the P1 / P2 amendments 2026-09-30)
 
 Numbers are measured on the built `mcf7_24h` table (37,340 wells) unless
 marked analytic.
@@ -1147,13 +1173,15 @@ marked analytic.
   arms train on `net` weights (≈1.004 treated / 0.942 DMSO after
   normalisation, analytic). That exercises the `fit_urr` → export → trainer
   path step C needs. `counts` (≡ 1 in v1) runs as a check and stays
-  available if the net fails its gate.
+  available if the net fails its gate. *Amended 2026-09-30 (P12): this holds
+  for v1; steps C / A use `counts` at the positivity cell.*
 - **P2 — Arms are keyed on `dose_level`** everywhere an arm is keyed:
   `fit_urr` common support and $\nu$, the fold strata (P5), the tiered
   split's scored arms, and the `counts` keys. Once C is non-empty, keys are
   (arm, C). This still matters under P1: RxRx's float keys give 10,944 arms
   instead of 10,479 (0.37 vs 0.3704 µM split), which shrinks common support
-  in steps C / A.
+  in steps C / A. *Amended 2026-09-30 (P12): in a thinning instance the
+  `counts` key is the design's positivity cell, not (arm, C).*
 - **P3 — Split:** `holdout_frac` 0.2 with arm strata (realised 28.5%, train
   26.7k); DMSO stratified by plate (min 14 train DMSO per plate, vs 12 as one
   stratum); the table fingerprint in the cache key.
@@ -1180,6 +1208,24 @@ marked analytic.
   std stays over all centred train rows; GAPDH and the other capped genes are
   kept and reported (§3.12).
 - **P11 — The centring gate is measured on held-out DMSO wells** (§3.10).
+- **P12 — Steps C / A: DR weights are post-stratified counts at the design's
+  positivity cell (decided 2026-09-30).**
+  - Cells: (compound, dose half, `syn_c`) in step C; (compound, `dose_level`,
+    `cell_id`) in step A (`splits.POSITIVITY_KEYS`).
+  - $w = n_\nu(\text{cell}) / n_\text{kept}(\text{cell})$, 1 on vehicles
+    and on every unthinned cell; `export_urr_weights --mode counts`
+    (`--smooth_k` 0); no cross-fitting.
+  - Why: an (arm, C) cell holds ~1 train well. In each cross-fit fold most
+    (ν arm, C) pairs have no factual fit row, where the URR target
+    α = ν/P is unbounded: 77–78% of arms per fold with X = `syn_c`, on
+    mcf7_24h (Phase 5 TODO note). The design weight is constant within a
+    positivity cell, which always keeps ≥ 1 well.
+  - `fit_urr` and `export --mode net` refuse a thinning instance. A net
+    given the coarse action (dose half) could be a secondary estimate later;
+    it is not implemented, and it would still lack fit rows in 12–38% of cells
+    per fold at 5 folds.
+  - Dropping gap arms from each fold's ν was rejected: ν(a) = 0 sets α ≈ 0
+    and zeroes the weights of the scored arms.
 
 Compute: `fit_urr` imports torch but AlphaNet is tiny, so it runs as a CPU
 job (`ma` under the headroom rule). `export --mode counts` needs no torch
@@ -1228,7 +1274,9 @@ the ADIGen contract.
 
 ### Phase 1 — table consumers + nuisances
 
-- [x] §3.13 decisions D1, P1–P11 chosen and recorded (2026-09-29)
+- [x] §3.13 decisions D1, P1–P12 chosen and recorded (2026-09-29; P12 and
+      the P1 / P2 amendments 2026-09-30)
+      - Reopened and re-checked 2026-09-30 (P12 added, P1 / P2 amended).
 Checked 2026-09-29 after two independent code reviews (data layer;
 nuisances + smoke test), a re-review of every follow-up, and smoke runs:
 - local, numpy only, torch imports blocked: the `--limit 1500` build (v1,
@@ -1244,6 +1292,9 @@ implementation and review".
 - [x] `splits.py`: copied `load_splits` + stratification engine; cache key =
       population key + table fingerprint; arm strata; DMSO stratified by
       plate; realised holdout fraction logged (P3)
+      - Reopened and re-checked 2026-09-30 (P12): `dose_half`, `POSITIVITY_KEYS`,
+        `positivity_cells` added. `dose_half` equals the old thinning rule on
+        all 110 limit-build compounds (review).
       - mcf7_24h: train 26,690, holdout 10,650, realised 0.285 (treated
         0.290, DMSO 0.201); 725 / 10,479 arms without a holdout well; ≥ 14
         train DMSO per plate. Every stratum's holdout count is re-derived.
@@ -1252,6 +1303,9 @@ implementation and review".
 - [x] `build_tiered_split.py`: reserve (`k_reserve` 0 default) / split /
       thinning layers with `_calibrate_pi`; v1 instance = no scored
       compounds, no thinning → `splits.json` + `nu_rows.npy` (P4, P6)
+      - Reopened and re-checked 2026-09-30 (P12): the dose half comes from
+        `splits.dose_half`, and `tier.positivity_key` is recorded. The three
+        limit-build instances rebuild identical.
       - Thinning is generic over `--scored_compounds` and implements
         `--confounder syn_c`. `cell_id` raises until Phase 6 declares the
         line groups; `--plan` (it needs the oracle) is Phase 5.
@@ -1291,6 +1345,9 @@ implementation and review".
 - [x] `fit_urr.py`: copied URR loss; no `infected==1` restriction, no
       `--cell_type` / `experiment`; `--nu_rows`; support and \(\nu\) keyed on
       the `dose_level` arm (P2); arm-stratified cross-fit folds (P5)
+      - Reopened and re-checked 2026-09-30 (P12): refuses a thinning instance
+        up front, before it removes anything, pointing to `counts`. The limit
+        job checks the message. v1 results are unchanged.
       - Folds cover the ν pool, stratified on (arm, X stratum, train or not).
         99.9% of train rows see their arm in the other fold.
       - Val rows are held out of both legs. The first full run diverged
@@ -1303,6 +1360,13 @@ implementation and review".
       `net` (primary, P1) and `counts` (fallback; `dose_level` arm keys,
       (arm, C) when C is non-empty); compares with `dr_weights_design.npz`
       when present; writes `dr_weights_{urr,counts}.npz` `{row_id, w}`
+      - Reopened and re-checked 2026-09-30 (P12). On a thinning instance,
+        `counts` keys on the positivity cell: w = n_ν / n_kept, `--smooth_k`
+        0 (negative refused).
+      - It refuses an adjustment set other than the tier's covariate, and
+        `--mode net` exits before torch loads.
+      - Limit γ = 1 instance: recomputed exactly from the table; unscored
+        rows 1; kept scored rows mean 2.18 vs design 2.07, corr +0.83.
       - Fold f is scored by `fold{f}.pt`. RxRx's `nets[1 - f]` scored rows
         in-sample (§5).
       - Refuses unless the per-fold treated means equal `fit_urr`'s
@@ -1310,6 +1374,8 @@ implementation and review".
 - [x] URR gate: beats constant baseline, `mean(alpha)≈1`, ESS/n usable
       (trivial on v1 — §3.3); known answers hold: net
       \(\alpha \approx 1.066\) on treated / ≈0 on DMSO, `counts` \(w \equiv 1\)
+      - Reopened and re-checked 2026-09-30 (P12): the v1 known answers
+        re-verified on the final code (identical numbers; `counts` ≡ 1).
       - mcf7_24h: both folds USABLE. Beats constant by +0.070 / +0.061;
         mean 0.999 / 0.997; ESS 93.8% / 93.9%; tail k 0.001 / 0.005.
       - α treated 1.0649 / 1.0622 vs 1/(1−π₀) = 1.0652 / 1.0670; DMSO
@@ -1375,27 +1441,22 @@ implementation and review".
       compounds, \(z\) = dose half × `syn_c`, positivity cells (compound,
       dose half, `syn_c`), `keep_frac` 0.4, γ ∈ {0, 1}; `--plan` bias table;
       `dr_weights_design.npz`, `nu_rows.npy`, `tier_meta.json`
-- [ ] Nuisances: `fit_urr --adjustment_set syn_c --target_support all
-      --nu_rows …` + `export_urr_weights --mode net` (`counts` fallback keyed
-      on (arm, `syn_c`));
-      gate passes with \(\alpha\) varying in `syn_c`; weights track
-      `dr_weights_design.npz` where \(\pi\) is known
-      - **Open decision (found in the Phase 1 review):** as written, this fit
-        cannot run.
-        - A (ν arm, `syn_c`) cell holds ~1 train well, so in each cross-fit
-          fold about half the arms lack a fit row for one `syn_c` level.
-          There α = ν/P is unbounded; with val rows in ν this is exactly what
-          made the first v1 fit diverge.
-        - `fit_urr` therefore refuses (`--max_nu_gap_cells` 0). On the limit
-          γ = 1 instance: 323 gap cells over 409 arms, and ~170 per fold in
-          simulation.
-        - Options: drop the gap arms from each fold's ν (and record them);
-          key the support on the compound × dose-half positivity cell; or
-          allow gaps and rely on the net sharing across doses, at the risk of
-          divergence.
-        - The `counts` fallback at (arm, `syn_c`) keys has the same ~1-row
-          cells: on the limit instances it recovers the design weights only
-          weakly (corr +0.4 to +0.6).
+- [ ] Nuisances: `export_urr_weights --mode counts --adjustment_set syn_c`
+      (positivity-cell weights, P12); weights vary in `syn_c` on scored
+      compounds, are 1 on unscored ones, and track `dr_weights_design.npz`
+      - Decided 2026-09-30 (P12). The cross-fitted net cannot run here. Share
+        of ν actions per fold without a factual fit row, all / scored
+        (mcf7_24h, replayed fold/val construction, 100 simulated scored
+        compounds, γ = 1, keep_frac 0.4):
+
+        | action key | v1, X = ∅ | v1, X = `syn_c` | thinned, X = `syn_c` | same, 5 folds |
+        |---|---|---|---|---|
+        | arm (compound, dose_level) | 0 / 0 | 77% / 57% | 78% / 69% | 62% / 80% |
+        | compound × dose half | 0 / 0 | 32% / 31% | 34% / 67% | 12% / 38% |
+
+      - On the limit build's instances the positivity-cell weights track the
+        design weights (kept scored rows, γ = 1: mean 2.18 vs 2.07, corr
+        +0.83), where (arm, `syn_c`) keys gave means of 1.1–1.3.
 - [ ] `naive` / `conditional` / `dr` (+ `dr_design`) × γ ∈ {0, 1} × ≥2
       seeds trained and scored
 - [ ] Step-C verdict against the §3.8.1 success criteria written up (gate
@@ -1412,9 +1473,8 @@ implementation and review".
 - [ ] `build_tiered_split` step-A instance: positivity cells (compound,
       `dose_level`, `cell_id`), `keep_frac` 0.6; line groups declared in
       `spec.py`
-- [ ] Nuisances: `fit_urr --adjustment_set cell_id --target_support common
-      --nu_rows …` + `export_urr_weights --mode net`; gate passes; weights
-      track `dr_weights_design.npz`
+- [ ] Nuisances: `export_urr_weights --mode counts --adjustment_set cell_id`
+      (weights at (arm, `cell_id`), P12); weights track `dr_weights_design.npz`
 - [ ] `naive` / `conditional` / `dr` (+ `dr_design`) × γ ∈ {0, γ>0} × ≥2
       seeds trained and scored; group-contrast bias readout
 
@@ -1464,8 +1524,8 @@ pre-review text is in `IMPLEMENT.md.orig` (untracked).
 | 6 accepted: DMSO-median centring on train wells, no scaling | held-out DMSO plate share 0.67 → 0.20 (chance 0.10); poscon plate share 0.65 → 0.33, while scaling variants give 0.39 / 0.44; plate offset > effect in 93% of 400 arms |
 | 6 includes plate QC: drop plates with DMSO spread > 3× median | spreads 0.14–0.53 plus one outlier at 1.16; drops 1 plate (367 wells), no arm emptied |
 | 7 accepted: confounding in two steps, C then A | plate-level confounders are removed by centring; the replicate index carries 2% of variance; cell lines share ≥99.8% of MCF7 arms (4 lines) |
-| Step C confounds at (compound, dose half) with `--target_support all` | ~2 train wells per arm leave (arm, `syn_c`) cells with ~1 row |
-| Step A confounds at (compound, `dose_level`, `cell_id`) with `--target_support common` | ~2 train rows per cell keep arm-level positivity at `min_cell 1` |
+| Step C confounds at (compound, dose half) with `--target_support all` (weights superseded by P12, 2026-09-30) | ~2 train wells per arm leave (arm, `syn_c`) cells with ~1 row |
+| Step A confounds at (compound, `dose_level`, `cell_id`) with `--target_support common` (weights superseded by P12, 2026-09-30) | ~2 train rows per cell keep arm-level positivity at `min_cell 1` |
 | `syn_c` and `cell_id` declared adjustable, role `None` | promotable per arm; inert in v1 |
 
 ### Decisions 2026-09-29
@@ -1505,7 +1565,7 @@ re-review of every follow-up. Numbers are from `mcf7_24h` unless marked.
 | `fit_urr`: val rows are held out of **both** URR legs | first full v1 run diverged (fold 0: L_val −1.01 → +15,327, max α 1,405 by step 1,500). With ~1 row per arm per fold, an arm whose only fit row went to val stayed in ν with P_fit = 0, where α = ν/P is unbounded. Fixed run: 0 gap cells |
 | `fit_urr`: folds cover the ν pool, stratified on (arm, X stratum, train or not) | with folds over train only, thinned-away rows entered every fold's ν at full weight: the fold target was 1 + (1−π)/(qπ), not 1/π (analytic, ~4.5 vs 2.5 at π = 0.4). Now both legs are half-samples of the design (simulated ratio 1.00–1.03) |
 | `fit_urr`: product-support guard `--max_nu_gap_cells` (default 0), X = the shared adjustment set (no `--cov_blocks`), `--nu_rows` default `nu_rows.npy`, outputs written together under one `run_id` | an unsupported (ν arm, X) cell diverges instead of failing; RxRx emptied X whenever `--nu_rows` was set, which would drop `syn_c` in step C; a crashed run could leave old and new nets mixed |
-| `export_urr_weights --mode net`: fold f scored by `fold{f}.pt` | RxRx's export uses `nets[1 - f]`, the net **fit on** fold f: in-sample weights. It is invisible in v1 (constant target) but not from step C on. The export now checks that each fold's treated mean equals `fit_urr`'s out-of-fold mean (|diff| 1e-11). **`RxRx19a/src/nuisances/export_urr_weights.py` has the same bug and is not patched here (§3.1.1)** |
+| `export_urr_weights --mode net`: fold f scored by `fold{f}.pt` | RxRx's export uses `nets[1 - f]`, the net **fit on** fold f: in-sample weights. It is invisible in v1 (constant target) but not from step C on. The export now checks that each fold's treated mean equals `fit_urr`'s out-of-fold mean (|diff| 1e-11). **`RxRx19a/src/nuisances/export_urr_weights.py:90` has the same bug; recorded as an aside in §3.1.1, not patched** |
 | Tiered split: design weight $P_c/\pi$, not $1/\pi$ (§3.8.1) | the positivity redraw conditions on each cell keeping ≥ 1 well, so the inclusion probability is $\pi_i/P_c$. Monte Carlo on the limit build: z of empirical vs recorded inclusion, mean −0.06, SD 0.98 |
 | Split: one generator per stratum, seeded by `(seed, stratum)` | with RxRx's single stream, a reserve (k > 0) reshuffled every later stratum, DMSO included, and so moved the plate centres (up to 2.07 log2 on a k = 1 limit build). Now unscored holdouts equal v1's for any k |
 | `expr_stats` fits on `nu_rows.npy` (the unthinned train pool) | thinning changed the per-gene std by up to 7.5% between γ instances; now all γ instances of a seed share one z-scale. v1 is unchanged (ν = train) |
@@ -1513,5 +1573,23 @@ re-review of every follow-up. Numbers are from `mcf7_24h` unless marked.
 | `dataset.py` drops the "level" dose encoding | 97 raw float doses would split arms; dose is continuous (decision 3) |
 | `--data_dir` also moves `runs/` | smoke runs on a `--limit` build would have written into `runs/mcf7_24h` |
 
-Open for Phase 5: step C's `fit_urr --adjustment_set syn_c` fit is refused by
-the product-support guard, as designed (see the Phase 5 TODO).
+Open for Phase 5 at the time: step C's `fit_urr --adjustment_set syn_c` fit
+is refused by the product-support guard. Decided 2026-09-30 (P12, below).
+
+### Decision 2026-09-30: positivity-cell weights for steps C / A (P12)
+
+| Change | Where | Why |
+|---|---|---|
+| `counts` keys on the tier's positivity cell and is the count ratio $n_\nu / n_\text{train}$ (`--smooth_k` 0); it refuses an adjustment set other than the tier's covariate | `export_urr_weights.py` | the post-stratified design weight; exactly 1 on unthinned keys, so v1's `counts ≡ 1` is unchanged |
+| `--mode net` refused on a thinning instance | `export_urr_weights.py` | the net cannot be cross-fitted there |
+| thinning instances refused up front, pointing to `counts` | `fit_urr.py` | same; the product-support guard stays for v1-type fits |
+| `dose_half`, `POSITIVITY_KEYS`, `positivity_cells`: one definition of the cell | `splits.py` | builder, export and check must agree on the cell |
+| thinning takes the dose half from `dose_half`; `tier.positivity_key` recorded in `splits.json` | `build_tiered_split.py` | behaviour unchanged: the three limit-build instances rebuild identical (splits, `nu_rows`, design weights, `tier_meta`) |
+| counts weights on a thinning instance recomputed from the table (pandas; dose half by dense rank) | `check_phase1.py` | independent check of the new key |
+
+Phase 0 code is unaffected: the dose half derives from `dose_level`, and
+`spec.py` freezes decisions 1, 2, 3, 5 and 6, none of which concerns weight
+estimation. Decision 7 (not encoded in `spec.py`) named `fit_urr --nu_rows`
+for ν; its wording is amended in §3.12. Reopened, then re-checked after review
+and smoke tests: the five Phase 1 code boxes these files carry, and the §3.13
+decisions box (P12 added, P1 / P2 amended).
