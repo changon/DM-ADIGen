@@ -107,7 +107,7 @@ normalises `w` to mean 1.
 - Eval rebuilds the model from `arch.json` alone (`build_generator_from_ckpt`).
 
 **Tracking.** Runs log to wandb (`--wandb_project lincs-adigen`,
-`--wandb_entity` defaults to the login's, credentials from `~/.netrc`). Use
+`--wandb_entity` defaults to `493302570`, credentials from `~/.netrc`). Use
 `--wandb_mode offline` or `--wandb_mode disabled` to log locally or not at all.
 `loss_history.jsonl` is written either way, and it is the record eval and the
 checks read.

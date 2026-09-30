@@ -304,7 +304,7 @@ def _parse_args():
     p.add_argument("--log_every", type=int, default=10, help="Log step metrics (loss, grad norm, lr) to wandb every N steps.")
     p.add_argument("--wandb_mode", default="online", choices=("online", "offline", "disabled"), help="wandb tracking; credentials from ~/.netrc. 'disabled' for smoke runs.")
     p.add_argument("--wandb_project", default="lincs-adigen")
-    p.add_argument("--wandb_entity", default=None)
+    p.add_argument("--wandb_entity", default="493302570", help="wandb entity (user or team) the runs log to.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--val_cap", type=int, default=2000, help="Max holdout rows used to estimate the validation. 0 = use the full holdout.")
     p.add_argument("--val_every", type=int, default=5,  help="Compute + log validation loss every N epochs (and at the last).")
