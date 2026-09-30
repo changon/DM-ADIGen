@@ -171,7 +171,8 @@ committed) un-ignores `lincs/src/**/*.py`, `lincs/*.md` and
 lincs/                    # LINCS_ROOT: holds src/, as RxRx19a/ is RXRX19A_ROOT
   SPEC.md                 # dataset + causal definition (exists)
   IMPLEMENT.md            # this file
-  requirements.txt        # exists: RxRx pins + h5py (cmapPy / tables optional)
+  README.md               # v1 pipeline commands (§3.6)
+  requirements.txt        # exists: RxRx pins + h5py (cmapPy / tables optional) + wandb
   scripts/download.sh     # exists (untracked); run from lincs/
   lincs/GSE70138/         # the download, nested like RxRx19a/RxRx19a/ (gitignored)
   data/                   # built artifacts (gitignored)
@@ -195,6 +196,7 @@ lincs/                    # LINCS_ROOT: holds src/, as RxRx19a/ is RXRX19A_ROOT
       precompute_cmean.py # copy, optional (P9): per-arm train means of y for the FM cmean loss
     models/
       conditioning.py     # copy as-is
+      layers.py           # NEW (Phase 2): TimestepEmbedder / modulate copied from dit.py, vec_modulate, CFG-drop helper
       mlp.py              # NEW vector denoiser
       dit1d.py            # NEW 1-d DiT
       __init__.py         # build_generator / build_generator_from_ckpt dispatch on arch
@@ -207,6 +209,7 @@ lincs/                    # LINCS_ROOT: holds src/, as RxRx19a/ is RXRX19A_ROOT
       dist_metrics.py     # MMD / Frechet on Y (no Inception, no torchvision)
     tests/
       test_lincs_shapes.py  # GPU-box smoke test; under src/ so git tracks it
+      check_build.py, check_phase1.py, smoke_phase1_torch.py  # Phase 0 / 1 read-back checks
 ```
 
 Python entry points from day one (`python -m src....`, run from `lincs/`); do
@@ -649,8 +652,10 @@ Edits:
   concepts. Record `n_genes`, `arch`, `patch_size`, `plate_center` in
   `arch.json`.
 - V-REx: rewrite the env-key block. It re-encodes RxRx columns (`cell_type`,
-  `experiment`, `well`, `site`, `disease_condition`). `--invariance_env`
-  choices become `plate` (~375 wells per plate, ~250 in train).
+  `experiment`, `well`, `site`, `disease_condition`). The env is
+  `spec.invariance_env_fields`, i.e. `plate` (~375 wells per plate, ~250 in
+  train), set with `--environment_set`; RxRx's free-form `--invariance_env`
+  is dropped (Phase 2).
 - Re-tune batch size / epochs: RxRx defaults (`--train_batch_size 8`, epochs
   over 305k sites) do not transfer to ~25k train rows.
 - `--dr_mode {conditional, weighted}`, renamed from RxRx's `knn_dr` (P7), and
@@ -1389,31 +1394,109 @@ implementation and review".
 
 ### Phase 2 — MLP arms
 
-- [ ] `models/conditioning.py`: copied as a new file
+Checked 2026-09-30, after two independent code reviews, two re-reviews of
+every follow-up, and these smoke runs:
+- local, numpy only with torch blocked: `precompute_cmean` on the limit build;
+- a CPU job on `bindel` (`scripts/phase2_cpu.sub`);
+- GPU jobs on `zabih`:
+  - `scripts/phase2_gpu.sub` on the limit build: 68 checks, a 12-run trainer
+    matrix, 2 resumes, 9 refusals and 10 rebuilds. Final job 717146.
+  - `scripts/phase2_sanity.sub` on `mcf7_24h`, job 715222.
+
+What changed against the plan text and the RxRx copy is in §5, "Phase 2/3
+implementation and review". Phases 2 and 3 were built and reviewed together.
+
+- [x] `models/conditioning.py`: copied as a new file
       - Already copied in Phase 1 (byte-identical; `dataset.py` needs it).
-        The box stays for Phase 2's own review.
-- [ ] `processes/__init__.py` + `ddpm.py` + `flow_matching.py`: copied as new
+        Re-verified with `cmp` against RxRx19a (Phase 2 review).
+- [x] `processes/__init__.py` + `ddpm.py` + `flow_matching.py`: copied as new
       files
-- [ ] `models/mlp.py`: vector denoiser, full shared interface (§3.4)
-- [ ] `models/__init__.py`: `arch=mlp` in `arch.json` (`n_genes`, no image
+      - Byte-identical (`cmp`). They are rank-agnostic: FM broadcasts over
+        `x0.ndim`, and diffusers' `add_noise` / `get_velocity` unsqueeze to the
+        sample's rank.
+- [x] `models/mlp.py`: vector denoiser, full shared interface (§3.4)
+      - adaLN-Zero on vectors (`layers.vec_modulate`), and the output is
+        exactly 0 at init.
+      - MLP-B has 39.8M parameters at the v1 vocabulary.
+      - The GPU test checks that CFG drop nulls role A and never C, that a
+        mixed mask acts per row, that the timestep is handled per row, and
+        that gradient checkpointing gives the same outputs and gradients.
+      - It also checks that a fixed-batch overfit uses the conditioning:
+        shuffled compounds score worse.
+- [x] `models/__init__.py`: `arch=mlp` in `arch.json` (`n_genes`, no image
       VAE keys); `build_generator_from_ckpt` dispatches on `arch`
-- [ ] `train/train_diffusion.py`: copied loop; rank-agnostic loss in train
+      - `arch_kwargs` holds the resolved sizes; `gene_pr_ids` and its sha1
+        record the gene order.
+      - The rebuild uses `arch.json` alone and cross-checks the geometry and
+        gene count. It rejects RxRx's `arch="dit"`.
+- [x] `train/train_diffusion.py`: copied loop; rank-agnostic loss in train
       and validation; `--arch mlp`; `--dr_mode {conditional, weighted}` +
       `--dr_weights_file` (P7); no `--latent`; V-REx key
-- [ ] `nuisances/precompute_cmean.py` + trainer `--cmean_lambda` (default 0)
+      - Fixes (a)–(e) against RxRx (§5).
+      - Rows are held on the device, and a resume replays epoch 1 bit for bit.
+      - wandb logging (user request); `--mixed_precision` defaults to `no`.
+      - Run-dir guards: identity on resume, a lock, refusals before any
+        write.
+      - V-REx: env = `invariance_env_fields` (plate).
+- [x] `nuisances/precompute_cmean.py` + trainer `--cmean_lambda` (default 0)
       / `--cmean_file`, FM only; `--min_n` configurable, coverage logged (P9)
-- [ ] `src/tests/test_lincs_shapes.py` (or equivalent) for a GPU box
-- [ ] `mlp_conditional` arm trainable
-- [ ] `mlp_dr` arm trainable (after `fit_urr` + `export_urr_weights --mode
+      - numpy only, with `dose_level` arm keys (P2) and `row_gid` for the
+        trainer.
+      - mcf7_24h, `--min_n 8`: 34 / 10,479 treated arms plus the vehicle key,
+        13.6% of train rows (`cmean.npz`). `--min_n 2`: 10,446 arms, 99.9%
+        (`cmean_min2.npz`).
+      - The vehicle μ̂ has max |·| 3e-9, i.e. z = 0 by construction. The GPU
+        test recomputes every group mean from `LincsDataset.y` (max |diff| 0).
+- [x] `src/tests/test_lincs_shapes.py` (or equivalent) for a GPU box
+      - Synthetic, real-data and `--ckpt_dir` sections.
+      - `--ckpt_dir` rebuilds a run from `arch.json` alone. It reproduces the
+        logged `val_loss_ema` (EMA) and `val_loss` (training weights) to rel
+        0.0.
+- [x] `mlp_conditional` arm trainable
+      - mcf7_24h, 20 epochs (~2.1k steps, 82 it/s): val loss 0.864 → 0.784,
+        EMA 0.952 → 0.811, still falling. wandb online worked.
+- [x] `mlp_dr` arm trainable (after `fit_urr` + `export_urr_weights --mode
       net`)
+      - `dr_weights_urr.npz` on mcf7_24h, after the mean-1 normalisation:
+        treated 1.0037, vehicle 0.9437 (plan: ~1.004 / ~0.942), ESS/n 1.000.
+      - `dr_weights_counts.npz` (≡ 1) reproduces the conditional loss exactly.
+      - The weighted-design run on the step-C tier dir, with C = `syn_c`,
+        trains.
 
 ### Phase 3 — 1D-DiT arms
 
-- [ ] `models/dit1d.py`: 1-d patch embed + copied `DiTBlock` /
+- [x] `models/dit1d.py`: 1-d patch embed + copied `DiTBlock` /
       `TimestepEmbedder` / 1-d sin-cos (not `DiT2DModel`)
-- [ ] `arch.json` rebuild for `arch=dit1d` (`patch_size`, pad, gene order)
-- [ ] `dit1d_conditional` arm trainable
-- [ ] `dit1d_dr` arm trainable
+      - The patch embed is a Linear on the zero-padded `(B, T, p)` view.
+        `DiTBlock` is copied without cross-attention (xattn not ported). The
+        frozen 1-d sin-cos is a persistent buffer.
+      - p = 10: 98 tokens, pad 2. p = 6: 163 tokens, no pad. The pad is sliced
+        off.
+      - DiT-S/10 has 33.3M parameters. It runs at 5.6 it/s in fp32/TF32 on an
+        A6000 (~2.5 h per 50k steps).
+- [x] `arch.json` rebuild for `arch=dit1d` (`patch_size`, pad, gene order)
+      - `arch_kwargs.patch_size`, `patch_geometry` `{pad, n_tokens}`,
+        `gene_pr_ids`.
+      - `test_lincs_shapes --ckpt_dir` rebuilds the dit1d runs and reproduces
+        their logged losses: `dit_cond_ddpm`, `dit_cond_fm`, `dit_urr` and
+        the mcf7_24h sanity run.
+- [x] `dit1d_conditional` arm trainable
+      - mcf7_24h, 3 epochs: val loss 0.955 → 0.804.
+- [x] `dit1d_dr` arm trainable
+      - The smoke run `dit_urr` trains; the resume replays bit for bit.
+
+Full-length v1 training (plan step F: DDPM, seed 0, 500 epochs ≈ 52k steps,
+wandb project `lincs-adigen`) was launched 2026-09-30 on `zabih`. Jobs:
+
+| arm | job |
+|---|---|
+| `mlp_conditional` | 717515 |
+| `mlp_dr` | 717516 |
+| `dit1d_conditional` | 717517 |
+| `dit1d_dr` | 717518 |
+
+Run dirs: `runs/mcf7_24h/{mlp-B,dit1d-S-p10}_{conditional,weighted-urr}_ddpm_s0`.
+Phase 4 picks the checkpoint from `val_loss_ema`.
 
 ### Phase 4 — eval
 
@@ -1593,3 +1676,48 @@ estimation. Decision 7 (not encoded in `spec.py`) named `fit_urr --nu_rows`
 for ν; its wording is amended in §3.12. Reopened, then re-checked after review
 and smoke tests: the five Phase 1 code boxes these files carry, and the §3.13
 decisions box (P12 added, P1 / P2 amended).
+
+### Phase 2/3 implementation and review (2026-09-30)
+
+Built together: the MLP and 1D-DiT backbones share `models/layers.py` and one
+trainer. Two independent code reviews covered (1) the models, layers and GPU
+test and (2) the trainer, cmean, scripts and README. Two re-reviews then
+covered every follow-up. Checks and runs:
+
+- **Local**, numpy only, with torch blocked: `precompute_cmean` on the limit
+  build, and an independent recompute of its group means.
+- **CPU job on `bindel`:** `precompute_cmean` on `mcf7_24h`
+  (`scripts/phase2_cpu.sub`).
+- **GPU jobs on `zabih`** (approved for all Phase 2–3 GPU jobs, 2026-09-30):
+  - `scripts/phase2_gpu.sub`: `test_lincs_shapes`, then a two-epoch trainer
+    matrix on the limit build, with resume, refusals and rebuild checks;
+  - `scripts/phase2_sanity.sub`: short full-data runs.
+
+| Change against the plan text or the RxRx copy | Why |
+|---|---|
+| New `models/layers.py`: `TimestepEmbedder`, token `modulate` and the output dataclass are copied from `dit.py`; new are `vec_modulate` and the timestep / CFG-drop helper taken from `DiT2DModel.forward` | The MLP needs `TimestepEmbedder` in Phase 2, before `dit1d.py`. The token `modulate` broadcasts a `(B, H)` vector to `(B, B, H)`, and `mse_loss` would only warn |
+| `arch.json` records the resolved `arch_kwargs` (hidden / depth / heads / patch), not a size letter. `patch_geometry` `{pad, n_tokens}` is kept beside it | Re-tuning `MLP_SIZES` / `DIT_SIZES` cannot orphan a checkpoint. `build_generator_from_ckpt` reads `arch.json` only, and cross-checks the geometry and gene count |
+| Gene order is `gene_pr_ids` plus the sha1 of that list | The `gene_order.json` file embeds the table fingerprint, so its hash differs between the full and limit builds even though the genes do not |
+| The trainer keeps the rows on the device (`_RowBatcher`, a shuffle seeded by (seed, epoch)) instead of a DataLoader, and refuses `num_processes > 1` | Per-row dicts plus collate would cost more than an MLP step. A resume replays the uninterrupted batches: epoch-1 losses match bit for bit |
+| `--mixed_precision` defaults to `no` (fp32 with TF32); RxRx hard-codes fp16 | fp16 GradScaler with fused AdamW hides skipped steps, and AMP buys nothing for the launch-bound MLP. bf16 is opt-in for DiT-B |
+| wandb through accelerate (`--wandb_mode`); `loss_history.jsonl` also carries `val_loss_ema` and grad-norm statistics. RxRx used tensorboard | tensorboard is absent from the `adi` env. wandb 0.30.0 is installed and pinned (user request, 2026-09-30) |
+| (a) The V-REx batch sampler gets `set_epoch` every epoch | RxRx never called it, so every epoch replayed the same batches. accelerate's `set_epoch` does not reach a custom batch sampler |
+| (b) A checkpoint is always saved at the last epoch | RxRx lost the tail when `num_epochs % checkpoint_every != 0` |
+| (c) `--cmean_lambda > 0` under DDPM is refused | RxRx skipped it silently |
+| (d) The cmean aux forward passes an explicit no-drop mask (only when p > 0) | RxRx's train-mode forward drew its own CFG mask, so about 10% of aux rows pulled the null branch toward μ̂(a) |
+| (e) cmean with a non-empty C or `--include_env` is refused. μ̂(a) stays unweighted in the `weighted` arm (recorded, not changed) | μ̂ is keyed on the action only |
+| `precompute_cmean` writes `row_gid` (each train row's group), `plate_center` and `split_fingerprint`. It is numpy only, via `expr_stats.normalize_expr` | The trainer does not re-derive the key (RxRx duplicated `group_key`), and the file cannot silently pair with another split or centring |
+| Run-dir safety, all refused before anything is written: a fresh start into a dir with checkpoints (checked again under the lock), or with another run's `arch.json`; a second launch of a running run (`fcntl.lockf` on `.train.lock`, NFS-enforced); a resume from a missing or torn checkpoint (`random_states_0.pkl`, which accelerate writes last, is removed before a re-save) | Auto-named runs (e.g. the Phase 4 cmean ablation) could overwrite each other. A mistyped `--resume_epoch` truncated the history |
+| A resume compares every `arch.json` field except `train_args`, against both the run dir's and the source checkpoint's run. `--resume_from_checkpoint` can fork into a new dir, never into a dir that holds checkpoints; the fork starts a fresh history | RxRx compared three fields. Identity includes `ema_decay`, `val_cap`, the sha1 of the DR weights and cmean files, split-dir-relative file paths and a realpath `nuisance_dir` |
+| `--reset_lr` sets the group lr inside the existing scheduler, and is refused inside the warm-up. A changed `--lr_decay_every` on resume is reported as ignored | RxRx swapped in a fresh ExponentialLR, whose state a later resume could not load into its SequentialLR |
+| V-REx uses `spec.invariance_env_fields` (`--environment_set`); RxRx's free-form `--invariance_env` is dropped | It bypassed spec.py's role guards and duplicated `--environment_set` |
+| `precompute_cmean --min_n` keeps the RxRx default 8, which covers 34 of 10,479 treated arms plus the vehicle key (13.6% of train rows). `cmean_min2.npz` (`--min_n 2`) covers 99.9% | P9: Phase 4's ablation picks the value |
+| The trainer's smoke runs use `--ema_decay 0.9`. `test_lincs_shapes --ckpt_dir` reproduces both the logged `val_loss_ema` (EMA) and `val_loss` (training weights) | At 0.999 over about 40 steps the EMA is still close to its initialisation, so a wrong `cond_spec` would still have passed |
+
+Runs from before these changes (`runs/*/smoke_714963_*`, `runs/mcf7_24h/sanity_715222_*`)
+have an older `arch.json` and are not resumable. They are throwaway.
+
+`src/models/__init__.py` now imports both backbones, and with them timm and
+diffusers. Every importer of `src.data.dataset` loads them too, as in RxRx. No
+numpy-only path (`check_phase1`, `precompute_cmean`, `export --mode counts`)
+imports `src.models`.

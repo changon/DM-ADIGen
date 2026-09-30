@@ -56,3 +56,10 @@ timm==1.0.11                 # Attention/Mlp used by a later 1D-DiT; not ingest
 # --- misc --------------------------------------------------------------------
 tqdm==4.67.0
 matplotlib==3.7.2            # diagnostic plots only
+
+# --- experiment tracking -------------------------------------------------------
+# train_diffusion logs through accelerate's wandb tracker (--wandb_mode
+# online|offline|disabled; credentials from ~/.netrc). Needs Python >= 3.10:
+# installed in the live `adi` env (Python 3.11.16, torch 2.5.1+cu121), not in
+# the Python 3.8 env described above.
+wandb==0.30.0
