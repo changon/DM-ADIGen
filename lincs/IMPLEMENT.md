@@ -774,19 +774,28 @@ computed on the full, unablated pool.
 2. **Split:** the P3 split (arm strata, DMSO stratified by plate,
    `holdout_frac` 0.2, table fingerprint in the cache key). v1 is this
    builder with no scored compounds and no thinning (P4), so v1 and steps C /
-   A share one split implementation and, at a given seed, one holdout.
+   A share one split implementation and, at a given seed, one holdout. Each
+   stratum draws from its own `(seed, stratum)` generator, so with
+   `k_reserve` > 0 every unscored stratum (DMSO included) still keeps v1's
+   holdout.
 3. **Thinning:** for each scored compound, every train well $i$ gets
    retention $\pi_i \propto \exp(-\gamma z_i)$, calibrated so that
    $\sum_i \pi_i$ = `keep_frac` · $n$ and clipped to [`pmin`, 1] (RxRx
    `_calibrate_pi`; `pmin` default 0.05). Survivors are drawn, and redrawn
    until every positivity cell (below) keeps ≥ 1 train well. Kept wells of
-   scored compounds get the design weight $1/\pi_i$, every other row 1. γ = 0
+   scored compounds get the design weight $P_c/\pi_i$, every other row 1. γ = 0
    gives constant $\pi$: the uniform (MCAR) control at the same `keep_frac`.
+   - $P_c = 1 - \prod_{j \in c}(1 - \pi_j)$ for the well's positivity cell
+     $c$. The redraw conditions on "$c$ keeps ≥ 1", so well $i$ is kept with
+     probability $\pi_i / P_c$, not $\pi_i$ (the cells are independent).
+   - $1/\pi_i$ (the pre-implementation text) ignored that conditioning. At
+     γ = 1 it over-weights small low-$\pi$ cells up to ~4× (Phase 1 review,
+     2026-09-29; checked by Monte Carlo on the limit build).
 
 Outputs, as in RxRx:
 - `splits.json`: thinned `train_idx`, `holdout_idx`, and a `tier` block with
   γ, `pmin`, `keep_frac`, the covariate, and the scored compounds;
-- `dr_weights_design.npz`: the true weights $1/\pi$;
+- `dr_weights_design.npz`: the true weights $P_c/\pi$;
 - `nu_rows.npy` (`build_nu_rows`): the unthinned train pool minus reserve;
 - `tier_meta.json`: per-compound $\pi$, kept counts, and the expected naive
   vs IPW bias;
@@ -1220,39 +1229,103 @@ the ADIGen contract.
 ### Phase 1 — table consumers + nuisances
 
 - [x] §3.13 decisions D1, P1–P11 chosen and recorded (2026-09-29)
-- [ ] `splits.py`: copied `load_splits` + stratification engine; cache key =
+Checked 2026-09-29 after two independent code reviews (data layer;
+nuisances + smoke test), a re-review of every follow-up, and smoke runs:
+- local, numpy only, torch imports blocked: the `--limit 1500` build (v1,
+  thinning instances k0 γ0/γ1 and k1 γ1);
+- CPU jobs on `bindel`: the full `mcf7_24h` pipeline and the limit build
+  (`scripts/phase1_cpu.sub`, `scripts/phase1_tier_smoke.sub`);
+- a GPU job on `zabih`: `src/tests/smoke_phase1_torch.py`.
+
+The read-back checks are `src/tests/check_phase1.py` (all pass on every
+instance). What changed against the plan text is in §5, "Phase 1
+implementation and review".
+
+- [x] `splits.py`: copied `load_splits` + stratification engine; cache key =
       population key + table fingerprint; arm strata; DMSO stratified by
       plate; realised holdout fraction logged (P3)
-- [ ] `build_tiered_split.py`: reserve (`k_reserve` 0 default) / split /
+      - mcf7_24h: train 26,690, holdout 10,650, realised 0.285 (treated
+        0.290, DMSO 0.201); 725 / 10,479 arms without a holdout well; ≥ 14
+        train DMSO per plate. Every stratum's holdout count is re-derived.
+      - Each stratum has its own `(seed, stratum)` generator (not RxRx's
+        single stream), so a reserve changes no other stratum's holdout.
+- [x] `build_tiered_split.py`: reserve (`k_reserve` 0 default) / split /
       thinning layers with `_calibrate_pi`; v1 instance = no scored
       compounds, no thinning → `splits.json` + `nu_rows.npy` (P4, P6)
-- [ ] `build_nu_rows.py`: \(\nu\) = unthinned train pool minus reserve
-- [ ] `expr_stats.py`: train-DMSO plate centres; per-gene mean from centred
+      - Thinning is generic over `--scored_compounds` and implements
+        `--confounder syn_c`. `cell_id` raises until Phase 6 declares the
+        line groups; `--plan` (it needs the oracle) is Phase 5.
+      - Design weight $P_c/\pi$ (§3.8.1), recomputed from the table by
+        `check_phase1`.
+      - Unscored holdout = v1's at k = 0 and k = 1 (limit build).
+- [x] `build_nu_rows.py`: \(\nu\) = unthinned train pool minus reserve
+- [x] `expr_stats.py`: train-DMSO plate centres; per-gene mean from centred
       train DMSO, std from all centred train rows (decision 5, amended);
       per-gene fraction at the 15.0 cap → `expr_meta.json`
-- [ ] Centring gate on **held-out** DMSO (P11): per-plate means ≈0; plate
+      - "Train" is `nu_rows.npy`, the unthinned train pool: the train rows in
+        v1, and one z-scale for all γ instances of a seed.
+      - GAPDH is at the cap in 41.4% of train wells; 9 genes > 1%.
+- [x] Centring gate on **held-out** DMSO (P11): per-plate means ≈0; plate
       share of DMSO variance 0.67 → ~0.20
-- [ ] `dataset.py`: in-memory vector loader (no PIL / image VAE) + copied
+      - mcf7_24h, 414 held-out DMSO wells on 100 plates: per-plate mean
+        |z| (against its sampling SE) median 0.38, vs 0.67 expected when
+        centred and 1.36 uncentred.
+      - Plate share: raw R² 0.728 → 0.310 at chance 0.240; chance-corrected
+        ω² 0.642 → 0.092.
+      - The raw R² stays above 0.20 because ~4 held-out wells per plate put
+        chance at 0.24 (0.10 in the §3.2 measurement). The excess over
+        chance (~0.07) matches §3.2's (~0.10).
+      - The gate therefore passes on ω² ≤ 0.20 and ≤ 0.5 × before, plus
+        |z| ≤ 1.0.
+- [x] `dataset.py`: in-memory vector loader (no PIL / image VAE) + copied
       `build_cond_spec` / `cond_from_*` / `dose_probe`
-- [ ] `alpha_net.py`: copied; **no `infected` input**
-- [ ] `knn_dr.py`: copied as a new file (`ess` / `tail_index` for `fit_urr`
-      and export)
-- [ ] `fit_urr.py`: copied URR loss; no `infected==1` restriction, no
+      - The "level" dose encoding is dropped: dose is continuous (decision 3),
+        and raw log-dose levels would split arms.
+      - Needs `models/conditioning.py`, copied byte-identical here (Phase 2
+        box below).
+      - GPU smoke passed: z-space, rows re-derived, cond spec (v1 / env /
+        C = `syn_c`), CondEmbedder with and without CFG drop.
+- [x] `alpha_net.py`: copied; **no `infected` input**
+- [x] `knn_dr.py`: copied as a new file (`ess` / `tail_index` for `fit_urr`
+      and export). `knn_dr_weights` stripped (retired, D1).
+- [x] `fit_urr.py`: copied URR loss; no `infected==1` restriction, no
       `--cell_type` / `experiment`; `--nu_rows`; support and \(\nu\) keyed on
       the `dose_level` arm (P2); arm-stratified cross-fit folds (P5)
-- [ ] `export_urr_weights.py`: copied; no `inf`; vehicle rows \(w = 1\);
+      - Folds cover the ν pool, stratified on (arm, X stratum, train or not).
+        99.9% of train rows see their arm in the other fold.
+      - Val rows are held out of both legs. The first full run diverged
+        without this (§5).
+      - A (ν arm × X stratum) product-support guard refuses fits it cannot
+        support.
+      - X = the shared adjustment set; `--nu_rows` defaults to
+        `nu_rows.npy`; outputs share a `run_id`.
+- [x] `export_urr_weights.py`: copied; no `inf`; vehicle rows \(w = 1\);
       `net` (primary, P1) and `counts` (fallback; `dose_level` arm keys,
       (arm, C) when C is non-empty); compares with `dr_weights_design.npz`
       when present; writes `dr_weights_{urr,counts}.npz` `{row_id, w}`
-- [ ] URR gate: beats constant baseline, `mean(alpha)≈1`, ESS/n usable
+      - Fold f is scored by `fold{f}.pt`. RxRx's `nets[1 - f]` scored rows
+        in-sample (§5).
+      - Refuses unless the per-fold treated means equal `fit_urr`'s
+        out-of-fold means.
+- [x] URR gate: beats constant baseline, `mean(alpha)≈1`, ESS/n usable
       (trivial on v1 — §3.3); known answers hold: net
       \(\alpha \approx 1.066\) on treated / ≈0 on DMSO, `counts` \(w \equiv 1\)
-- [ ] Trainer gets `n_compounds` without a hidden `fit_urr` dependency
+      - mcf7_24h: both folds USABLE. Beats constant by +0.070 / +0.061;
+        mean 0.999 / 0.997; ESS 93.8% / 93.9%; tail k 0.001 / 0.005.
+      - α treated 1.0649 / 1.0622 vs 1/(1−π₀) = 1.0652 / 1.0670; DMSO
+        0.0001 / 0.0055.
+      - `counts` w ≡ 1 exactly. Net weights 1.0636 treated, 1 vehicle;
+        normalised 1.0037 / 0.9437 (plan: ~1.004 / ~0.942).
+- [x] Trainer gets `n_compounds` without a hidden `fit_urr` dependency
       (`compound_vocab.json` or `build_dataset`'s `nuisance_meta.json`)
+      - `nuisance_meta.json` (1751 compounds, `cov_dim` 3) comes from
+        `build_dataset`. Tiered dirs copy it; `fit_urr` only checks it.
 
 ### Phase 2 — MLP arms
 
 - [ ] `models/conditioning.py`: copied as a new file
+      - Already copied in Phase 1 (byte-identical; `dataset.py` needs it).
+        The box stays for Phase 2's own review.
 - [ ] `processes/__init__.py` + `ddpm.py` + `flow_matching.py`: copied as new
       files
 - [ ] `models/mlp.py`: vector denoiser, full shared interface (§3.4)
@@ -1307,6 +1380,22 @@ the ADIGen contract.
       on (arm, `syn_c`));
       gate passes with \(\alpha\) varying in `syn_c`; weights track
       `dr_weights_design.npz` where \(\pi\) is known
+      - **Open decision (found in the Phase 1 review):** as written, this fit
+        cannot run.
+        - A (ν arm, `syn_c`) cell holds ~1 train well, so in each cross-fit
+          fold about half the arms lack a fit row for one `syn_c` level.
+          There α = ν/P is unbounded; with val rows in ν this is exactly what
+          made the first v1 fit diverge.
+        - `fit_urr` therefore refuses (`--max_nu_gap_cells` 0). On the limit
+          γ = 1 instance: 323 gap cells over 409 arms, and ~170 per fold in
+          simulation.
+        - Options: drop the gap arms from each fold's ν (and record them);
+          key the support on the compound × dose-half positivity cell; or
+          allow gaps and rely on the net sharing across doses, at the risk of
+          divergence.
+        - The `counts` fallback at (arm, `syn_c`) keys has the same ~1-row
+          cells: on the limit instances it recovers the design weights only
+          weakly (corr +0.4 to +0.6).
 - [ ] `naive` / `conditional` / `dr` (+ `dr_design`) × γ ∈ {0, 1} × ≥2
       seeds trained and scored
 - [ ] Step-C verdict against the §3.8.1 success criteria written up (gate
@@ -1405,3 +1494,24 @@ pre-review text is in `IMPLEMENT.md.orig` (untracked).
 | P10 decision 5 amended: DMSO mean, all-row std, all genes kept | §3.2, §3.3 `OutcomeSpec`, §3.12 decision 5, TODO Phase 1; Phase 0 box reopened |
 | P11 centring gate on held-out DMSO | §3.10, TODO Phase 1 |
 | Phase 0 fix for P8 / P10 applied in `spec.py`; builds regenerated; `check_build` checks the decisions record | TODO Phase 0 box re-closed |
+
+### Phase 1 implementation and review (2026-09-29)
+
+Two independent code reviews (data layer; nuisances and smoke test), then a
+re-review of every follow-up. Numbers are from `mcf7_24h` unless marked.
+
+| Change against the plan text or the RxRx copy | Why |
+|---|---|
+| `fit_urr`: val rows are held out of **both** URR legs | first full v1 run diverged (fold 0: L_val −1.01 → +15,327, max α 1,405 by step 1,500). With ~1 row per arm per fold, an arm whose only fit row went to val stayed in ν with P_fit = 0, where α = ν/P is unbounded. Fixed run: 0 gap cells |
+| `fit_urr`: folds cover the ν pool, stratified on (arm, X stratum, train or not) | with folds over train only, thinned-away rows entered every fold's ν at full weight: the fold target was 1 + (1−π)/(qπ), not 1/π (analytic, ~4.5 vs 2.5 at π = 0.4). Now both legs are half-samples of the design (simulated ratio 1.00–1.03) |
+| `fit_urr`: product-support guard `--max_nu_gap_cells` (default 0), X = the shared adjustment set (no `--cov_blocks`), `--nu_rows` default `nu_rows.npy`, outputs written together under one `run_id` | an unsupported (ν arm, X) cell diverges instead of failing; RxRx emptied X whenever `--nu_rows` was set, which would drop `syn_c` in step C; a crashed run could leave old and new nets mixed |
+| `export_urr_weights --mode net`: fold f scored by `fold{f}.pt` | RxRx's export uses `nets[1 - f]`, the net **fit on** fold f: in-sample weights. It is invisible in v1 (constant target) but not from step C on. The export now checks that each fold's treated mean equals `fit_urr`'s out-of-fold mean (|diff| 1e-11). **`RxRx19a/src/nuisances/export_urr_weights.py` has the same bug and is not patched here (§3.1.1)** |
+| Tiered split: design weight $P_c/\pi$, not $1/\pi$ (§3.8.1) | the positivity redraw conditions on each cell keeping ≥ 1 well, so the inclusion probability is $\pi_i/P_c$. Monte Carlo on the limit build: z of empirical vs recorded inclusion, mean −0.06, SD 0.98 |
+| Split: one generator per stratum, seeded by `(seed, stratum)` | with RxRx's single stream, a reserve (k > 0) reshuffled every later stratum, DMSO included, and so moved the plate centres (up to 2.07 log2 on a k = 1 limit build). Now unscored holdouts equal v1's for any k |
+| `expr_stats` fits on `nu_rows.npy` (the unthinned train pool) | thinning changed the per-gene std by up to 7.5% between γ instances; now all γ instances of a seed share one z-scale. v1 is unchanged (ν = train) |
+| Centring gate passes on ω² (and per-plate mean \|z\|); R² is reported | ~4 held-out DMSO wells per plate put chance R² at 0.24, so R² after centring (0.31) has a thin margin against "halved". Centring gives ω² 0.642 → 0.092 |
+| `dataset.py` drops the "level" dose encoding | 97 raw float doses would split arms; dose is continuous (decision 3) |
+| `--data_dir` also moves `runs/` | smoke runs on a `--limit` build would have written into `runs/mcf7_24h` |
+
+Open for Phase 5: step C's `fit_urr --adjustment_set syn_c` fit is refused by
+the product-support guard, as designed (see the Phase 5 TODO).

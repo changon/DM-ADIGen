@@ -471,3 +471,28 @@ def config_from_args(args) -> CaseConfig:
     if raw is not None or raw_e is not None:
         cfg.__post_init__()
     return cfg
+
+
+def add_paths_cli(parser, *, nuisance_dir: bool = True) -> None:
+    """Register `--data_dir` (a build other than data/<population>, e.g. a --limit
+    smoke build) and `--nuisance_dir` (a split dir, e.g. from build_tiered_split)."""
+    parser.add_argument("--data_dir", default=None, help="Build dir (default data/<population>/); e.g. data/mcf7_24h_limit1500 for the smoke build.")
+    if nuisance_dir:
+        parser.add_argument("--nuisance_dir", default=None, help="Split dir (default <data_dir>/nuisances/): splits.json, vocab, encoders, nuisances.")
+
+
+def apply_paths_args(cfg: CaseConfig, args, *, require_splits: bool = True) -> CaseConfig:
+    """Point cfg.paths at `--data_dir` / `--nuisance_dir` when given (see add_paths_cli)."""
+    data_dir = getattr(args, "data_dir", None)
+    if data_dir:
+        # runs follow the build: data/mcf7_24h_limit1500 -> runs/mcf7_24h_limit1500
+        data_dir = os.path.abspath(data_dir)
+        cfg.paths = Paths(population=cfg.population.name, raw_dir=cfg.paths.raw_dir, data_dir=data_dir,
+                          train_output_dir=str(PROJECT_ROOT / "runs" / os.path.basename(data_dir)))
+    nz = getattr(args, "nuisance_dir", None)
+    if nz:
+        nz = os.path.abspath(nz)
+        if require_splits and not os.path.isfile(os.path.join(nz, "splits.json")):
+            raise FileNotFoundError(f"{nz} has no splits.json; build it with `python -m src.data.build_tiered_split`")
+        cfg.paths.nuisance_dir = nz
+    return cfg
