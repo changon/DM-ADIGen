@@ -204,12 +204,13 @@ lincs/                    # LINCS_ROOT: holds src/, as RxRx19a/ is RXRX19A_ROOT
     train/
       train_diffusion.py  # adapt: y rank, --arch {mlp,dit1d}
     eval/
-      evaluate.py         # NEW gene-space ATE
-      generation.py       # sample vectors, not images; no clamp
+      evaluate.py         # NEW gene-space ATE: oracle, arms, --truth, floor + ceiling
+      generation.py       # sample vectors, not images; no clamp; streaming driver
       dist_metrics.py     # MMD / Frechet on Y (no Inception, no torchvision)
     tests/
       test_lincs_shapes.py  # GPU-box smoke test; under src/ so git tracks it
-      check_build.py, check_phase1.py, smoke_phase1_torch.py  # Phase 0 / 1 read-back checks
+      check_build.py, check_phase1.py, check_phase4.py       # numpy read-back checks
+      smoke_phase1_torch.py, smoke_phase4_torch.py           # GPU smoke tests
 ```
 
 Python entry points from day one (`python -m src....`, run from `lincs/`); do
@@ -722,6 +723,30 @@ one of them. So:
 - **High-n anchors:** bortezomib and MG-132 (~980 wells each, 20 µM, 84
   plates) are the only arms where a single-arm oracle is tight. The next tier
   is ~20-well arms of PD-0325901, dasatinib, and GSK-1059615.
+
+**Reference scale (E11, §3.14).** A per-arm number from ~3 wells cannot be read
+on its own, so `--source real` measures two references from real wells and
+records them in the oracle:
+
+- the **noise floor** per arm size $n$ — the median
+  $\|\hat\tau_\text{null}\|$ of pseudo-arms built from $n$ real DMSO wells
+  against a disjoint DMSO subsample. This is the floor §3.8.1's responder rule
+  (`> 1.5 ×`) refers to;
+- the **split-half reliability** per $n$ — the median
+  $\cos(\hat\tau_A, \hat\tau_B)$ over two disjoint halves of each arm's real
+  wells — and its **Spearman–Brown lift**, $\sqrt{2r/(1+r)}$, which is the
+  actual bound on $\cos(\hat\tau_\text{gen}, \hat\tau_\text{oracle})$.
+  Accuracy is reported raw and as a fraction of that bound.
+
+Amplitudes need the same care: $\mathbb{E}\|\hat\tau\|^2 = \|\tau\|^2 +
+\mathbb{E}\|\text{noise}\|^2$, and at n = 3 the floor (14.5) is most of the
+measured median (15.2), so the report also carries
+$\|\hat\tau\|_\text{denoised} = \sqrt{\max(\|\hat\tau\|^2 - \text{floor}^2, 0)}$
+and the generated-over-denoised ratio.
+
+The per-arm threshold is per pool: `--min_dose_n` 2 on `all` (E4), but
+`--min_dose_n_holdout` **1** on the holdout, where the P3 split leaves almost
+every arm exactly one well.
 
 **Where $\mu(0)$ comes from.** RxRx takes its anchors from real rows unless
 `--gen_anchors`. Here the vehicle arm is part of the estimand, so report both:
@@ -1236,6 +1261,103 @@ Compute: `fit_urr` imports torch but AlphaNet is tiny, so it runs as a CPU
 job (`ma` under the headroom rule). `export --mode counts` needs no torch
 once the import is lazy.
 
+### 3.14 Phase 4 decisions (resolved 2026-10-01, before any Phase 4 code)
+
+- **E1: Checkpoint.** Every arm is scored at `checkpoint-0499` with the EMA
+  weights (`model_1.safetensors`). The best `val_loss_ema` epoch is within
+  0.0002 of it in every DDPM arm, and one epoch keeps the arms comparable.
+- **E2: Guidance.** The headline uses no guidance, w = 1.
+  - Why: the estimand is a mean difference. Guidance (w > 1) pushes each arm
+    away from the action-marginal, so it inflates ‖τ̂‖ and shrinks within-arm
+    variance. Neither effect has anything to do with confounding.
+  - The DR weights correct the denoising risk of the conditional model, which
+    is the model sampled at w = 1.
+  - `--guidance_scale` stays an option for a later ablation (e.g. 1, 1.5, 2,
+    read as ‖τ̂_gen‖ / ‖τ̂_oracle‖).
+- **E3: Samples.** 16 generated wells per real row, to start. Raise it if τ̂
+  is too noisy; lower it if sampling is too slow.
+- **E4: Arm filter.** `--min_dose_n 2`. It keeps the 692 two-well arms.
+- **E5: Quality metrics.** Report both Fréchet variants, plus MMD everywhere.
+  - Marginal (per-gene) Fréchet: usable on small groups (per dose level, per
+    compound). It is blind to gene–gene correlations.
+  - Top-k PC Fréchet: only on large pools (all treated, all DMSO), where the
+    sample count is in the thousands. PCs are fit on real train Y; k is chosen
+    by explained variance (e.g. 90%) and recorded.
+- **E6: Scope.** One seed per arm. No pathway-score metrics for now.
+- **E7: Compute.** Phase 4 eval and generation jobs run on `zabih` (approved
+  2026-10-01). The CPU-only `--source real` oracle follows the CPU rule (`ma`
+  under the headroom rule, else `bindel`).
+- **E8: Tracking.** wandb entity `493302570`, project `lincs-adigen`
+  (`--wandb_entity` default). The four DDPM v1 runs first logged to the
+  login's default team (`pfn-diffusion`); copies were synced to `493302570`
+  on 2026-10-01.
+- **E9: cmean (P9), from the training results in §5.**
+  - `--cmean_lambda 0` stays the default for both backbones, and the v1
+    headline stays DDPM with λ = 0.
+  - cmean is not used on the 1D-DiT: it doubles the training time for a
+    slightly worse validation loss.
+  - On the MLP it stays a candidate. It becomes a default only if Phase 4
+    shows a τ gain on the holdout pool with no loss of sample spread (MMD /
+    Fréchet).
+  - **The fair pool for this ablation is `--pool holdout`.** μ̂(a) is the mean
+    of each arm's ~2 train wells, and the `--pool all` oracle contains those
+    wells, so a model that memorises them is flattered there.
+  - All eight FM arms are scored in Phase 4 next to the four DDPM arms.
+  - Follow-ups (a λ sweep, `--min_n 3`, more epochs) are run only if the MLP
+    gain carries over to τ.
+- **E10: Sampler — 100 steps** (resolved 2026-10-01, before any Phase 4 code).
+  DDIM for the DDPM arms, Euler for the FM arms, 100 steps
+  (`--num_inference_steps`). The schedule is not a choice: every arm records
+  `zero_snr=true`, so `make_eval_scheduler_for_ckpt` returns
+  `prediction_type="v_prediction"` with `timestep_spacing="trailing"`, and an FM
+  arm returns `FlowMatching` instead.
+  - Cost at `--pool all` (597k samples per arm): ~16 min per MLP-B arm, ~3.9 h
+    per DiT-S/10 arm. 1,000 ancestral steps would be ~39 h per DiT arm.
+  - τ̂ **amplitude** is the quantity being measured, so the discretisation error
+    is checked rather than assumed: one MLP arm is scored at 50 / 100 / 250 /
+    1000 steps (~2.3 h in total, because the MLP is ~14× faster than the DiT)
+    before the DiT arms are launched.
+- **E11: Reference scale — empirical floor + split-half ceiling.** §3.8.1 asks
+  for "1.5× the noise floor" without defining it, and with ~3 wells per arm the
+  oracle τ̂ is itself mostly noise, so a median per-arm cosine over all 10,479
+  arms is near 0 even for a perfect generator. Both references are measured from
+  **real wells only**, written into the oracle artifacts, and reused by `--truth`
+  and by Phase 5:
+  - **Noise floor, per arm size $n$:** `--n_floor_draws` (200) pseudo-arms of $n$
+    real DMSO wells, each against an independent **disjoint** DMSO subsample on
+    the $\hat\mu(0)$ side, so the two sides are independent exactly as a real
+    arm's are. Median and p90 of $\|\hat\tau_\text{null}\|$ are recorded.
+    Sizes are evaluated exactly up to 20 and on a geometric ladder above (90% of
+    arms hold 2 or 3 wells), and other sizes read the nearest.
+  - **Split-half reliability, per $n$:** for every arm with ≥2 wells,
+    $\cos(\hat\tau_A, \hat\tau_B)$ from two disjoint halves of its real
+    wells against the same $\hat\mu(0)$. Without it "median cosine 0.35" cannot
+    be told from "at the noise limit".
+  - **The ceiling is that value lifted by Spearman–Brown**, not the value
+    itself (corrected 2026-10-01 against the first MLP results). The split-half
+    cosine is the reliability of a *half-sized* estimate: with
+    $s = \|\tau\|^2$ and $v = \sigma^2/n$,
+    $r_\text{half} = s/(s+2v)$ while the oracle itself has
+    $r_\text{full} = s/(s+v) = 2r_\text{half}/(1+r_\text{half})$, and a
+    noiseless generator correlates with it at $\sqrt{r_\text{full}}$. On
+    `mcf7_24h` the raw median is 0.451 but the attainable bound is **0.788**, so
+    comparing a generated cosine with the raw value understates the model by
+    ~1.75x. `evaluate.corrected_ceiling` does the lift; the raw value is still
+    reported as `split_half_responder`.
+  - **`responder`** (per arm and per compound) is
+    $\max_d \|\hat\tau\| > 1.5 \times$ the floor — the §3.8.1 rule, now
+    computable. Phase 5's `responders.json` reads it straight off the oracle.
+- **E12: Generation pool per arm.** `--pool all` for the four DDPM headline
+  arms; `--pool holdout` for the eight FM `cmean` arms, which exist only for the
+  decision E9 already scopes to the holdout pool. Saves ~11 h of DiT GPU time.
+  - A `--pool all` run also reports the `holdout` **sub-pool** from the same
+    generation pass, so E9's headline is free on the DDPM arms.
+  - The per-arm well threshold is per sub-pool: `--min_dose_n` 2 (E4) everywhere
+    except holdout, where `--min_dose_n_holdout` defaults to **1**. Under the P3
+    split a 3-well arm puts exactly **one** well in the holdout, so the E4
+    threshold would empty that pool; §3.7 reads holdout in aggregate for the
+    same reason.
+
 ---
 
 ## 4. Implementation TODO
@@ -1496,20 +1618,71 @@ wandb project `lincs-adigen`) was launched 2026-09-30 on `zabih`. Jobs:
 | `dit1d_dr` | 717518 |
 
 Run dirs: `runs/mcf7_24h/{mlp-B,dit1d-S-p10}_{conditional,weighted-urr}_ddpm_s0`.
-Phase 4 picks the checkpoint from `val_loss_ema`.
+Phase 4 scores `checkpoint-0499` (E1, §3.14).
+
+All four finished (exit 0, 500 epochs, five checkpoints each). Final
+`val_loss_ema`, on the 2,000 fixed holdout rows:
+
+| arm | `val_loss_ema` | wall time |
+|---|---|---|
+| `mlp_conditional` | 0.7027 | 11 min |
+| `mlp_dr` | 0.7026 | 11 min |
+| `dit1d_conditional` | 0.5545 | 2 h 37 |
+| `dit1d_dr` | 0.5547 | 2 h 38 |
+
+- `dr` ≈ `conditional` on both backbones (to ~2e-4): the v1 null check holds
+  on the denoising loss.
+- The MLP has plateaued with mild overfitting; the DiT was still improving
+  slowly (~0.002 per 100 epochs).
+- This is denoising loss, not τ accuracy. Phase 4 decides between backbones.
+
+Eight FM arms were also trained on 2026-10-01 for the P9 `cmean` ablation
+(same split, seed and budget; `cmean_min2.npz`, λ ∈ {0, 0.1}). Their results
+are in §5, "cmean ablation: training results".
 
 ### Phase 4 — eval
 
+§3.14 decisions E10–E12 chosen and recorded (2026-10-01, before any Phase 4
+code). Written and smoke-tested 2026-10-01; **no box is checked yet — the code
+review has not happened.** What landed and what it changed is in §5, "Phase 4
+implementation and review".
+
 - [ ] `eval/generation.py`: CFG sampling → `(B, 978)`; no clamp, no
       `channels_last`; rebuild from `arch.json` only
+      - Also `check_arm_against_data` (the gene-order / provenance guard
+        `build_generator_from_ckpt` delegates to eval) and
+        `generate_for_rows`, the streaming driver.
+      - **`clip_sample=False`** had to be pinned in `processes/ddpm.py`: the
+        diffusers default clips predicted \(x_0\) to \([-1, 1]\) every step,
+        which truncated every DDPM sample (§5).
 - [ ] `eval/dist_metrics.py`: Frechet (marginal / PCs) + MMD on \(Y\)
       (copied math; no Inception, no torchvision)
+      - RxRx's `rbf_mmd2` had to be rewritten: its `(n, n, d)` temporary is
+        ~125 GB at d = 978 (§5).
 - [ ] `eval/evaluate.py`: gene-space \(\hat\tau(c,d)\) on `dose_level`;
       `--pool all` per-arm aggregates + holdout aggregates; real and
       generated \(\mu(0)\); `--truth` accuracy; no OpenPhenom / rescue panel
+      - The `--source real` path imports no torch, so the oracle is a CPU job.
+      - Plus the E11 reference scale: the DMSO noise floor per arm size and the
+        split-half reliability ceiling.
+- [ ] `src/tests/check_phase4.py` (numpy read-back) and
+      `src/tests/smoke_phase4_torch.py` (GPU sampler), with
+      `scripts/{eval_oracle,eval_arm,eval_steps,phase4_gpu}.sub` and
+      `scripts/eval_all_arms.sh`
 - [ ] Oracle (`--source real`) + all four v1 generator arms scored
+      - Settings are fixed in §3.14 (E1–E12): `checkpoint-0499` EMA, w = 1,
+        16 samples per real row, `--min_dose_n 2`, 100 sampler steps, both
+        Fréchet variants and MMD.
+      - The `mcf7_24h` oracle is built and checked (job 791843; §5). The four
+        generator arms are not scored yet.
+      - E10's step-count convergence check (`scripts/eval_steps.sub`) runs
+        before the DiT arms are launched.
 - [ ] `cmean` ablation (P9): FM `mlp_conditional` / `mlp_dr` with
       `--cmean_lambda` 0 vs > 0, scored with `--truth`
+      - Training is done for both backbones (eight FM arms; §5). Scoring is
+        open, so the box stays unchecked.
+      - Score all eight FM arms, with `--pool holdout` as the headline for
+        this ablation (E9), which is also their generation pool (E12).
 
 ### Phase 5 — step C: semi-synthetic confounder on MCF7 (§3.8.2)
 
@@ -1721,3 +1894,323 @@ have an older `arch.json` and are not resumable. They are throwaway.
 diffusers. Every importer of `src.data.dataset` loads them too, as in RxRx. No
 numpy-only path (`check_phase1`, `precompute_cmean`, `export --mode counts`)
 imports `src.models`.
+
+### Decisions 2026-10-01: Phase 4 settings (E1–E9)
+
+Taken with the user before any Phase 4 code; recorded in §3.14. No Phase 4
+box is checked.
+
+### cmean ablation: training results (2026-10-01)
+
+Eight FM arms on `mcf7_24h`: {MLP-B, DiT-S/10} × {`conditional`, `dr`} ×
+λ ∈ {0, 0.1}. All use flow matching, 500 epochs, seed 0, the v1 split, and
+`cmean_min2.npz` (10,447 arms, 99.9% of train rows). Jobs 756915–756918 (MLP)
+and 759400, 759404–759406 (DiT), all on `zabih`, all exit 0. Run dirs:
+`runs/mcf7_24h/{mlp-B,dit1d-S-p10}_{conditional,weighted-urr}_fm[_cm0.1-min2]_s0`.
+
+Final values at epoch 499. FM losses start near 2.0 and are not comparable
+with the DDPM arms.
+
+| backbone | arm | λ | train loss | `val_loss` | `val_loss_ema` | wall time |
+|---|---|---|---|---|---|---|
+| MLP-B | conditional | 0 | 1.0698 | 1.1465 | 1.1428 | 11 min |
+| MLP-B | dr | 0 | 1.0696 | 1.1466 | 1.1429 | 11 min |
+| MLP-B | conditional | 0.1 | 1.0928 | 1.1291 | 1.1261 | 17 min |
+| MLP-B | dr | 0.1 | 1.0925 | 1.1293 | 1.1263 | 17 min |
+| DiT-S/10 | conditional | 0 | 0.8516 | 0.8789 | 0.8722 | 2 h 38 |
+| DiT-S/10 | dr | 0 | 0.8523 | 0.8792 | 0.8723 | 2 h 38 |
+| DiT-S/10 | conditional | 0.1 | 0.8774 | 0.8818 | 0.8758 | 5 h 12 |
+| DiT-S/10 | dr | 0.1 | 0.8768 | 0.8826 | 0.8766 | 5 h 09 |
+
+The cmean training loss includes λ · aux (≈0.023 at the end).
+
+`val_loss_ema` gap, cmean minus plain (`conditional` arm):
+
+| epoch | 9 | 49 | 99 | 199 | 299 | 399 | 499 |
+|---|---|---|---|---|---|---|---|
+| MLP-B | −0.004 | −0.039 | −0.030 | −0.017 | −0.015 | −0.015 | −0.017 |
+| DiT-S/10 | −0.042 | −0.000 | +0.001 | +0.001 | +0.002 | +0.003 | +0.004 |
+
+Findings:
+
+- **MLP: cmean lowers the final validation loss by 0.017 (1.5%).**
+  - The comparison is paired (same val rows, noise draws and seed), and the
+    gap is ~100× the `conditional`–`dr` difference (1e-4).
+  - Net of the aux term, the training denoising loss equals the plain run's
+    (≈1.070). The train–val gap shrinks from ~0.073 to ~0.056, so cmean acts
+    as a regulariser, not as a better fit.
+  - The plain runs are flat from epoch 399; the cmean runs were still
+    improving slowly at epoch 499.
+- **DiT: cmean does not help.**
+  - It is ahead only in the first epochs, level by epoch 49, and +0.004 (0.4%)
+    worse at the end, in both arms. The gap grows steadily and is 5–40× the
+    `conditional`–`dr` difference.
+  - It costs 2× the training time (MLP: ~1.5×).
+- **The aux loss ends at ≈0.23 on both backbones.** That looks like the noise
+  floor of a two-well mean. A reading, not tested: the DiT already learns the
+  per-arm mean, so cmean adds no information there and pulls toward noisy
+  two-well targets.
+- **The backbone matters far more than cmean.** Under FM the DiT reaches 0.872
+  against the MLP's 1.143; the MLP's cmean gain is ~6% of that gap.
+- **`dr` ≈ `conditional` in every setting** (null check).
+- **Caveats.**
+  - One seed.
+  - None of the four FM DiT runs has plateaued: the best epoch is the last
+    one, and the loss still falls ~0.002 per 50 epochs. The comparison is at a
+    fixed budget.
+  - FM DiT runs show larger pre-clip gradient spikes (max 5.7 plain, 7.6
+    cmean; clip 4.0) than the DDPM runs, with no visible effect on the
+    curves.
+  - All of this is denoising loss, a proxy. τ error decides.
+
+What follows from this is decision E9 (§3.14). One optional item is left
+open: if Phase 4 prefers FM for the DiT, its two λ = 0 runs can be resumed
+for a few hundred more epochs.
+
+### Decisions 2026-10-01: Phase 4 sampler, reference scale and pool (E10–E12)
+
+Taken with the user before the Phase 4 code, after costing the sampler from the
+measured training throughput; recorded in §3.14.
+
+### Phase 4 implementation and review (2026-10-01)
+
+New: `src/eval/{__init__,dist_metrics,generation,evaluate}.py`,
+`src/tests/{check_phase4,smoke_phase4_torch}.py`,
+`scripts/{eval_oracle,eval_arm,phase4_gpu}.sub`. Checks and runs:
+
+- **Local**, numpy only with torch execution blocked: the `--source real` oracle
+  and `check_phase4` on the `--limit` build, plus a numeric self-test of
+  `dist_metrics` on synthetic matrices.
+- **CPU job on `bindel`** (`scripts/eval_oracle.sub`): the full `mcf7_24h`
+  oracle and its checks. `ma` was at 96% of its memory allocated (1,979 of
+  2,064 GB), so it failed the 20% headroom rule.
+- **GPU job on `zabih`** (`scripts/phase4_gpu.sub`): the sampler checks, the
+  eval end to end on the `--limit` build, and the refusals.
+
+| Change against the plan text or the RxRx copy | Why |
+|---|---|
+| **`make_eval_scheduler` now pins `clip_sample=False`** (and `thresholding=False` on DPM). A Phase 2 file, changed because sampling is the first thing to call `step()` | `DDIMScheduler` and `DDPMScheduler` both **default to `clip_sample=True`**, which clips the predicted $x_0$ to $[-1, 1]$ at every step. That is an image-range assumption, and the outcome here is a z-scored gene vector: it silently truncates the sampled distribution and biases $\|\hat\tau\|$ downward -- the same hazard §2.2 records for the explicit clamp, which the plan removed while this one survived inside diffusers. Found by the GPU smoke: with the default, **0.0%** of sampled values fell outside $[-1, 1]$ on both DDPM arms (max $|x| = 1$ exactly), while the flow-matching arm -- whose Euler `step` does no clipping -- was unaffected. Training is untouched: it only calls `add_noise` / `get_velocity`, neither of which reads the flag, so no trained arm has to be redone |
+| `rbf_mmd2` rewritten through `_pairwise_sq_dists` (the Gram trick RxRx already had for PRDC) | RxRx builds `((x[:, None, :] - y[None, :, :]) ** 2).sum(-1)` in both the kernel and the median-heuristic block. At d = 978 and its own `max_samples=4000` that is a ~125 GB temporary, so the first quality metric would have died. Also: `seed` is a parameter instead of a hard-coded `default_rng(0)`, and a degenerate median now raises instead of silently becoming bandwidth 1.0 via `float(...) or 1.0` |
+| Two Fréchet variants, `marginal_frechet` and `pc_frechet` + `fit_pca` (E5) | A full-covariance Fréchet in 978-d needs n >> 978 per side. The marginal form is the closed-form 1-d $W_2^2$ summed over genes, so it works on a 2-well group; checked against `frechet_distance` on diagonal data (0.5287 vs 0.5286). The PC form runs only where n > k |
+| `generation.check_arm_against_data` is new | `build_generator_from_ckpt`'s docstring assigns the gene-order check to eval, and nothing else compared a checkpoint's provenance with the split and outcome in front of it. It checks the gene order and sha1, `n_genes`, population, both fingerprints, `plate_center`, both normalisation modes, `syn_effect` / `syn_seed`, `adjustment_set` and the compound cardinality. The GPU smoke doctors each field in turn and requires a refusal |
+| `generate_for_rows` streams, and its sample subset is drawn **up front** | 597k samples x 978 floats is 2.3 GB per arm, so only per-row sums and sums of squares are kept. Drawing the retained subset from the known item count up front makes it invariant to `--gen_batch_size`; an online reservoir would depend on both chunk size and arrival order. The GPU smoke checks that invariance |
+| `META_COLUMNS` includes `CONTEXT_SOURCE_COLUMNS` | Found by the GPU smoke: `generation.targets_from_rows` calls `context_for_rows`, which reads `cell_id` / `syn_c` / `det_well` / `pert_time` off the same frame. Without them every `--source generated` run died with `KeyError: 'cell_id'`. v1's `cond_spec` has no context field, but the `(N, F)` tensor must still be built |
+| The smoke's batching-invariance checks compare across batch **sizes** with a tolerance (1e-4), and bit-exactly only under re-**ordering** | Reordering keeps the tensor shape, so the kernels are identical and the samples match to 0.0. A different batch size makes cuBLAS pick different kernels, so the same row's sample moves by ~1e-7. That is float nondeterminism, not a seeding bug; the reservoir's *selection* is still required to be identical, since it is drawn up front from the item count |
+| `--min_dose_n_holdout`, default 1 (E12) | Under the P3 split a 3-well arm puts exactly **one** well in the holdout, so E4's `--min_dose_n 2` empties that sub-pool: measured 0 arms on the limit build, and it would drop 9,754 of 9,754 on `mcf7_24h`. §3.7 already reads holdout in aggregate for this reason |
+| $\|\hat\mu(0)\|$ is reported against its own DMSO sampling scale, not against 0 | z = 0 is the mean of the centred **train** DMSO wells (decision 5 / P10), so a pool's own DMSO mean is 0 only up to the sampling noise of its $n_\text{DMSO}$ wells. The check is the ratio: measured 0.50x on `--pool all` and 1.09x on the holdout |
+| The oracle path imports no torch, and that is enforced | `--source real` reaches `expr.npy` through `load_expr_meta` / `plate_codes` / `normalize_expr` and reuses `precompute_cmean.group_means`, so it runs as a CPU job. The local run asserts `torch` never entered `sys.modules` |
+| Eval artifacts live under `runs/<build>[/<run>]/eval_artifacts/` | `Paths` has no eval field and refuses reassignment of `data_dir` / `population`; §3.1 already said `runs/` holds the eval JSON. The 978-vectors go to a `_tau.npz` sidecar (10,479 x 978 as JSON text would be ~400 MB), which is what `--truth` reads |
+
+#### Oracle results (`mcf7_24h`, `--pool all`, job 791843, 6.9 s on `bindel`)
+
+10,446 arms (33 one-well arms dropped by `--min_dose_n 2`), 2,064 DMSO wells.
+Every check in `check_phase4` passes, including τ̂ and $\hat\mu(0)$ recomputed
+from `expr.npy` with pandas (max diff 4.8e-07) and the empirical floor against
+its analytic value $\sqrt{\sum_g \sigma_g^2 (1/n + 1/n_\text{ref})}$ at all 18
+evaluated sizes.
+
+- **The reliability ceiling is the headline, and it is low.** Median split-half
+  $\cos(\hat\tau_A, \hat\tau_B)$ is **0.078** over all 10,446 arms: 0.051 at
+  n = 2, 0.072 at n = 3 (8,835 arms), 0.311 at n = 4, 0.721 at n = 8. So on a
+  typical 3-well arm **a perfect generator would score a median per-arm cosine
+  of about 0.08**. Phase 4's per-arm cosines must be read against this, which is
+  what E11 exists for; the holdout median (0.329) is higher only because just
+  the 59 multi-well arms can be measured there.
+- **Responders: 17.2% of arms** (1,795 / 10,446) and 651 compounds clear 1.5x
+  the floor. §3.8.1 quotes "~29%" from the 2026-09-28 pre-build scan; the
+  measured number under E11's floor definition is lower, and 17.2% is what
+  Phase 5 should size its scored-compound set against.
+- **The curated panel behaves** (all 16 compounds resolved). ‖τ̂‖ by family:
+  HDAC 50–56 (belinostat 56.2, vorinostat 51.2, entinostat 50.3), HSP90 ~40,
+  proteasome 41.0 / 40.7 at floor ratio ~35 with 968 / 971 wells, mTOR 17.8–34.6,
+  MEK 17.6–27.7, ER 14.7–29.6. 15 of 16 are responders; **estradiol is the
+  exception** (floor ratio 1.0), which is what an already-ER+ line at baseline
+  should look like.
+- $\|\hat\mu(0)\|$ 0.294 = 0.50x its DMSO sampling scale, i.e. z = 0 is the
+  vehicle as decision 5 intends.
+
+
+### Phase 5 progress: step-C data layer on `mcf7_24h` (2026-10-01)
+
+Built while the Phase 4 generator arms were still running, since the only Phase 4
+input step C needs is the `--source real` oracle, which was already finished.
+CPU job `scripts/phase5_cpu.sub` on `bindel` (`ma` was at 89.6% of its memory
+allocated, failing the 20% headroom rule).
+
+New: `src/data/responders.py`, `scripts/phase5_cpu.sub`.
+
+| Change against the plan text | Why |
+|---|---|
+| `responders.py` screens for **thinnability**, not just response: a scored compound must already have a train well in each of its four positivity cells, {low, high} x `syn_c`, and >= 2 distinct dose levels | `build_tiered_split.thin_compound` requires exactly that and refuses the **whole instance** over one bad compound. Measured on `mcf7_24h`: of 651 responders, 3 have < 2 dose levels and 7 have an empty cell -- `syn_c` is balanced within an *arm*, so after the holdout takes one of ~3 wells a compound can end up with every high-half train well at one `syn_c` level. 641 are scored |
+| The responder subsample (`--n_compounds` / `--frac`) lives in `responders.py`, not as `--n_tier_compounds` on `build_tiered_split` | §3.8.1 named the flag but the builder never grew one, and keeping the selection in its own artifact makes it reviewable and re-runnable per population (Phase 6 needs one for `core5_24h`) |
+| **The tier instances use one thinning seed (42), not two.** §3.8.1's "at least 2 seeds per arm" is read as TRAINING seeds (`train_diffusion --seed`) | The split layer runs *inside* the builder, so a second seed draws a different **holdout** -- and §3.8.1 itself requires that v1 and steps C / A "share one split implementation and, at a given seed, one holdout", which the Phase 4 oracle is built on. A seed-43 instance also failed the cell screen, because the screen can only use the base split's train rows |
+| `beta`'s calibration input is recorded both raw and noise-corrected | §3.8.2 sets beta = `--syn_effect` x the median responder ||tau_hat||. Measured: raw 28.98, noise-corrected 25.48 -- only 12% apart, because responders are by definition above the floor. (The large distortion is in the median over *all* arms, 15.2 against a floor of 14.5.) The corrected value is the one to use, but the choice is minor |
+
+Both instances build and pass `check_phase1 --adjustment_set syn_c`, which
+recomputes pi, the positivity cells and the design weights from the table:
+
+| instance | n_train | n_holdout | design w mean / max | counts w mean / max | corr(counts, design) |
+|---|---|---|---|---|---|
+| gamma = 0 (MCAR control) | 21,293 | 10,650 | 1.248 / 2.50 | 1.253 / 11.0 | +0.73 |
+| gamma = 1 (confounded) | 21,600 | 10,650 | 1.228 / 9.62 | 1.236 / 22.0 | +0.88 |
+
+- 641 scored compounds thin the train pool from 26,690 to ~21,300-21,600 wells
+  (about 20%), and the **holdout is 10,650 in both, identical to v1's**, so the
+  shared-holdout property holds.
+- The counts weights track the design weights better at gamma = 1 (+0.88) than at
+  gamma = 0 (+0.73), as they should: at gamma = 0 the design weights are nearly
+  constant (max 2.5) so the correlation is dominated by estimation noise, while
+  at gamma = 1 there is real variation to track. This is §3.8.1's success
+  criterion 4, measured on the full population for the first time (the limit
+  build gave +0.83 at gamma = 1).
+
+
+### Phase 5 code (B2–B7) implemented 2026-10-01
+
+`synthetic.py` (injection + CLI), `spec.add_syn_cli`, `dataset.py`'s injection,
+`evaluate.py`'s oracle-side injection and bias-along-v readout,
+`build_tiered_split --plan`, `src/tests/check_phase5.py`,
+`src/tests/smoke_phase5_torch.py`, `scripts/phase5_gpu.sub`.
+
+| Change against the plan text | Why |
+|---|---|
+| The resolved injection lives in **`<nuisance_dir>/syn_meta.json`** (`syn_effect`, `syn_seed`, `vec_seed`, `scale`, `beta`, `v`, `v_sha1`), written once by `python -m src.data.synthetic` and read back by both `dataset.py` and `evaluate.py` | `beta` depends on a *measured* scale and `v` on its own seed, so resolving it twice would let the trainer and the oracle drift onto different ground truths -- the one error step C cannot detect, because it would look exactly like bias. Same pattern as `expr_meta.json`: one artifact, validated on every read |
+| `v`'s seed is **not** an `OutcomeSpec` field | `spec.decisions_record` embeds `asdict(cfg.outcome)` verbatim and `check_build` compares it against every build's `population_qc.json`, so a new field would invalidate both builds on disk and force a re-ingest for a knob that is not a Phase 0 decision. It lives in `syn_meta.json` instead |
+| An injected oracle is tagged `_syn<effect>[-v<seed>]` | It is a **different oracle**: without the tag it would overwrite the v1 oracle at `oracle_mcf7_24h_poolall.json`. `responders.py` therefore names the uninjected oracle exactly rather than globbing |
+| `arch.json` records `syn_beta`, `syn_vec_seed`, `syn_v_sha1`, and both the eval identity guard and `--truth` check them | `syn_effect` alone does not pin the ground truth, since `beta = syn_effect x scale` and the scale is measured |
+| A **tiered** arm's `split_fingerprint` is checked via its unthinned pool | Steps C / A train on a thinned split but are scored on the unablated pool (§3.8.1), so the arm's own fingerprint cannot match the eval's. `split_fingerprint(nu_rows, holdout_idx, reserve_idx)` recovers the base one exactly -- verified: both tier instances give v1's `7c480bd13be30dfe` -- which is a stronger check than skipping the field |
+| `thin_compound`'s pi/cell computation is factored into `pi_and_cells`, shared with `--plan` | The planned bias and the realised thinning must not be computable from different pi |
+| `check_phase4`'s independent recompute applies the injection, and its responder band is skipped on an injected oracle | Caught by running it: the recompute disagreed by beta, and the responder share legitimately drops (below) |
+
+#### Measured, on `mcf7_24h` at `--syn_effect 1.0` (beta = 25.483)
+
+- **`--plan` sizes gamma exactly as §3.8.2 intends.** Median over 641 scored
+  compounds of `E[syn_c | kept] - E[syn_c]`, by dose half:
+
+  | gamma | kept | dp low | dp high | bias low | bias high | high − low | IPW |
+  |---|---|---|---|---|---|---|---|
+  | 0 | 0.512 | +0.0000 | +0.0000 | +0.00 | +0.00 | +0.00 | 0 |
+  | 0.5 | 0.523 | +0.1122 | −0.1122 | +2.86 | −2.86 | −5.20 | 0 |
+  | 1 | 0.545 | +0.1872 | −0.1859 | +4.77 | −4.74 | −8.32 | 0 |
+  | 2 | 0.556 | +0.2121 | −0.2043 | +5.41 | −5.21 | −9.42 | 0 |
+
+  gamma = 0 is exactly 0 in both halves (the MCAR control), gamma = 1 is
+  equal-and-opposite (the dose-half x `syn_c` lever's signature), and gamma = 2
+  adds little because `pmin` clips. **gamma = 1 is the right operating point**,
+  as §3.8.2 guessed. IPW is 0 by construction.
+- **The injection is exactly additive and leaves tau alone on the unablated
+  pool.** `syn_c = 0` rows are bit-identical; `syn_c = 1` rows shift by exactly
+  `beta * v` (max |diff| 9e-07 on a shift of norm 25.48); and
+  `<tau_syn - tau_plain, v>` has median **+0.012**, i.e. < 5% of beta. So
+  `syn_c` really is balanced within arms, and any step-C bias is attributable to
+  the thinning alone.
+- **Two known offsets, both now reported rather than mistaken for errors.**
+  - $\hat\mu(0)$ moves by $\beta\,\mathbb{E}[\text{syn\_c}] \approx \beta/2$:
+    measured 12.725 against 12.729 predicted. The vehicles are injected too
+    (§3.8.2), and `evaluate` subtracts the known offset before reporting the
+    centring ratio (0.45x and 0.99x, i.e. intact).
+  - The per-arm residue is $\beta/6$: measured median 4.235 against
+    $\beta/6 = 4.247$. A 3-well arm splits `syn_c` 2/1, so its mean is 2/3, not
+    1/2. `check_phase5` asserts this bound explicitly.
+
+#### Open decision before the step-C arms are trained: how the oracle handles the injection
+
+The injection at `--syn_effect 1.0` **degrades the per-arm oracle**, because the
+$\beta/6$ residue is comparable to the thinning bias it is meant to expose:
+
+| | uninjected | injected, beta = 25.5 |
+|---|---|---|
+| split-half cos, `--pool all` | 0.0776 | **0.0218** |
+| split-half cos, `--pool holdout` | 0.3291 | 0.2673 |
+| responder arm fraction, `all` | 17.2% | 14.4% |
+
+Two consequences:
+
+1. **The Spearman–Brown lift (E11) is not valid on an injected oracle.** It
+   assumes a half-sample's noise is 2x the full sample's, which holds for i.i.d.
+   well noise but not for the injection: a 1-well half has `syn_c` mean 0 or 1,
+   so its injected shift swings by the whole of beta, far worse than half-sample
+   scaling predicts. The reported ceiling is therefore a *lower* bound on an
+   injected oracle.
+2. Lowering `--syn_effect` does **not** help: the thinning bias is
+   `0.187 * beta` and the residue is `beta / 6`, so their ratio is 1.12
+   regardless of beta.
+
+The fix, if wanted, is to define the step-C oracle **`syn_c`-stratified** --
+$\hat\tau$ = the mean over `syn_c` levels of (arm mean within the level −
+vehicle mean within the same level) -- which cancels the injection exactly and
+restores the uninjected oracle's precision. §3.8.2 does not specify this, so it
+is left open rather than decided here.
+
+**The aggregate readout is unaffected either way.** The residue is zero-mean
+across arms, so the signed median by dose half over ~1,900 scored arms per half
+has a standard error of roughly 0.12 against a bias of ±4.77 -- a margin of
+~40 sigma. Step C's headline does not depend on this decision; the per-arm
+cosine and accuracy metrics do.
+
+
+### Phase 5 step-C smoke: green (2026-10-01, job 818325)
+
+`scripts/phase5_gpu.sub` end to end on `mcf7_24h`: **38 checks, 0 failures**.
+The sampler/injection checks (17), the step-C oracle, a tiny tiered `dr` arm
+whose `arch.json` pins `syn_effect=1.0 beta=25.4828 v_sha1=492aa3d1 gamma=1.0
+C=['syn_c']`, that arm scored against the injected oracle, the syn-mismatch
+refusal (which names `syn_effect`, `syn_beta` **and** `syn_v_sha1`), and
+`check_phase5`.
+
+**The bias-along-v readout reproduces `--plan`.** Signed
+`<tau_gen - tau_oracle, v>`, median by dose half, on a deliberately untrained
+arm (1 epoch x 5 steps):
+
+| arms | low | high | high − low |
+|---|---|---|---|
+| scored (3,623) | −12.89 | −22.09 | **−9.20** |
+| unscored (6,131) | −2.82 | −2.18 | **+0.64** |
+
+`--plan` predicted a high − low contrast of **−8.32** at gamma = 1; the measured
+contrast on scored arms is −9.20, and on unscored arms it is ~0. The large
+common offset is the untrained model (tau_gen ~ 0, so the projection is mostly
+−tau_oracle); the **contrast between halves** is what isolates the thinning, and
+it is the quantity that matches. So §3.8.1's criteria 1 and 3 are already
+measurable end to end, on a model that has learned nothing.
+
+| Change against the plan text | Why |
+|---|---|
+| **Every `.sub` sets `PYTHONPYCACHEPREFIX` to a per-job, node-local dir** | `src/` is on NFS, and job 817949 started 15 s after an edit and silently ran bytecode compiled 9 minutes earlier (`.pyc` recorded mtime 17:45:24 / size 10479 against a source of 17:54:20 / 11513, and contained the old string). A private prefix makes stale reuse impossible and avoids races between concurrent jobs. Audited the earlier runs: only 817949 was affected |
+| A tiered dir needs its own `expr_meta.json` | `LincsDataset` reads it from the split dir it is handed. `expr_stats` fits on `nu_rows.npy`, so every gamma instance shares v1's z-scale: `centre` / `mean` / `std` / `cap_frac` / `plates` come out identical, and only `split_fingerprint` differs (it records that dir's own split). `phase5_cpu.sub` asserts exactly that |
+| `adjustment_set` **removed** from `TRUTH_GUARD` | The oracle is a mean of real wells and never builds a cond spec, so its tau is **bit-identical** with and without a C (verified, max abs diff 0.0). Keeping it would force a redundant oracle per C and would block step C by construction, whose arms condition on `syn_c` while the oracle marginalises over it. The C that matters -- the arm's own -- stays checked in `check_arm_against_data` |
+| Three tests were passing for the wrong reason, and now cannot | `_refuses` requires the message to name the intended failure; the missing-`syn_meta` case pointed at a nonexistent dir and was really failing on `expr_meta`; and the syn-mismatch gate matched `checkpoint / data mismatch`, which the `adjustment_set` guard also emits |
+
+### Phase 4 results: all twelve arms (2026-10-01)
+
+Scored at `checkpoint-0499` EMA, w = 1, 16 samples/real row, 100 steps (E1–E12).
+`cos` is the median per-arm cosine of tau_gen vs tau_oracle; `/ceil` is it as a
+fraction of the attainable ceiling (E11's Spearman–Brown lift).
+
+| arm | pool | cos all | cos resp | /ceil | Spearman ‖tau‖ | sec |
+|---|---|---|---|---|---|---|
+| mlp-B conditional ddpm | all | 0.480 | 0.792 | 1.01 | 0.800 | 428 |
+| mlp-B weighted-urr ddpm | all | 0.480 | 0.792 | 1.01 | 0.800 | 423 |
+| dit1d-S conditional ddpm | all | 0.457 | 0.778 | 1.00 | 0.803 | 21,147 |
+| dit1d-S weighted-urr ddpm | all | 0.459 | 0.777 | 1.00 | 0.804 | 21,268 |
+| mlp-B conditional ddpm | holdout | 0.208 | 0.451 | 0.96 | 0.607 | — |
+| dit1d-S conditional ddpm | holdout | 0.210 | 0.441 | 0.96 | 0.627 | — |
+| mlp-B conditional fm (λ=0 / 0.1) | holdout | 0.208 / 0.210 | 0.436 / 0.452 | 0.98 | 0.626 / 0.612 | 135 / 138 |
+| dit1d-S conditional fm (λ=0 / 0.1) | holdout | 0.211 / 0.209 | 0.451 / 0.450 | 0.97 | 0.630 / 0.619 | 6,088 / 6,107 |
+
+1. **Every arm sits at 96–101% of the attainable ceiling** on responder arms.
+   The oracle's own reliability, not the generator, is the binding constraint,
+   so tau accuracy cannot separate these models. Any future comparison needs
+   either more wells per arm or the high-n anchors.
+2. **`dr` = `conditional` on tau**, to three decimals on both backbones
+   (0.792 / 0.792 MLP, 0.778 / 0.777 DiT; Spearman 0.800 / 0.800). §1's v1 null
+   check holds on the causal quantity, not just on the denoising loss.
+3. **The DiT's better denoising loss does not transfer.** It beats the MLP by
+   21% on `val_loss_ema` (0.5545 vs 0.7027) yet is no better on tau --
+   marginally worse on `--pool all` (0.778 vs 0.792) and on the holdout (0.441
+   vs 0.451) -- for **49x the eval compute** (21,147 s vs 428 s). That supports
+   decision 4's choice of the MLP as the headline backbone.
+4. **cmean (E9): no.** On the holdout, λ = 0.1 moves the responder cosine
+   +0.016 on the MLP and −0.001 on the DiT, while Spearman falls on both
+   (0.626 → 0.612, 0.630 → 0.619). E9 required a tau gain with no loss of
+   spread; this is mixed, so `--cmean_lambda 0` stays the default.

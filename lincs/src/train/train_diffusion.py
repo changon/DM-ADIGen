@@ -67,7 +67,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.spec import (  # noqa: E402
-    CONTEXT_COL, PLATE_CENTER_MODES, CaseConfig, add_adjustment_set_cli, add_paths_cli,
+    CONTEXT_COL, PLATE_CENTER_MODES, CaseConfig, add_adjustment_set_cli, add_paths_cli, add_syn_cli,
     apply_paths_args, config_from_args, format_role_summary, invariance_env_fields, role_tag)
 from src.models import (  # noqa: E402
     ARCHS, DIT_SIZES, MLP_SIZES, arch_spec, build_generator, read_arch_spec,
@@ -322,6 +322,7 @@ def _parse_args():
     p.add_argument("--include_env", type=int, default=0, help="0 (ADIGen) = generator ignores role-E; E enters --invariance_lambda. 1 = E in adaLN (ablation).")
     add_adjustment_set_cli(p)
     add_paths_cli(p)
+    add_syn_cli(p)
     a = p.parse_args()
     a.grad_checkpoint = bool(a.grad_checkpoint)
     a.include_env = bool(a.include_env)
@@ -686,6 +687,12 @@ def main():
         normalize_std=cfg.outcome.normalize_std,
         syn_effect=float(cfg.outcome.syn_effect),
         syn_seed=int(cfg.outcome.syn_seed),
+        # The resolved step-C injection (§3.8.2). Recorded so eval can refuse an
+        # arm whose ground truth differs from the oracle's: syn_effect alone does
+        # not pin beta, which depends on a measured scale.
+        syn_beta=(float(train_ds.syn_meta["beta"]) if train_ds.syn_meta else 0.0),
+        syn_vec_seed=(int(train_ds.syn_meta["vec_seed"]) if train_ds.syn_meta else None),
+        syn_v_sha1=(str(train_ds.syn_meta["v_sha1"]) if train_ds.syn_meta else None),
         split_fingerprint=splits["split_fingerprint"],
         table_fingerprint=train_ds.expr_meta["table_fingerprint"],
         nuisance_dir=os.path.realpath(nz),

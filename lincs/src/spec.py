@@ -449,6 +449,23 @@ def add_adjustment_set_cli(parser) -> None:
     parser.add_argument("--adjustment_set", default=None, help="Comma-separated C fields for THIS arm; '' = explicitly empty, omit = declared default. Generator and BOTH DR legs must match.")
 
 
+def add_syn_cli(parser) -> None:
+    """Register the step-C knobs (IMPLEMENT.md §3.8.2).
+
+    `--syn_effect` is the switch: 0 (the default, and v1) leaves `syn_c` inert.
+    Nonzero needs a resolved `syn_meta.json` (`python -m src.data.synthetic`),
+    which carries beta and the direction v so the trainer and the oracle cannot
+    drift onto different ground truths.
+    """
+    parser.add_argument("--syn_effect", type=float, default=None,
+                        help="Step-C injected effect size; beta = this x the median "
+                             "responder ||tau_hat||. Default: OutcomeSpec (0 = inert).")
+    parser.add_argument("--syn_seed", type=int, default=None,
+                        help="The syn_c ASSIGNMENT seed. It must equal the one the table "
+                             "was built with (population_qc.json), so this exists to make "
+                             "a mismatch explicit, not to re-draw syn_c.")
+
+
 def config_from_args(args) -> CaseConfig:
     """`default_config()` with an adjustment_set. """
     cfg = default_config()
@@ -468,6 +485,13 @@ def config_from_args(args) -> CaseConfig:
     raw_e = getattr(args, "environment_set", None)
     if raw_e is not None:
         cfg.environment_set = tuple(c.strip() for c in raw_e.split(",") if c.strip())
+    # Step C (§3.8.2). OutcomeSpec is frozen, so this is a replace(); its
+    # __post_init__ re-validates. `syn_c` itself is already in the table -- only
+    # the injection is switched on here.
+    syn = {k: getattr(args, k) for k in ("syn_effect", "syn_seed")
+           if getattr(args, k, None) is not None}
+    if syn:
+        cfg.outcome = replace(cfg.outcome, **syn)
     if raw is not None or raw_e is not None:
         cfg.__post_init__()
     return cfg

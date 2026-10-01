@@ -19,18 +19,33 @@ def make_train_scheduler(zero_snr: bool):
 
 def make_eval_scheduler(zero_snr: bool, kind: str = "ddim", **extra):
     """kind: 'ddim' | 'ddpm' | 'dpm'.
+
+    `clip_sample=False` is not optional on LINCS. DDIMScheduler and
+    DDPMScheduler both default to `clip_sample=True`, which clips the predicted
+    x0 to [-1, 1] at EVERY step -- an image-range assumption. The outcome here is
+    a z-scored gene vector with no such bound, so the default truncates the
+    sampled distribution and biases ||tau_hat|| downward (IMPLEMENT.md §2.2: the
+    same reason `generation` must not clamp). Measured on the Phase 4 smoke:
+    with the default, 0.0% of sampled values fell outside [-1, 1] on both DDPM
+    arms, while the flow-matching arm -- whose Euler step does no clipping -- was
+    unaffected.
+
+    Training is not affected and is left alone: it only calls `add_noise` and
+    `get_velocity`, neither of which reads `clip_sample`.
     """
     kw = dict(schedule_kwargs(zero_snr), **extra)
     if kind == "ddpm":
         from diffusers import DDPMScheduler
-        return DDPMScheduler(**kw)
+        return DDPMScheduler(**dict(kw, clip_sample=False))
     if zero_snr:
         kw.setdefault("timestep_spacing", "trailing")
     if kind == "dpm":
         from diffusers import DPMSolverMultistepScheduler
-        return DPMSolverMultistepScheduler(**kw)
+        # DPMSolver has no `clip_sample`; its analogue is dynamic thresholding,
+        # which is off by default. Pin it so a diffusers default cannot turn it on.
+        return DPMSolverMultistepScheduler(**dict(kw, thresholding=False))
     from diffusers import DDIMScheduler
-    return DDIMScheduler(**kw)
+    return DDIMScheduler(**dict(kw, clip_sample=False))
 
 
 def training_target(scheduler, clean, noise, timesteps):

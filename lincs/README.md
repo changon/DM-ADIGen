@@ -31,6 +31,8 @@ src/models/                  conditioning (CondSpec), layers, mlp (MLPDenoiser),
                              __init__ (build_generator, arch.json)
 src/processes/               DDPM (zero-SNR, v-prediction) and flow matching
 src/train/train_diffusion.py the trainer
+src/eval/                    evaluate (gene-space ATE), generation (CFG sampler),
+                             dist_metrics (MMD / Frechet on Y)
 src/tests/                   read-back checks (numpy) and GPU smoke tests
 data/<build>/                built artifacts; data/<build>/nuisances/ is the v1 split dir
 runs/<build>/<run>/          arch.json, loss_history.jsonl, checkpoint-NNNN/ (model_1 = EMA), wandb/
@@ -59,6 +61,9 @@ python -m src.nuisances.precompute_cmean [--min_n 8]                 # cmean.npz
 ```
 
 **3. Train the four v1 arms (GPU).** All four use the same split and seed.
+`runs/mcf7_24h/` also holds eight flow-matching arms (the same four, with
+`--diffusion_method fm`, at `--cmean_lambda` 0 and 0.1) built for the P9
+`cmean` ablation, so twelve arms are scored in Phase 4.
 
 | arm | command |
 |---|---|
@@ -118,6 +123,119 @@ checks read.
 - **Offline resume** starts a new local run with the same id. wandb ignores
   `resume` offline, so sync the runs separately.
 
+## v1 evaluation (Phase 4)
+
+The estimand is the dose-specific ATE in gene space,
+`tau_hat(c, d) = mu_hat(c, d) - mu_hat(0)`, on the plate-centred, z-scored
+outcome. Arms are keyed on `(compound_idx, dose_level)`. The settings are fixed
+in `IMPLEMENT.md` §3.14 (E1-E12) and are the defaults: `checkpoint-0499` EMA
+weights, no guidance, 16 samples per real row, 100 sampler steps,
+`--min_dose_n 2`.
+
+**1. The real-data oracle (CPU).** `--source real` is numpy only -- it never
+imports torch -- so it runs as a CPU job. It also measures the two references a
+per-arm number has to be read against (E11): the DMSO **noise floor** per arm
+size, and the **split-half reliability ceiling**.
+
+```bash
+python -m src.eval.evaluate --source real --pool all
+# -> runs/mcf7_24h/eval_artifacts/oracle_mcf7_24h_poolall{.json,_tau.npz}
+```
+
+**2. Score one arm (GPU).** `--pool all` also reports the `holdout` sub-pool
+from the same generation pass.
+
+```bash
+O=runs/mcf7_24h/eval_artifacts/oracle_mcf7_24h_poolall.json
+python -m src.eval.evaluate --source generated --device cuda --truth "$O" \
+    --run_dir runs/mcf7_24h/mlp-B_conditional_ddpm_s0 --pool all
+```
+
+The eight FM `cmean` arms are scored on `--pool holdout` instead (E12): mu_hat(a)
+is the mean of each arm's ~2 train wells, and the `--pool all` oracle contains
+those wells, so a model that memorises them is flattered there.
+
+**Outputs**, under `<run_dir>/eval_artifacts/` (oracle:
+`runs/<build>/eval_artifacts/`):
+
+| file | contents |
+|---|---|
+| `<tag>.json` | aggregates, the curated-compound panel, per-compound responder status |
+| `<tag>_tau.npz` | the `(K, 978)` tau matrix per sub-pool, plus per-arm scalars. `--truth` reads this |
+| `<tag>_gen.npz` | per-row generated means and the sample reservoir, so metrics can be recomputed without re-sampling (`--no_save_gen` to skip) |
+
+**Options:** `--n_per_row` (samples per real row), `--num_inference_steps`,
+`--sampler {ddim,ddpm,dpm}` (DDPM arms; FM always uses the flow Euler sampler),
+`--guidance_scale` (E2 keeps the headline at 1.0), `--gen_anchors` (take
+mu_hat(0) from generated vehicle wells instead of real ones), `--extra_metrics`
+(KID, PRDC), `--probe` (a linear TRTS probe on `dose_level`), `--pool`,
+`--min_dose_n` / `--min_dose_n_holdout`.
+
+`--truth` refuses an oracle built on another population, table, split, centring
+or normalisation, and a generated run may not be written onto the oracle's path.
+
+**Batch scripts:** `scripts/eval_oracle.sub` (CPU) and `scripts/eval_arm.sub`
+(one arm per job on `zabih`; every argument is passed through).
+
+## Step C: the semi-synthetic confounder (Phase 5)
+
+Step C injects a known effect along a random direction `v` for the rows with
+`syn_c = 1`, then thins the training wells of responder compounds on
+(dose half x `syn_c`) so that a naive generator is confounded and a correctly
+adjusted one is not. `syn_c` itself is already in the table from ingest.
+
+```bash
+# 1. which compounds may be thinned: responders, from the uninjected oracle
+python -m src.data.responders                  # -> <nuisance_dir>/responders.json
+
+# 2. resolve the injection ONCE (beta and v); both the trainer and the oracle read it
+python -m src.data.synthetic --syn_effect 1.0   # -> <nuisance_dir>/syn_meta.json
+
+# 3. size gamma before building anything (writes nothing)
+python -m src.data.build_tiered_split --scored_compounds \
+    data/mcf7_24h/nuisances/responders.json --confounder syn_c --plan
+
+# 4. the tiered instances: gamma = 1 confounds, gamma = 0 is the MCAR control
+for G in 0 1; do
+  python -m src.data.build_tiered_split --scored_compounds \
+      data/mcf7_24h/nuisances/responders.json --confounder syn_c \
+      --gamma $G --keep_frac 0.4
+done
+
+# 5. the positivity-cell DR weights (P12; numpy only, no torch)
+T=data/mcf7_24h/nuisances_tier_Csyn_c_k0_g1_s42
+python -m src.nuisances.export_urr_weights --mode counts --adjustment_set syn_c --nuisance_dir $T
+
+# 6. the step-C oracle -- a DIFFERENT oracle from v1's, tagged _syn1
+python -m src.eval.evaluate --source real --pool all --syn_effect 1.0
+```
+
+The thinning seed stays at `cfg.seed`: the split layer runs inside the builder,
+so another seed would draw another holdout, and §3.8.1 requires v1 and step C to
+share one. The "at least 2 seeds per arm" is `train_diffusion --seed`.
+
+**The arms** (MLP only, same split and seed; `naive` shows the bias, `dr_design`
+is the known-weights reference):
+
+| arm | `--adjustment_set` | weights |
+|---|---|---|
+| `naive` | `''` | conditional |
+| `conditional` | `syn_c` | conditional |
+| `dr` | `syn_c` | `dr_weights_counts.npz` |
+| `dr_design` | `syn_c` | `dr_weights_design.npz` |
+
+Each is `train_diffusion --nuisance_dir $T --adjustment_set syn_c --syn_effect 1.0
+...`, then scored with `evaluate --source generated --syn_effect 1.0 --truth
+<step-C oracle>`. A tiered arm is scored on the **unablated** pool, so eval
+verifies its unthinned pool (`nu_rows.npy`) reproduces the eval split rather
+than matching its thinned fingerprint.
+
+Two offsets the injection creates are expected, reported, and not errors:
+mu_hat(0) moves by `beta * E[syn_c]` ~ `beta/2` (the vehicles are injected too,
+and eval subtracts the known offset before reporting the centring), and each arm
+carries a `beta/6` residue because a 3-well arm splits `syn_c` 2/1. See
+`IMPLEMENT.md` §5 for the measured numbers and one open decision about them.
+
 ## Checks
 
 | check | what it covers | where to run |
@@ -125,8 +243,18 @@ checks read.
 | `python -m src.tests.check_build [--data_dir ...]` | the ingest | CPU |
 | `python -m src.tests.check_phase1 [--data_dir ...]` | split, `nu`, `expr_meta` and the centring gate, URR gate, weights, tier | CPU |
 | `python -m src.tests.smoke_phase1_torch --device cuda` | dataset, cond spec, AlphaNet | GPU |
+| `python -m src.tests.check_phase4 --oracle ORACLE.json [--arm ARM.json ...]` | the eval artifacts: tau recomputed from `expr.npy`, arm counts, mu_hat(0), the noise floor against its analytic value, the reliability ceiling, responder share | CPU |
+| `python -m src.tests.smoke_phase4_torch --device cuda --ckpt_dir RUN ...` | the sampler: shapes, no clamp, per-row seeding, both schedule directions, guidance forward counts, the identity guard | GPU |
+| `python -m src.tests.check_phase5 [--tier DIR ...]` | step C: syn_meta, the injection recomputed, tau unchanged on the unablated pool, responder eligibility, the planned vs realised thinning | CPU |
+| `python -m src.tests.smoke_phase5_torch --device cuda --tier DIR` | step C on the torch path: the injection through `LincsDataset`, its refusals, `syn_c`-as-C conditioning, the DR legs | GPU |
 | `python -m src.tests.test_lincs_shapes --device cuda [--data_dir ...] [--ckpt_dir RUN ...]` | both backbones, the trainer's loss and batcher, cmean, rebuild from `arch.json` | GPU |
 
 `scripts/phase2_gpu.sub` runs `test_lincs_shapes` and a two-epoch trainer
 matrix on the smoke build, covering resume, the refusals and the rebuild
 checks.
+
+`scripts/phase4_gpu.sub` does the same for Phase 4 on the smoke build: the
+sampler checks, the oracle, two generated arms, the read-back checks, and the
+refusals. `scripts/phase5_cpu.sub` builds the step-C data layer, and
+`scripts/phase5_gpu.sub` smokes step C end to end (it runs on the `gpu`
+partition, so it may be preempted; it is idempotent, so just resubmit).

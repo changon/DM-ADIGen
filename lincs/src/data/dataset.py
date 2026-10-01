@@ -7,7 +7,7 @@ with Y normalised once by the split's expr_meta.json (src.data.expr_stats):
     y = (x - centre[plate] - mean) / std        (z-space; never clamped)
 
 The step-C injection `y <- y + syn_c * beta * v` goes here after
-normalisation (Phase 5); until then a nonzero OutcomeSpec.syn_effect raises.
+normalisation, from the resolved syn_meta.json (src/data/synthetic.py).
 
 `build_cond_spec`, `cond_from_arrays`, `cond_from_batch` and `dose_probe` are
 copied from RxRx19a (spec-driven, not image code). The categorical ("level")
@@ -25,6 +25,7 @@ from torch.utils.data import Dataset
 
 from src.data.build_dataset import CONTEXT_FIELDS, CONTEXT_SOURCE_COLUMNS, ContextEncoder
 from src.data.expr_stats import load_expr_meta, normalize_expr, plate_codes
+from src.data.synthetic import inject, load_syn_meta
 from src.models.conditioning import CondSpec, Field
 from src.spec import ACTION_FIELDS, BY_NAME, CONTEXT_COL, ROLE_OF, CaseConfig
 
@@ -73,16 +74,26 @@ class LincsDataset(Dataset):
 
         self.y = None
         self.expr_meta = None
+        # Set whenever the step-C injection is active; None otherwise, including
+        # on the load_y=False path the nuisance fitters use (they never see y).
+        self.syn_meta = None
         if load_y:
             m = load_expr_meta(cfg, plate_center)
-            if cfg.outcome.syn_effect != 0:
-                raise NotImplementedError("the step-C syn_c injection lands in Phase 5 (IMPLEMENT.md §3.8.2)")
             expr = np.load(cfg.paths.expr_npy, mmap_mode="r")
             if expr.shape != (n_all, cfg.outcome.n_genes):
                 raise ValueError(f"expr.npy {expr.shape} does not match the table ({n_all:,} x {cfg.outcome.n_genes})")
             x = np.asarray(expr[self.row_ids])
             pc = plate_codes(df["det_plate"].values, m["plates"])
-            self.y = torch.from_numpy(normalize_expr(x, pc, m))
+            z = normalize_expr(x, pc, m)
+            # Step C (§3.8.2): the injection lands AFTER centring and z-scoring,
+            # on treated and vehicle rows alike. beta and v come from the single
+            # resolved syn_meta.json, never from cfg, so the trainer and the
+            # oracle share one ground truth.
+            if cfg.outcome.syn_effect != 0:
+                self.syn_meta = load_syn_meta(cfg, n_genes=cfg.outcome.n_genes)
+                z = inject(z, df["syn_c"].values.astype(np.int64),
+                           self.syn_meta["beta"], self.syn_meta["v"])
+            self.y = torch.from_numpy(z)
             self.plate_code = torch.as_tensor(pc)
             self.expr_meta = {k: v for k, v in m.items() if k not in ("centre", "mean", "std", "cap_frac")}
 

@@ -129,11 +129,12 @@ def default_out_dir(cfg: CaseConfig, base: str, scored: list[str], confounder: s
     return os.path.normpath(base) + tag
 
 
-def thin_compound(rows: np.ndarray, half: np.ndarray, c_val: np.ndarray,
-                  confounder: str, gamma: float, keep_frac: float, pmin: float,
-                  rng: np.random.Generator, max_redraws: int) -> dict:
-    """Layer 3 for one scored compound: pi, the kept mask, and its positivity cells.
-    `half` is splits.dose_half over the table (1 = high half of the compound's levels)."""
+def pi_and_cells(rows: np.ndarray, half: np.ndarray, c_val: np.ndarray,
+                 confounder: str, gamma: float, keep_frac: float,
+                 pmin: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, set]:
+    """The selection probabilities and positivity cells of one scored compound,
+    with no draw. Shared by `thin_compound` and `--plan`, so the planned bias and
+    the realised thinning can never be computed from different pi."""
     high = half[rows] == 1
     if confounder != "syn_c":
         raise NotImplementedError(
@@ -147,6 +148,47 @@ def thin_compound(rows: np.ndarray, half: np.ndarray, c_val: np.ndarray,
     missing = sorted(want - set(cells.tolist()))
     if missing:
         raise ValueError(f"positivity cells {missing} have no train well before thinning")
+    return pi, cells, z, want
+
+
+def planned_bias(rows: np.ndarray, half: np.ndarray, c_val: np.ndarray,
+                 confounder: str, gamma: float, keep_frac: float,
+                 pmin: float) -> dict:
+    """Expected naive-vs-IPW bias for one scored compound, per dose half (§3.8.2).
+
+    The injected effect is `y + syn_c * beta * v`, so an estimator that
+    over-represents one `syn_c` level is biased along v by
+    `beta * (E[syn_c | kept] - E[syn_c])`. Under the redraw, well i is kept with
+    probability `incl_i = pi_i / P(its cell keeps >= 1)`, so
+
+        naive:  E[syn_c | kept] = sum_i incl_i c_i / sum_i incl_i
+        IPW:    weights 1 / incl_i cancel incl exactly -> E[syn_c] -> bias 0
+
+    Returned in units of beta; multiply by beta for the z-space bias.
+    """
+    pi, cells, _, want = pi_and_cells(rows, half, c_val, confounder, gamma, keep_frac, pmin)
+    p_cell = {c: 1.0 - float(np.prod(1.0 - pi[cells == c])) for c in want}
+    incl = pi / np.array([p_cell[c] for c in cells])
+    cv = c_val[rows].astype(np.float64)
+    high = half[rows] == 1
+    out = {"keep_frac_expected": float(incl.mean()), "n_train": int(rows.size)}
+    for nm, sel in (("low", ~high), ("high", high)):
+        if not sel.any():
+            out[f"dp_{nm}"] = None
+            continue
+        w = incl[sel]
+        out[f"dp_{nm}"] = float((w * cv[sel]).sum() / w.sum() - cv[sel].mean())
+    if out["dp_low"] is not None and out["dp_high"] is not None:
+        out["dp_high_minus_low"] = out["dp_high"] - out["dp_low"]
+    return out
+
+
+def thin_compound(rows: np.ndarray, half: np.ndarray, c_val: np.ndarray,
+                  confounder: str, gamma: float, keep_frac: float, pmin: float,
+                  rng: np.random.Generator, max_redraws: int) -> dict:
+    """Layer 3 for one scored compound: pi, the kept mask, and its positivity cells.
+    `half` is splits.dose_half over the table (1 = high half of the compound's levels)."""
+    pi, cells, z, want = pi_and_cells(rows, half, c_val, confounder, gamma, keep_frac, pmin)
     for attempt in range(1, max_redraws + 1):
         kept = rng.random(rows.size) < pi
         if all(kept[cells == c].any() for c in want):
@@ -157,6 +199,30 @@ def thin_compound(rows: np.ndarray, half: np.ndarray, c_val: np.ndarray,
     p_cell = {c: 1.0 - float(np.prod(1.0 - pi[cells == c])) for c in want}
     incl = pi / np.array([p_cell[c] for c in cells])
     return {"pi": pi, "incl": incl, "p_cell": p_cell, "kept": kept, "cells": cells, "z": z, "n_draws": attempt}
+
+
+def _plan_beta(cfg, args) -> tuple[float, str]:
+    """beta for --plan: the resolved syn_meta.json if there is one, else
+    --syn_effect x the scale recorded in responders.json."""
+    from src.data.synthetic import SYN_META
+    sp = os.path.join(cfg.paths.nuisance_dir, SYN_META)
+    if os.path.isfile(sp):
+        with open(sp) as f:
+            m = json.load(f)
+        if abs(float(m["syn_effect"]) - float(args.syn_effect)) < 1e-12:
+            return float(m["beta"]), f"{SYN_META}"
+    rp = args.scored_compounds if args.scored_compounds and os.path.isfile(
+        str(args.scored_compounds)) else os.path.join(cfg.paths.nuisance_dir, "responders.json")
+    if not os.path.isfile(rp):
+        raise SystemExit(f"--plan needs beta: no {SYN_META} and no {rp}. Build responders "
+                         f"(`python -m src.data.responders`) or resolve the injection "
+                         f"(`python -m src.data.synthetic --syn_effect ...`).")
+    with open(rp) as f:
+        r = json.load(f)
+    sc = (r.get("beta_scale") or {}).get("median_max_tau_norm_denoised")
+    if sc is None:
+        raise SystemExit(f"{rp} carries no noise-corrected scale for beta")
+    return float(args.syn_effect) * float(sc), f"{float(args.syn_effect)} x {os.path.basename(rp)} scale"
 
 
 def main():
@@ -172,6 +238,9 @@ def main():
     ap.add_argument("--max_redraws", type=int, default=1000)
     ap.add_argument("--out_dir", default=None, help="Default: the base nuisance dir for v1, else <nuisance_dir>_tier_C<c>_k<k>_g<gamma>_s<seed>.")
     ap.add_argument("--overwrite", action="store_true", help="Replace a split built with other parameters (refused while downstream artifacts exist).")
+    ap.add_argument("--plan", action="store_true", help="Print the expected naive-vs-IPW bias per gamma and WRITE NOTHING (§3.8.1).")
+    ap.add_argument("--plan_gammas", default="0,0.5,1,2", help="--plan: the gammas to table.")
+    ap.add_argument("--syn_effect", type=float, default=1.0, help="--plan: beta = this x the scale in responders.json / syn_meta.json.")
     add_adjustment_set_cli(ap)
     add_paths_cli(ap)
     args = ap.parse_args()
@@ -196,7 +265,8 @@ def main():
               "gamma": args.gamma if scored else None, "keep_frac": keep_frac,
               "pmin": args.pmin if scored else None}
     sp = os.path.join(out_dir, SPLITS_FILENAME)
-    if os.path.isfile(sp):
+    # --plan writes nothing, so none of the write guards below apply to it.
+    if os.path.isfile(sp) and not args.plan:
         with open(sp) as f:
             old = json.load(f).get("params")
         if old == json.loads(json.dumps(params)) and not args.overwrite:
@@ -264,6 +334,43 @@ def main():
           f"train DMSO per plate {report['train_dmso_per_plate']}")
     if report["n_arms_without_train"]:
         raise AssertionError(f"{report['n_arms_without_train']} arms have no train well")
+
+    # --- --plan: the expected bias per gamma, writing nothing (§3.8.1) -----
+    if args.plan:
+        if not scored:
+            ap.error("--plan describes a thinning instance; pass --scored_compounds")
+        beta, src = _plan_beta(cfg, args)
+        in_train = np.zeros(n_total, dtype=bool)
+        in_train[train_idx] = True
+        c_val = df[confounder].values
+        half = dose_half(comp, dose_level, ctl)
+        print(f"\n[plan] {len(scored_ci):,} scored compounds, confounder {confounder}, "
+              f"keep_frac {keep_frac}, pmin {args.pmin}")
+        print(f"[plan] beta = {beta:.4f} ({src}); the bias lives along v, so these are "
+              f"signed z-space shifts of <tau_hat, v>")
+        print(f"\n{'gamma':>6s} {'kept':>6s} {'dp_low':>9s} {'dp_high':>9s} "
+              f"{'bias_low':>9s} {'bias_high':>10s} {'high-low':>10s} {'IPW':>5s}")
+        for g in [float(x) for x in args.plan_gammas.split(",") if x.strip()]:
+            rec = []
+            for ci in scored_ci:
+                rows = np.flatnonzero(in_train & scored_mask & (comp == ci))
+                try:
+                    rec.append(planned_bias(rows, half, c_val, confounder, g,
+                                           keep_frac, args.pmin))
+                except (ValueError, NotImplementedError):
+                    continue
+            if not rec:
+                print(f"{g:6.2f}   (no scored compound could be planned)")
+                continue
+            med = lambda k: float(np.median([r[k] for r in rec if r.get(k) is not None]))
+            print(f"{g:6.2f} {med('keep_frac_expected'):6.3f} {med('dp_low'):+9.4f} "
+                  f"{med('dp_high'):+9.4f} {beta * med('dp_low'):+9.3f} "
+                  f"{beta * med('dp_high'):+10.3f} "
+                  f"{beta * med('dp_high_minus_low'):+10.3f} {0.0:5.1f}")
+        print("\n[plan] IPW is 0 by construction: weights 1/incl cancel the selection "
+              "exactly, which is what `dr_design` checks empirically.")
+        print("[plan] nothing written.")
+        return
 
     # --- LAYER 3: thinning -------------------------------------------------
     w_train = np.ones(train_idx.size, dtype=np.float32)
