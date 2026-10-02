@@ -1,9 +1,12 @@
 """Read-back checks of the Phase 5 step-C artifacts (IMPLEMENT.md §3.8.2). No PyTorch.
 
   syn_meta   v is a unit vector, matches its sha1, and is reproducible from
-             vec_seed; beta = syn_effect x scale; syn_seed = the table's draw
-  inject     recomputed independently: exactly beta*v on syn_c=1 rows, identity
-             on syn_c=0, and no other row touched
+             vec_seed; beta = syn_effect x scale; syn_seed = the table's draw.
+             Compound mode (step C2, §3.8.4): the direction matrix is
+             reproducible, its rows are unit, its geometry matches rho, and the
+             rho = 0 matrix injects BIT-IDENTICALLY to the global mode
+  inject     recomputed independently: exactly beta*v (beta*v_k on a compound-k
+             row) on syn_c=1 rows, identity on syn_c=0, and no other row touched
   oracle     the injection does NOT move tau on the unablated pool, because syn_c
              is balanced within every arm and within every plate's DMSO -- this is
              what makes the step-C bias attributable to the thinning alone
@@ -19,6 +22,7 @@ Run from lincs/ (a CPU job for the full population):
     python -m src.tests.check_phase5
     python -m src.tests.check_phase5 --data_dir data/mcf7_24h_limit1500
     python -m src.tests.check_phase5 --tier data/mcf7_24h/nuisances_tier_Csyn_c_k0_g1_s42
+    python -m src.tests.check_phase5 --syn_meta syn_meta_compound_r1.json      # step C2
 """
 from __future__ import annotations
 
@@ -42,7 +46,8 @@ from src.data.build_tiered_split import planned_bias  # noqa: E402
 from src.data.expr_stats import load_expr_meta, normalize_expr, plate_codes  # noqa: E402
 from src.data.splits import CONTROL_ARM, arm_keys, dose_half, load_splits  # noqa: E402
 from src.data.synthetic import (  # noqa: E402
-    SYN_META, effect_vector, inject, load_syn_meta, resolve_syn_meta_path, table_syn_seed)
+    SYN_META, _v_sha1, directions_for, effect_directions, effect_vector, inject,
+    inject_meta, load_syn_meta, resolve_syn_meta_path, table_syn_seed)
 from src.nuisances.precompute_cmean import group_means  # noqa: E402
 from src.spec import (  # noqa: E402
     add_adjustment_set_cli, add_paths_cli, apply_paths_args, config_from_args)
@@ -98,6 +103,46 @@ def main():
           f"beta {m['beta']:.4f} == syn_effect {m['syn_effect']} x scale {m['scale']:.4f}")
     check(int(m["syn_seed"]) == table_syn_seed(cfg),
           f"syn_seed {m['syn_seed']} == the table's syn_c draw")
+    compound = m["mode"] == "compound"
+    if compound:
+        V = m["V"]
+        rho = float(m["rho"])
+        with open(os.path.join(nz, "nuisance_meta.json")) as fh:
+            n_comp = int(json.load(fh)["n_compounds"])
+        check(V.shape == (n_comp, n_genes),
+              f"compound mode: one direction per compound_idx ({V.shape[0]} == the "
+              f"vocab's {n_comp}, vehicle included)")
+        # Independent of synthetic.py: rebuild sampled rows from the raw streams
+        # (v: [vec_seed, 23]; u_k: [vec_seed, 29, k]) and the §3.8.4 formula.
+        # load_syn_meta already held V to its recorded hash, so this is the check
+        # that the hash describes the intended construction.
+        v_ind = np.random.default_rng([int(m["vec_seed"]), 23]).normal(size=n_genes)
+        v_ind /= np.linalg.norm(v_ind)
+        rows = sorted({0, 1, n_comp // 2, n_comp - 1})
+        worst = 0.0
+        for k in rows:
+            u = np.random.default_rng([int(m["vec_seed"]), 29, k]).normal(size=n_genes)
+            d = np.sqrt(1 - rho) * v_ind + np.sqrt(rho) * u / np.linalg.norm(u)
+            worst = max(worst, float(np.abs(d / np.linalg.norm(d) - V[k]).max()))
+        check(worst < 1e-12 and np.allclose(v, v_ind, rtol=0, atol=1e-15),
+              f"directions rebuilt independently for compound_idx {rows} match "
+              f"(max |diff| {worst:.1e}); sha1 {m['v_sha1'][:12]} is v_sha1 of this matrix")
+        check(m["v_sha1"] == _v_sha1(V) and m["v_shared_sha1"] == _v_sha1(v),
+              "v_sha1 hashes the matrix and v_shared_sha1 the shared v")
+        nr = np.linalg.norm(V, axis=1)
+        check(float(np.abs(nr - 1).max()) < 1e-12,
+              f"every direction is a unit vector (max |norm - 1| {float(np.abs(nr - 1).max()):.1e})")
+        cv = V @ v
+        check(abs(float(np.median(cv)) - np.sqrt(1 - rho)) < 0.05,
+              f"median cos(v_k, v) {float(np.median(cv)):.4f} ~ sqrt(1 - rho) "
+              f"{np.sqrt(1 - rho):.4f}")
+        if rho == 1.0:
+            g = V[1:] @ V[1:].T
+            g = np.abs(g[np.triu_indices(g.shape[0], 1)])
+            check(float(np.median(g)) < 3.0 / np.sqrt(n_genes),
+                  f"at rho = 1 compounds' directions are near-orthogonal: median "
+                  f"|cos| {float(np.median(g)):.4f}, max {float(g.max()):.4f} "
+                  f"(isotropic in {n_genes}-d: ~{0.6745 / np.sqrt(n_genes):.4f})")
     _pop = load_splits(cfg).get("population", {})
     if "table_fingerprint" in _pop:
         check(m["table_fingerprint"] == _pop["table_fingerprint"],
@@ -115,21 +160,34 @@ def main():
     expr = np.load(cfg.paths.expr_npy, mmap_mode="r")
     pc = plate_codes(meta["det_plate"].values, em["plates"])
     y_plain = normalize_expr(np.asarray(expr), pc, em)
-    y_syn = inject(y_plain, syn_c, m["beta"], v)
+    comp_all = meta["compound_idx"].values.astype(np.int64)
+    y_syn = inject_meta(y_plain, syn_c, comp_all, m)
+
+    # rho = 0 must be step C exactly: the compound path with every row's direction
+    # equal to v has to reproduce the global path bit for bit (§3.8.4).
+    n_dirs = int(comp_all.max()) + 1
+    y_g = inject(y_plain, syn_c, m["beta"], effect_vector(m["vec_seed"], n_genes))
+    y_c0 = inject(y_plain, syn_c, m["beta"],
+                  effect_directions(m["vec_seed"], n_genes, n_dirs, 0.0), comp_all)
+    check(np.array_equal(y_g, y_c0),
+          "compound mode at rho = 0 injects bit-identically to the global mode "
+          "(step C2 at rho = 0 IS step C)")
+    del y_g, y_c0
 
     # ---- inject, recomputed independently -------------------------------
     d = (y_syn.astype(np.float64) - y_plain.astype(np.float64))
     one, zero = syn_c == 1, syn_c == 0
     check(bool(np.abs(d[zero]).max() < 1e-6),
           f"syn_c=0 rows are untouched (max |diff| {float(np.abs(d[zero]).max()):.2e})")
-    want = m["beta"] * v
-    err = float(np.abs(d[one] - want[None, :]).max())
-    check(err < 2e-3, f"syn_c=1 rows are shifted by exactly beta*v (max |diff| {err:.2e}, "
-                      f"on a shift of norm {float(np.linalg.norm(want)):.2f})")
+    want = m["beta"] * directions_for(m, comp_all[one])
+    err = float(np.abs(d[one] - want).max())
+    check(err < 2e-3, f"syn_c=1 rows are shifted by exactly beta*v"
+                      f"{'_k (their own compound)' if compound else ''} "
+                      f"(max |diff| {err:.2e}, on a shift of norm {m['beta']:.2f})")
     check(np.isin(np.unique(syn_c), (0, 1)).all() and one.sum() > 0 and zero.sum() > 0,
           f"syn_c is 0/1 and both levels are present ({int(one.sum()):,} / {int(zero.sum()):,})")
 
-    # ---- the injection must not move tau on the unablated pool ----------
+    # ---- what the injection does to tau on the unablated pool ------------
     keys = arm_keys(meta["compound_idx"].values, meta["dose_level"].values,
                     meta["is_control"].values).astype(str)
     def tau_of(y):
@@ -141,21 +199,41 @@ def main():
     k1, t_plain, _ = tau_of(y_plain)
     k2, t_syn, _ = tau_of(y_syn)
     check(np.array_equal(k1, k2), "the arm set is the same with and without the injection")
-    proj = (t_syn - t_plain) @ v
-    # A balanced arm shifts by beta*(mean syn_c in arm - mean syn_c in DMSO) ~ 0;
-    # the residue is the 1-well imbalance an odd-sized arm cannot avoid.
-    scale = float(np.median(np.abs(proj)))
-    check(scale < args.tau_tol * m["beta"],
-          f"median |<tau_syn - tau_plain, v>| {scale:.3f} < {args.tau_tol} x beta "
-          f"{m['beta']:.2f}; beta/6 = {m['beta'] / 6:.3f} is the 3-well arm's own "
-          f"2/1 syn_c imbalance, which is the whole residue")
-    check(abs(float(np.median(proj))) < 0.05 * m["beta"],
-          f"<tau_syn - tau_plain, v> is centred at {float(np.median(proj)):+.3f}, "
-          f"i.e. < 5% of beta {m['beta']:.2f}: syn_c is balanced within arms, so the "
-          f"unablated oracle is (nearly) unchanged")
-    print(f"      |projection| median {scale:.3f}, p90 "
-          f"{float(np.percentile(np.abs(proj), 90)):.3f}, max {float(np.abs(proj).max()):.3f} "
-          f"(beta {m['beta']:.2f}); the residue is the odd-well imbalance")
+    if compound:
+        # Step C2: a compound-k arm's syn_c = 1 wells move along v_k and the
+        # vehicles' along v_0, so syn_c MODIFIES the treatment effect and tau
+        # itself moves, by exactly beta * (mix_a v_k - mix_0 v_0). That shift is
+        # part of C2's estimand (the oracle carries it, and a generator that
+        # learned the interaction reproduces it), so it is checked exactly here
+        # rather than required to vanish as in step C.
+        k_comp = np.array([int(k.split("|", 1)[0]) for k in k1])
+        uq, mix, _ = group_means(syn_c[:, None].astype(np.float64), keys)
+        mix_of = dict(zip(uq.astype(str), mix[:, 0]))
+        mix_a = np.array([mix_of[k] for k in k1])
+        V = m["V"]
+        expect = m["beta"] * (mix_a[:, None] * V[k_comp] - mix_of[CONTROL_ARM] * V[0][None, :])
+        err = float(np.abs((t_syn - t_plain) - expect).max())
+        check(err < 2e-3,
+              f"compound mode: tau moves by exactly beta * (mix_a v_k - mix_0 v_0) "
+              f"(max |diff| {err:.2e}); median shift norm "
+              f"{float(np.median(np.linalg.norm(expect, axis=1))):.2f} -- syn_c now "
+              f"modifies the effect, which is what step C2 needs (§3.8.4)")
+    else:
+        proj = (t_syn - t_plain) @ v
+        # A balanced arm shifts by beta*(mean syn_c in arm - mean syn_c in DMSO) ~ 0;
+        # the residue is the 1-well imbalance an odd-sized arm cannot avoid.
+        scale = float(np.median(np.abs(proj)))
+        check(scale < args.tau_tol * m["beta"],
+              f"median |<tau_syn - tau_plain, v>| {scale:.3f} < {args.tau_tol} x beta "
+              f"{m['beta']:.2f}; beta/6 = {m['beta'] / 6:.3f} is the 3-well arm's own "
+              f"2/1 syn_c imbalance, which is the whole residue")
+        check(abs(float(np.median(proj))) < 0.05 * m["beta"],
+              f"<tau_syn - tau_plain, v> is centred at {float(np.median(proj)):+.3f}, "
+              f"i.e. < 5% of beta {m['beta']:.2f}: syn_c is balanced within arms, so the "
+              f"unablated oracle is (nearly) unchanged")
+        print(f"      |projection| median {scale:.3f}, p90 "
+              f"{float(np.percentile(np.abs(proj), 90)):.3f}, max {float(np.abs(proj).max()):.3f} "
+              f"(beta {m['beta']:.2f}); the residue is the odd-well imbalance")
 
     # ---- responders ------------------------------------------------------
     rp = os.path.join(nz, args.responders)

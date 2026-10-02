@@ -67,7 +67,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.spec import (  # noqa: E402
-    CONTEXT_COL, PLATE_CENTER_MODES, CaseConfig, add_adjustment_set_cli, add_paths_cli, add_syn_cli,
+    CONTEXT_COL, PLATE_CENTER_MODES, CaseConfig, add_adjustment_set_cli, add_paths_cli, add_syn_cli, check_syn_args,
     apply_paths_args, config_from_args, format_role_summary, invariance_env_fields, role_tag)
 from src.models import (  # noqa: E402
     ARCHS, DIT_SIZES, MLP_SIZES, arch_spec, build_generator, read_arch_spec,
@@ -429,6 +429,7 @@ def _trim_history(path: str, keep_through_epoch: int | None) -> None:
 def main():
     args = _parse_args()
     cfg: CaseConfig = apply_paths_args(config_from_args(args), args)
+    check_syn_args(cfg, args)
     plate_center = args.plate_center or cfg.outcome.plate_center
 
     # Perf (math-preserving, resume-safe)
@@ -693,6 +694,11 @@ def main():
         syn_beta=(float(train_ds.syn_meta["beta"]) if train_ds.syn_meta else 0.0),
         syn_vec_seed=(int(train_ds.syn_meta["vec_seed"]) if train_ds.syn_meta else None),
         syn_v_sha1=(str(train_ds.syn_meta["v_sha1"]) if train_ds.syn_meta else None),
+        # Step C2 (§3.8.4): which injection. v_sha1 already pins it (in compound
+        # mode it hashes the whole direction matrix); these make it readable.
+        syn_meta_name=(str(train_ds.syn_meta["name"]) if train_ds.syn_meta else None),
+        syn_mode=(str(train_ds.syn_meta["mode"]) if train_ds.syn_meta else None),
+        syn_rho=(float(train_ds.syn_meta.get("rho", 0.0)) if train_ds.syn_meta else None),
         split_fingerprint=splits["split_fingerprint"],
         table_fingerprint=train_ds.expr_meta["table_fingerprint"],
         nuisance_dir=os.path.realpath(nz),

@@ -53,12 +53,12 @@ from datasets import load_from_disk  # noqa: E402
 from src.data.build_dataset import CONTEXT_SOURCE_COLUMNS, _atomic_write  # noqa: E402
 from src.data.expr_stats import load_expr_meta, normalize_expr, plate_codes  # noqa: E402
 from src.data.splits import CONTROL_ARM, arm_keys, dose_half, load_splits  # noqa: E402
-from src.data.synthetic import inject, load_syn_meta  # noqa: E402
+from src.data.synthetic import directions_for, inject_meta, load_syn_meta  # noqa: E402
 from src.eval import dist_metrics as dm  # noqa: E402
 from src.nuisances.precompute_cmean import group_means  # noqa: E402
 from src.spec import (  # noqa: E402
     PLATE_CENTER_MODES, add_adjustment_set_cli, add_paths_cli, add_syn_cli,
-    apply_paths_args, config_from_args, format_role_summary)
+    apply_paths_args, check_syn_args, config_from_args, format_role_summary)
 
 # Table columns the estimand needs. `dose_level` is NOT in LincsDataset's
 # TABLE_COLUMNS, and the curated panel needs the names, so read the table
@@ -296,8 +296,13 @@ def corrected_ceiling(r_half: np.ndarray) -> np.ndarray:
 
 
 def bias_along_v(tau_est: np.ndarray, tau_truth: np.ndarray, arm_key: np.ndarray,
-                 v: np.ndarray, half_of_arm: dict, scored_ci: set[int]) -> dict:
+                 v: np.ndarray, half_of_arm: dict, scored_ci: set[int],
+                 n_wells: np.ndarray | None = None) -> dict:
     """Signed projection of the generator's error onto the injected direction v.
+
+    `v` is one (G,) direction (step C) or (n_arms, G), one row per arm (step C2,
+    §3.8.4): each arm's error is projected on its OWN compound's direction, which
+    is where that compound's bias lives.
 
     §3.8.2: "The bias lives along v. Report the signed projection
     <tau_gen(a) - tau_oracle(a), v> for scored arms by dose half, rare vs
@@ -307,8 +312,14 @@ def bias_along_v(tau_est: np.ndarray, tau_truth: np.ndarray, arm_key: np.ndarray
     That sign flip is the signature; a two-sided magnitude would hide it.
     """
     comp, _ = _split_key(arm_key)
-    proj = (np.asarray(tau_est, dtype=np.float64)
-            - np.asarray(tau_truth, dtype=np.float64)) @ np.asarray(v, dtype=np.float64)
+    err = np.asarray(tau_est, dtype=np.float64) - np.asarray(tau_truth, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
+    if v.ndim == 1:
+        proj = err @ v
+    elif v.shape == err.shape:
+        proj = np.einsum("ag,ag->a", err, v)
+    else:
+        raise ValueError(f"v has shape {v.shape}; expected ({err.shape[1]},) or {err.shape}")
     halves = np.array([int(half_of_arm.get(k, -1)) for k in arm_key])
     scored = np.isin(comp, list(scored_ci)) if scored_ci else np.zeros(comp.size, bool)
     out = {"n_scored_arms": int(scored.sum()), "n_unscored_arms": int((~scored).sum())}
@@ -317,10 +328,79 @@ def bias_along_v(tau_est: np.ndarray, tau_truth: np.ndarray, arm_key: np.ndarray
             out[f"{name}_{hname}"] = _q(proj[sel & hsel])
         out[name] = _q(proj[sel])
     # The contrast the lever creates: high minus low, within each group.
+    #
+    # The MEAN is the headline. Each arm's projection carries a discrete
+    # beta * (syn_c mix - 1/2) term, so the per-arm distribution is bimodal --
+    # +/- beta/6 on a 3-well arm, and +/- beta/2 on a 1-well one. A median of a
+    # bimodal variable lands on a mode: on `--pool holdout`, where the P3 split
+    # leaves one well per arm, the oracle's own contrast reads +10.03 by median
+    # against +0.32 by mean (§5, corrected 2026-10-01). The mean is unbiased for
+    # the systematic shift the thinning creates, which is what is being measured.
+    one_well = (n_wells is not None and n_wells.size
+                and float(np.median(np.asarray(n_wells))) <= 1.0)
+    out["median_is_meaningful"] = not one_well
+    if one_well:
+        out["median_note"] = ("the median arm has <= 1 well, so <tau, v> is bimodal "
+                              "at +/- beta/2 and the median contrast is not "
+                              "interpretable; use the mean")
     for name, sel in (("scored", scored), ("unscored", ~scored)):
         hi, lo = proj[sel & (halves == 1)], proj[sel & (halves == 0)]
+        ok = bool(hi.size and lo.size)
+        out[f"{name}_high_minus_low_mean"] = (
+            float(hi.mean() - lo.mean()) if ok else None)
         out[f"{name}_high_minus_low_median"] = (
-            float(np.median(hi) - np.median(lo)) if hi.size and lo.size else None)
+            float(np.median(hi) - np.median(lo)) if ok and not one_well else None)
+        # The spread the contrast has to beat, from the arms themselves.
+        out[f"{name}_high_minus_low_se"] = (
+            float(np.sqrt(hi.var(ddof=1) / hi.size + lo.var(ddof=1) / lo.size))
+            if ok and hi.size > 1 and lo.size > 1 else None)
+    return out
+
+
+def learned_syn_effect(row_mean: np.ndarray, keys: np.ndarray, syn_c: np.ndarray,
+                       syn: dict, half_of_arm: dict, scored_ci: set[int],
+                       keep_arms: set[str] | None = None) -> dict:
+    """The share lambda-hat of the injected shift the generator reproduces (§3.8.4).
+
+    Step-C generators condition on (compound, is_control, dose, syn_c) only, so
+    within one arm the generated rows differ ONLY in syn_c. Per arm with both
+    levels among `keys`' rows:
+
+        lambda_a = < gen mean(syn_c = 1 rows) - gen mean(syn_c = 0 rows), v_k > / beta
+
+    ~1 when the model learned compound k's shift, ~0 when it ignores syn_c
+    (`naive`). At 16 samples per row its sampling noise is ~0.01 per arm. Rows are
+    the generation pool's, so `row_mean[i]` is row i's mean over its samples.
+    `keep_arms` restricts it to the arms the accuracy block keeps (min_dose_n),
+    so lambda-hat and bias_along_v describe one arm set; the vehicle arm is
+    always kept.
+    """
+    keys = np.asarray(keys).astype(str)
+    sc = np.asarray(syn_c, dtype=np.int64)
+    if keep_arms is not None:
+        sel = np.isin(keys, list(keep_arms | {CONTROL_ARM}))
+        row_mean, keys, sc = row_mean[sel], keys[sel], sc[sel]
+    uniq, mu, _ = group_means(row_mean, np.char.add(np.char.add(keys, "#"), sc.astype(str)))
+    arm_of = np.array([u.rsplit("#", 1)[0] for u in uniq])
+    lvl = np.array([int(u.rsplit("#", 1)[1]) for u in uniq])
+    k1 = {a: i for i, (a, l) in enumerate(zip(arm_of, lvl)) if l == 1}
+    k0 = {a: i for i, (a, l) in enumerate(zip(arm_of, lvl)) if l == 0}
+    both = sorted(set(k1) & set(k0))
+    if not both:
+        return {"n_arms": 0}
+    d = mu[[k1[a] for a in both]] - mu[[k0[a] for a in both]]
+    comp = np.array([int(a.split("|", 1)[0]) for a in both])     # CONTROL_ARM is "0|ctl"
+    lam = np.einsum("ag,ag->a", d, directions_for(syn, comp)) / float(syn["beta"])
+    is_ctl = np.array([a == CONTROL_ARM for a in both])
+    scored = np.isin(comp, list(scored_ci)) & ~is_ctl if scored_ci else np.zeros(comp.size, bool)
+    halves = np.array([int(half_of_arm.get(a, -1)) for a in both])
+    out = {"n_arms": int((~is_ctl).sum()), "beta": float(syn["beta"]),
+           "vehicle": float(lam[is_ctl][0]) if is_ctl.any() else None,
+           "treated": _q(lam[~is_ctl])}
+    for name, sel in (("scored", scored), ("unscored", ~scored & ~is_ctl)):
+        out[name] = _q(lam[sel])
+        for hname, h in (("low", 0), ("high", 1)):
+            out[f"{name}_{hname}"] = _q(lam[sel & (halves == h)])
     return out
 
 
@@ -415,6 +495,9 @@ def _out_paths(cfg, args, arch: dict | None,
         stag_syn = f"_syn{float(cfg.outcome.syn_effect):g}"
         if int((syn_meta or {}).get("vec_seed", 0)):
             stag_syn += f"-v{int(syn_meta['vec_seed'])}"
+        # Step C2's per-compound injection is a different ground truth again.
+        if (syn_meta or {}).get("mode", "global") != "global":
+            stag_syn += f"-cmp{float(syn_meta['rho']):g}"
     otag = f"oracle_{pop}{ptag}{stag_syn}"
     if args.source == ORACLE_SOURCE:
         tag = otag
@@ -598,8 +681,9 @@ def _pool_block(real: dict, gen: dict | None, *, meta_by_arm: dict, floor: dict,
         acc["per_compound_cos_pooled"] = _q(np.array(cmp_cos))
         # Step C's readout, alongside the aggregate metrics (§3.8.2).
         if syn is not None and half_of_arm is not None:
-            acc["bias_along_v"] = bias_along_v(te, tt, shared, syn["v"],
-                                              half_of_arm, scored_ci or set())
+            acc["bias_along_v"] = bias_along_v(
+                te, tt, shared, directions_for(syn, _split_key(shared)[0]),
+                half_of_arm, scored_ci or set(), n_wells=n_wells[i_est])
         block["accuracy"] = acc
         arm_cos, arm_pear = np.full(keys.size, np.nan), np.full(keys.size, np.nan)
         arm_cos[i_est] = cos; arm_pear[i_est] = pear
@@ -699,6 +783,8 @@ def _quality_block(y_real: np.ndarray, groups_real: np.ndarray, group_names: lis
         out["pooled"][pooled] = [m.to_dict() for m in dm.quality_metrics(
             r, g, pca=pca, mmd_max_samples=args.mmd_max_samples,
             extra=args.extra_metrics, seed=args.seed)]
+    # Which eigensolver the Frechet numbers rest on (dist_metrics._eigh_psd).
+    out["eigh_fallbacks"] = dict(dm.EIGH_FALLBACKS)
     return out
 
 
@@ -786,12 +872,18 @@ def _load_truth(path: str, this: dict, pool: str, min_n: int) -> dict:
 def main():
     t_start = time.time()
     args = _parse_args()
+    # Before anything numeric: a wrong dgemm silently corrupts MMD and Frechet
+    # (§5, step C2 scoring), so it is refused rather than reported.
+    blas_err = dm.assert_blas_ok()
+    print(f"[blas] numpy matrix products verified (rel err {blas_err:.1e}, "
+          f"OPENBLAS_CORETYPE={os.environ.get('OPENBLAS_CORETYPE')})", flush=True)
     if args.source == "generated" and not args.run_dir:
         raise SystemExit("--source generated needs --run_dir <runs/.../arm>")
     if args.source == ORACLE_SOURCE and args.truth:
         print("[truth] ignored: --source real IS the oracle", file=sys.stderr)
         args.truth = None
     cfg = apply_paths_args(config_from_args(args), args)
+    check_syn_args(cfg, args)
     print(f"[init] roles: {format_role_summary(cfg)}", flush=True)
     plate_center = args.plate_center or cfg.outcome.plate_center
 
@@ -825,14 +917,17 @@ def main():
     # the pool is the holdout, and 37,340 x 978 float32 is only 146 MB.
     y_all = normalize_expr(np.asarray(expr), pc_all, m)
     # Step C (§3.8.2): the oracle must carry the SAME injection the arms trained
-    # on, from the same resolved syn_meta.json, or `--truth` would compare two
-    # different ground truths.
+    # on, from the same resolved syn_meta file (--syn_meta), or `--truth` would
+    # compare two different ground truths.
     syn = None
     if cfg.outcome.syn_effect != 0:
         syn = load_syn_meta(cfg, n_genes=cfg.outcome.n_genes)
-        y_all = inject(y_all, meta["syn_c"].values.astype(np.int64),
-                       syn["beta"], syn["v"])
-        print(f"[syn] injected beta {syn['beta']:.4f} along v (vec_seed "
+        y_all = inject_meta(y_all, meta["syn_c"].values.astype(np.int64),
+                            compound_idx, syn)
+        how = ("along v" if syn["mode"] == "global" else
+               f"along a direction per compound (rho {float(syn['rho']):g}, "
+               f"{int(syn['n_directions'])} directions)")
+        print(f"[syn] {syn['name']}: injected beta {syn['beta']:.4f} {how} (vec_seed "
               f"{syn['vec_seed']}, sha1 {syn['v_sha1'][:12]}) on "
               f"{int((meta['syn_c'].values.astype(int) == 1).sum()):,} syn_c=1 rows",
               flush=True)
@@ -939,8 +1034,9 @@ def main():
         # The injection's known shift of this pool's vehicle mean (§3.8.2).
         mu0_offset = None
         if syn is not None:
-            p1 = float(meta["syn_c"].values.astype(np.float64)[dmso_rows].mean())
-            mu0_offset = syn["beta"] * p1 * syn["v"]
+            sc_d = meta["syn_c"].values.astype(np.float64)[dmso_rows]
+            mu0_offset = syn["beta"] * (sc_d[:, None] * directions_for(
+                syn, compound_idx[dmso_rows])).mean(0)
         y_dmso = y_all[dmso_rows]
         mu0_scale = float(np.sqrt((y_dmso.astype(np.float64).var(0, ddof=1)
                                    / max(y_dmso.shape[0], 1)).sum())) if y_dmso.shape[0] > 1 else 0.0
@@ -998,6 +1094,13 @@ def main():
             scored_ci=scored_ci, mu0_offset=mu0_offset)
         block["n_arms_below_min_dose_n"] = n_drop
         block["min_dose_n"] = min_n
+        # §3.8.4's lambda-hat, on the generation pool only: a holdout sub-pool has
+        # one well per arm, so no arm holds both syn_c levels there.
+        if gen_out is not None and syn is not None and pname == args.pool:
+            block["learned_syn_effect"] = learned_syn_effect(
+                gen_out["row_mean"][gen_pos[rows]], keys_all[rows],
+                meta["syn_c"].values[rows], syn, half_of_arm, scored_ci,
+                keep_arms=set(map(str, real["arm_key"])))
         pools_json[pname] = block
         for k, v in arrs.items():
             npz[f"{pname}/{k}"] = v
@@ -1033,8 +1136,9 @@ def main():
             "checked_against_data": checked},
         "truth": None if truth_doc is None else {"path": truth_doc["path"],
                                                  "npz": truth_doc["npz"]},
-        "syn": None if syn is None else {k: syn[k] for k in
-                                        ("syn_effect", "syn_seed", "vec_seed", "scale",
+        "syn": None if syn is None else {k: syn.get(k) for k in
+                                        ("name", "mode", "rho", "n_directions",
+                                         "syn_effect", "syn_seed", "vec_seed", "scale",
                                          "scale_source", "beta", "v_sha1")},
         "tier_scored_compounds": len(scored_ci) or None,
         "pools": pools_json,
@@ -1109,10 +1213,18 @@ def _summarise(doc: dict) -> None:
             if bv:
                 print(f"    BIAS ALONG v (signed <tau_gen - tau_oracle, v>), "
                       f"{bv['n_scored_arms']:,} scored / {bv['n_unscored_arms']:,} unscored arms")
+                if not bv.get("median_is_meaningful", True):
+                    print(f"      NOTE {bv['median_note']}")
                 for nm in ("scored", "unscored"):
-                    print(f"      {nm:8s} low {bv[nm + '_low']['median']}  "
-                          f"high {bv[nm + '_high']['median']}  "
-                          f"high-low {bv[nm + '_high_minus_low_median']}")
+                    print(f"      {nm:8s} mean low {bv[nm + '_low']['mean']}  "
+                          f"high {bv[nm + '_high']['mean']}  "
+                          f"high-low {bv[nm + '_high_minus_low_mean']} "
+                          f"+/- {bv[nm + '_high_minus_low_se']}")
+        ls = b.get("learned_syn_effect")
+        if ls and ls.get("n_arms"):
+            print(f"  LEARNED syn_c SHIFT (lambda-hat = <gen(syn_c=1) - gen(syn_c=0), v_k> / beta), "
+                  f"{ls['n_arms']:,} arms: scored mean {ls['scored']['mean']}  "
+                  f"unscored mean {ls['unscored']['mean']}  vehicle {ls['vehicle']}")
         q = b.get("quality")
         if q and "pooled" in q:
             for nm, rows in q["pooled"].items():

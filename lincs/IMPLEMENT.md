@@ -798,7 +798,9 @@ be something other than the plate:
   known effect.
 - **Step A** — cell line, on a 5-line population, for real-data results.
 
-Run C to completion before building A. The vehicle is RxRx's current
+Run C to completion before building A, and then C2 (§3.8.4): step C could
+not tell `dr` from `conditional` (§5), and C2 is the known-truth case
+designed so that it can. The vehicle is RxRx's current
 **tiered split** (P6); `rarity.py` (MCAR drops, `_confound_cells`,
 `_allocate_drops`, `min_cell`) is outdated and not ported.
 
@@ -993,6 +995,112 @@ Outputs, as in RxRx:
   estimates toward the over-kept group.
 - **Scale:** ingest reads ~183k full rows (~9 GB) from the GCTX (CPU job). The
   in-memory `y` is ~0.7 GB. Nuisance and training time grow ~5×.
+
+#### 3.8.4 Step C2 — compound-specific injection (decided 2026-10-01; before step A)
+
+**Why.** Step C cannot separate `dr` from `conditional` (§5, "Phase 5 step-C
+results", finding 3).
+- Its injection is one shift shared by every row, and the conditional
+  generator learns it exactly: the slope is 25.5 against beta = 25.48.
+- So `conditional`'s g-formula is unbiased, and the weights have nothing to
+  correct.
+
+C2 keeps everything about step C except the injection, which becomes
+compound-specific. `conditional` then has to learn a compound × `syn_c`
+interaction from the few rows the thinning leaves. That is the misspecified
+outcome model DR is meant to protect against, and the same structure step A
+will have (cell line × compound), here with a known truth.
+
+- **Injection.** y ← y + `syn_c` · beta · v_{k(i)}, where k(i) is the row's
+  `compound_idx` (vehicles are k = 0).
+  - v_k = normalise(√(1−ρ) · v + √ρ · u_k). Here v is step C's direction
+    (`vec_seed` 0), and u_k is a unit vector seeded by (`vec_seed`, k), drawn
+    independently of every other compound.
+  - **ρ = 1 is the C2 setting.** ρ = 0 reproduces step C bit for bit, which is
+    checked rather than assumed.
+  - **`syn_c` now modifies the treatment effect.** In step C, the vehicles and
+    every arm moved along the same v, so `syn_c` was purely prognostic and the
+    unablated τ̂ did not move. In C2, a compound-k arm's `syn_c` = 1 wells move
+    along v_k and the vehicles' along v_0.
+    - So τ̂ on the unablated pool moves by exactly
+      beta · (mix_a · v_k − mix_0 · v_0), where mix is the arm's (or the
+      vehicles') `syn_c` mean. `check_phase5` asserts this to float precision.
+    - That shift is part of C2's estimand: the oracle carries it, and a
+      generator that learned the interaction reproduces it. It is the
+      interaction step C lacked.
+    - It cancels in the error projected on v_k, so the readout is unaffected.
+    - Per-arm cosines against this oracle are inflated by the −beta · mix_0 · v_0
+      term that every arm shares, so they are not used for C2.
+  - beta is unchanged (`--syn_effect 1.0`, 25.483).
+  - Reused unchanged, because they depend on (A, C) only: `syn_c`, both tier
+    instances, the positivity cells, `dr_weights_counts.npz` and
+    `dr_weights_design.npz`.
+  - Resolved once into `<data>/nuisances/syn_meta_compound_r1.json`
+    (`python -m src.data.synthetic --mode compound --rho 1`). The file records
+    the mode, ρ, `vec_seed`, the number of directions, and a `v_sha1` that
+    hashes the **whole direction matrix**. The matrix itself is stored once,
+    next to the file, as `syn_meta_compound_r1_V.npy`. Regenerating it is not
+    bit-portable across CPUs (§5, "Step C2 implementation and review"). Every existing provenance guard
+    (arch.json, `check_arm_against_data`, `TRUTH_GUARD`) therefore tells C2
+    from C with no new field.
+  - Selected with `--syn_meta <file>` on the trainer, `evaluate` and
+    `step_c_report`. The default, `syn_meta.json`, keeps step C. The choice
+    lives on `CaseConfig`, not `OutcomeSpec`, because `OutcomeSpec` is
+    embedded in `decisions_record` and a new field there would invalidate both
+    builds.
+- **Why `conditional` should fail and `dr` should not.** Take an arm a of
+  compound k. Let p_kept be the `syn_c` mix of its kept train wells, p_a the
+  mix of its pool wells, and λ the share of k's shift the generator learns.
+  - Along v_k, `conditional`'s bias is (p_kept − p_a)(1 − λ) beta.
+  - `dr`'s is (p_w − p_a)(1 − λ) beta. The weights balance p_w within each
+    (compound, dose half) cell, so its high − low contrast is ~0 for any λ.
+  - Step C had λ = 1. Here each scored compound's shift is learned from ~6 kept
+    rows, through a conditioning vector that is a sum
+    (`t + e_compound + e_dose + e_syn_c`). A shared shift is native to that
+    sum; a compound-specific one is not.
+- **Readout.** The same as step C: the DiD of the mean scored high − low
+  contrast, on `--pool all`, over 3 training seeds. Each arm's error is now
+  projected on **its own compound's** v_k.
+- **New diagnostic: the learned share λ̂**, per arm, from the generated per-row
+  means.
+  - Step-C generators condition on compound, `is_control`, dose and `syn_c`
+    only (checked in arch.json). So within one arm, generated rows differ only
+    in `syn_c`.
+  - λ̂ = ⟨mean gen(`syn_c` = 1 rows) − mean gen(`syn_c` = 0 rows), v_k⟩ / beta.
+    Its sampling noise is ~0.01 per arm.
+  - Expected: `naive` ≈ 0, and step C's adjusted arms ≈ 1.
+  - `evaluate` reports it on the generation pool as `learned_syn_effect`, for
+    step C and C2 alike.
+- **Arms.** `naive` / `conditional` / `dr` / `dr_design` × γ ∈ {0, 1} × training
+  seeds {0, 1, 2}, MLP-B DDPM 500 epochs, on the seed-42 tier instances,
+  exactly as step C.
+  - Run dirs are `stepc2_<arm>_g<γ>_s<seed>`.
+  - Each is scored at the §3.14 settings on `--pool all` against
+    `oracle_mcf7_24h_poolall_syn1-cmp1.json`.
+- **Success, fixed before any C2 result:**
+  1. `naive` is biased: |DiD| > 3 seed sd.
+  2. **`dr` beats `conditional`**: `dr`'s |DiD| is below `conditional`'s by
+     > 2σ (`step_c_report`'s `dr_vs_conditional_sigma`; §3.8.1 criterion 2).
+  3. `dr` is close to the true weights:
+     |DiD(`dr`) − DiD(`dr_design`)| < 0.25 · |DiD(`conditional`) − DiD(`dr_design`)|.
+     §3.8.1 criterion 2 always said "close to `dr_design`'s"; the step-C report
+     judged only its first half, and now judges both.
+  4. Unscored compounds unchanged (§3.8.1 criterion 3).
+- **Diagnostics, not gates:**
+  - λ̂ < 1 on `conditional`'s scored arms.
+  - DiD(`conditional`) ≈ (1 − λ̂) · DiD(`naive`), within a factor of 2.
+  - `naive`'s leak onto unscored compounds ≈ 0. With compound-specific
+    directions, no shared pathway can carry it (tests finding 5's mechanism).
+  - The weights' precision cost, as in step C's finding 4.
+- **If criterion 2 fails because λ̂ ≈ 1**, the pre-declared escalation is one
+  direction per (compound, dose half). That is still the positivity cell, so
+  the weights still balance it. It costs 24 more runs. Any other change is a
+  new decision.
+- **Compute.**
+  - The injected oracle and `check_phase5` are a numpy-only CPU job, so they
+    follow the CPU rule: `ma` within its headroom, else `bindel`.
+  - The GPU smoke and the 24 × (~9.4 min training + ~7.6 min scoring),
+    ~7 GPU-h in all, run on `zabih` (approved 2026-10-01).
 
 ### 3.9 Reuse vs rewrite (checklist)
 
@@ -1715,8 +1823,48 @@ implementation and review".
         +0.83), where (arm, `syn_c`) keys gave means of 1.1–1.3.
 - [ ] `naive` / `conditional` / `dr` (+ `dr_design`) × γ ∈ {0, 1} × ≥2
       seeds trained and scored
+      - All 24 runs trained and scored 2026-10-01 (3 training seeds, one
+        thinning seed; jobs 828810–828878 on `zabih`). Unchecked until the
+        Phase 5 code review. Results in §5, "Phase 5 step-C results".
 - [ ] Step-C verdict against the §3.8.1 success criteria written up (gate
       for Phase 6)
+      - Written up in §5 (2026-10-01). Criteria 1, 3 and 4 pass. Criterion 2
+        cannot be tested under step C's injection: the conditional arm is
+        correctly specified, so `dr` has no bias left to remove.
+- [ ] **Step C2** (§3.8.4): a step-C variant in which `dr` can beat
+      `conditional`, via a compound-specific injection at ρ = 1 (user,
+      2026-10-01: option B). **Runs before Phase 6.**
+  - [ ] `synthetic.py --mode compound --rho`: per-compound directions,
+        `v_sha1` over the whole matrix, ρ = 0 bit-identical to step C;
+        `--syn_meta` selects the file (trainer, eval, report, tests)
+  - [ ] `evaluate.py`: injection and vehicle offset per compound;
+        `bias_along_v` projects each arm on its own v_k; `learned_syn_effect`
+        (λ̂); oracle tag `_syn1-cmp1`
+  - [ ] `step_c_report`: `--syn_meta` filter, λ̂ columns, criterion 2 judged
+        in full (including "close to `dr_design`")
+  - [ ] `check_phase5` / `smoke_phase5_torch` / `phase5_gpu.sub` cover the
+        compound mode; `phase5_arms.sh` takes the variant
+  - [ ] Injected oracle (CPU) + GPU smoke green, then
+        `naive` / `conditional` / `dr` / `dr_design` × γ ∈ {0, 1} × 3 seeds
+        trained and scored on `zabih`
+        - The code above is written, reviewed (automated `code-review`; 8 of 10
+          findings fixed, §5) and smoke-tested. Unchecked until the user's
+          review.
+        - Oracle and checks: CPU job 850257 on `bindel`, 81 checks, 0
+          failures. GPU smoke: 850258 on `zabih`, 52 checks, 0 failures.
+        - The 24 runs were submitted 2026-10-01 with
+          `VARIANT=c2 bash scripts/phase5_arms.sh`: training 850418–850465
+          (even IDs from 850418 to 850426, odd from 850429), each scored by the
+          next ID.
+        - The first scoring wave crashed on a wrong BLAS (§5) and was
+          cancelled. It was rescored on the fixed scripts: 854859 and
+          856859–856968, all 24 exit 0.
+  - [ ] Verdict against §3.8.4's success criteria written up (gate for
+        Phase 6)
+        - Written up in §5, "Step C2 results" (2026-10-02). Criteria 1, 3 and 4
+          pass; **criterion 2 fails**: `dr` over-corrects (+0.58 against
+          `conditional`'s −0.28), from arm-level Hájek bias of cell-level
+          weights. Whether Phase 6 proceeds is the user's decision.
 
 ### Phase 6 — step A: cell line on `core5_24h` (§3.8.3)
 
@@ -2158,21 +2306,38 @@ C=['syn_c']`, that arm scored against the injected oracle, the syn-mismatch
 refusal (which names `syn_effect`, `syn_beta` **and** `syn_v_sha1`), and
 `check_phase5`.
 
-**The bias-along-v readout reproduces `--plan`.** Signed
+**The bias-along-v readout runs end to end.** Signed
 `<tau_gen - tau_oracle, v>`, median by dose half, on a deliberately untrained
-arm (1 epoch x 5 steps):
+arm (1 epoch x 5 steps), scored on `--pool holdout`:
 
 | arms | low | high | high − low |
 |---|---|---|---|
-| scored (3,623) | −12.89 | −22.09 | **−9.20** |
-| unscored (6,131) | −2.82 | −2.18 | **+0.64** |
+| scored (3,623) | −12.89 | −22.09 | −9.20 |
+| unscored (6,131) | −2.82 | −2.18 | +0.64 |
 
-`--plan` predicted a high − low contrast of **−8.32** at gamma = 1; the measured
-contrast on scored arms is −9.20, and on unscored arms it is ~0. The large
-common offset is the untrained model (tau_gen ~ 0, so the projection is mostly
-−tau_oracle); the **contrast between halves** is what isolates the thinning, and
-it is the quantity that matches. So §3.8.1's criteria 1 and 3 are already
-measurable end to end, on a model that has learned nothing.
+**Corrected 2026-10-01 (superseding the first reading of this table).** It was
+first recorded here that −9.20 "reproduces" `--plan`'s predicted −8.32. It does
+not: those are two unrelated numbers that happen to land close together, and an
+untrained model cannot exhibit thinning bias. The cause is the pool. On
+`--pool holdout` the P3 split leaves **one well per arm**, so
+`<tau_oracle, v> = beta * (syn_c - 1/2)` is **bimodal at +/- beta/2 = +/-12.74**
+-- measured on the injected oracle: |proj| median 12.73, and **100%** of arms
+beyond beta/4. The *median* of a bimodal variable lands on a mode, so it reports
++10.03 for the oracle alone, while its mean is +0.32. On `--pool all` (3-well
+arms, where the mix is 2/1 and the offset is beta/6) the same statistic is
+**+0.22 median / +0.29 mean**.
+
+Two consequences for the step-C readout, both adopted:
+
+- **Score step C on `--pool all`**, which §3.8.1 already required; the `holdout`
+  sub-pool's `bias_along_v` is not interpretable and the verdict ignores it.
+- **Read the contrast as a mean, not a median.** The per-arm projection is
+  discrete and bimodal by construction, which is exactly the case a median
+  handles badly. `bias_along_v` reports both.
+
+What the smoke does establish is that the path runs end to end and that the
+scored/unscored split, the dose halves and the projection are all wired
+correctly.
 
 | Change against the plan text | Why |
 |---|---|
@@ -2214,3 +2379,387 @@ fraction of the attainable ceiling (E11's Spearman–Brown lift).
    +0.016 on the MLP and −0.001 on the DiT, while Spearman falls on both
    (0.626 → 0.612, 0.630 → 0.619). E9 required a tau gain with no loss of
    spread; this is mixed, so `--cmean_lambda 0` stays the default.
+
+### Phase 5 step-C results: all 24 arms (2026-10-01)
+
+MLP-B, DDPM, 500 epochs. The matrix is {`naive`, `conditional`, `dr`,
+`dr_design`} × γ ∈ {0, 1} × training seeds {0, 1, 2}, on the seed-42 tier
+instances. Every arm is scored on `--pool all` at the §3.14 settings, against
+the injected oracle (beta = 25.483). Jobs 828810–828878 ran on `zabih`: training
+averaged 9.4 min, scoring 7.6 min, and all exited 0. The verdict is in
+`runs/mcf7_24h/eval_artifacts/step_c_verdict.json` (`src.eval.step_c_report`).
+
+The statistic is the one `step_c_report` documents: a difference-in-differences
+(DiD) of the **mean** high − low contrast of ⟨τ_gen − τ_oracle, v⟩ on scored
+compounds, γ = 1 minus γ = 0, with the spread over training seeds as the noise.
+The numbers below that are not in the verdict JSON were computed from the arms'
+`_tau.npz` files and the tier splits, with one-off numpy that is not in the repo.
+
+| Change against the plan text | Why |
+|---|---|
+| **`step_c_report` refuses duplicate cells, and admits only JSONs scored at the §3.14 settings** (`SCORING`: epoch 499, EMA, w = 1, 16 samples per row, 100 steps), at the JSON's own `syn_effect`, and against a single injection (beta, `v_sha1`). The verdict JSON records the source file of every cell | The default glob also matched `p5smoke_828242_dr`. That smoke arm is tiered with γ = 1, seed 0, C = `syn_c` and counts weights, but it was scored at epoch 0 with 1 sample and 4 steps. It sorted ahead of `stepc_dr_g1_s0`, and the report kept it, logging the real run as a "duplicate". `dr`'s DiD came out −0.11 ± 0.16 instead of −0.03 ± 0.02. The flags did not change, but the seed spread was inflated 7×. Checked after the fix: the default run skips both smoke JSONs and names the reason; a duplicated cell and a JSON with a different `v_sha1` are both refused |
+
+| arm | DiD, scored (mean ± seed sd) | DiD, unscored | as a share of `naive` |
+|---|---|---|---|
+| `naive` | **−6.85 ± 0.31** | −0.53 ± 0.27 | — |
+| `conditional` | +0.005 ± 0.020 | +0.00 | 0.07% |
+| `dr` (counts weights) | −0.025 ± 0.025 | −0.01 | 0.4% |
+| `dr_design` (true weights) | −0.052 ± 0.015 | −0.01 | 0.8% |
+
+§3.8.1 criteria:
+
+1. **Pass.** `naive`'s DiD is 22 seed-sd from 0. Its γ = 0 contrast is +0.15 to
+   +0.27, and differencing removes it.
+2. **Fails as written:** `dr` vs `conditional` is −1.1 σ. It **cannot be tested
+   under this injection** (finding 3). `dr` is within 1.6 σ of `dr_design`.
+3. **Pass**, at the 25% threshold. `naive` leaks onto unscored compounds
+   (finding 5).
+4. **Pass**, measured before training (corr(counts, design) +0.88 at γ = 1).
+
+Findings:
+
+1. **`naive` shows about 65% of the selection bias in its training data.**
+   - A memoriser (each arm's mean over its kept train wells) has DiD **−10.56**
+     on this thinning, and −9.00 when pooled to (compound, dose half). `naive`
+     has −6.85.
+   - The ratio is the same in both halves: +3.31 vs +5.28 (low), −3.55 vs −5.29
+     (high). So the MLP shrinks across arms rather than missing one half.
+   - `--plan`'s −8.32 is a median over compounds of a cell-level quantity. It is
+     not the reference for a mean over arms; the memoriser is.
+2. **Adjusting for `syn_c` removes ≥ 99% of that bias in all three arms**
+   (last column of the table). `dr_design`'s −0.052 is consistent over seeds
+   but is 0.2% of beta.
+3. **Why `dr` cannot beat `conditional` here: the outcome model is correctly
+   specified, and it is learned exactly.**
+   - Slope of ⟨τ_gen(a), v⟩ on each arm's `syn_c` mix, relative to the
+     vehicles (seed 0, both γ): **25.48–25.52** for all three adjusted arms,
+     against beta = 25.483. For `naive` it is 3.5.
+   - The injection is one additive shift shared by every row, learned from
+     ~21k training rows. With E[Y | arm, `syn_c`] right, the g-formula is
+     unbiased, and the weights have nothing to correct.
+   - So this is a limit of the design, not a failure of DR. §3.8.1 anticipated
+     it: "a null result is an admissible outcome".
+4. **The weights cost precision on scored compounds, and none on unscored
+   ones.**
+   - Read on the holdout sub-pool, whose one-well oracle was never trained on.
+     The `--pool all` oracle contains the train wells and rewards memorising
+     them (E9).
+   - Mean squared error orthogonal to v, relative to `conditional` at the same
+     γ (3 seeds):
+
+     | arm | γ = 1 scored | γ = 1 unscored | γ = 0 scored | γ = 0 unscored |
+     |---|---|---|---|---|
+     | `dr` | +3.5% | +0.1% | +2.0% | +0.0% |
+     | `dr_design` | +2.6% | +0.1% | +0.2% | −0.0% |
+     | `naive` | −0.3% | +0.0% | −0.4% | +0.1% |
+
+   - These shares include the one-well oracle noise common to every arm, so the
+     generator's own error rises by more.
+   - Kish ESS / n over the train rows: counts 0.68, design 0.75 at γ = 1 (max
+     weight 22.0 vs 9.6); counts 0.77, design 0.87 at γ = 0 (max 11.0 vs 2.5).
+   - At γ = 0 the true weights are nearly flat, and the counts weights still
+     cost 2.0%. That share is weight-estimation noise from ~3 rows per cell,
+     not the reweighting itself.
+   - On `--pool all` the same ranking shows as pooled gene MSE at γ = 1:
+     0.2356 (`conditional`), 0.2465 (`dr_design`), 0.2509 (`dr`).
+5. **`naive`'s bias leaks onto compounds that were never thinned.**
+   - Unscored DiD: −0.32, −0.44, −0.84 over the three seeds. That is ~8% of the
+     scored bias, in the same direction (high-dose half pulled along −v).
+   - The memoriser's unscored DiD is exactly 0, because unscored compounds are
+     identical in both instances. So the shift comes from parameter sharing in
+     the network.
+   - The likely carrier is the dose input every compound shares. That is not
+     tested yet.
+   - The adjusted arms show no leak (|DiD| ≤ 0.02). Criterion 3 passes at its
+     25% threshold, but the leak is not zero, so later steps should keep
+     reporting unscored compounds separately.
+6. **Per-arm cosine cannot rank the arms.**
+   - Every arm sits at 98–101% of the (lower-bound) ceiling.
+   - `naive`'s lower cosine, 0.47 vs 0.53 for `conditional` and present even at
+     γ = 0, comes from the oracle, not the generator. Each arm's oracle carries
+     its own `syn_c`-mix offset, which a model blind to `syn_c` cannot
+     reproduce. `naive`'s mean squared error along v is 21–23 per arm, against
+     (beta/6)² = 18.0 from that offset alone; the adjusted arms' is 0.14–0.38.
+   - The DiD along v is therefore the step-C readout. A `syn_c`-stratified
+     oracle (the earlier open decision) is needed only if per-arm metrics are
+     to be reported for step C.
+7. **Arm-level positivity fails for 15–19% of scored arms.** 589 (γ = 1) and
+   739 (γ = 0) of the 3,835 scored arms keep no train well after thinning. The
+   generator fills them in from the compound's other doses, and they are
+   included in the readout. Positivity holds at the (compound, dose half,
+   `syn_c`) cell, by construction.
+
+**Decision (user, 2026-10-01): Phase 6 waits.** First, a step-C variant in which
+`dr` can beat `conditional`. That requires an outcome model that cannot learn
+the confounder's effect exactly, which is where DR is supposed to help.
+
+#### Decision: which variant (resolved 2026-10-01)
+
+**Option B at ρ = 1, run on `zabih` (user, 2026-10-01).** Option A is not run.
+ρ = 0.5 is added only if ρ = 1 shows the effect. The design, the success
+criteria and the escalation are fixed in §3.8.4. The options as they were laid
+out:
+
+**Option A: IPW-only arms.**
+- The generator does not see `syn_c` (C = ∅) but is trained with the counts or
+  the design weights (`ipw`, `ipw_design`).
+- This completes the 2×2 of {C in the generator} × {weights}, and tests the
+  weights' half of double robustness on their own. Prediction: DiD ≈ 0, against
+  `naive`'s −6.85.
+- What it reuses: the injection, the oracle, the tier instances and the weights.
+- What it needs: an opt-in past the trainer's guard
+  (`train_diffusion.py`, "a weighted arm adjusts for it"), a report label, and a
+  launcher case. 12 runs, ~3.4 GPU-h.
+- Its limit: the arm it beats is `naive`, not `conditional`. The
+  misspecification is omitting C entirely, which no ADIGen arm does.
+
+**Option B: compound-specific injection (effect modification).**
+- y ← y + `syn_c` · beta · v_k, with
+  v_k = normalise(√(1−ρ) · v + √ρ · u_k) and u_k a seeded unit vector per
+  compound (the vehicle is compound 0). ρ = 0 is the current step C; ρ = 1 is
+  fully compound-specific.
+- Thinning, positivity cells and weights depend on (A, C) only, so they are
+  reused unchanged.
+- Mechanism:
+  - `conditional` must now learn each scored compound's `syn_c` shift from ~6
+    kept rows. The MLP's conditioning is an additive sum, so a shared shift is
+    native and a compound × `syn_c` interaction is not.
+  - Any shrinkage λ < 1 of that interaction leaves (1 − λ) of `naive`'s bias in
+    the g-formula.
+  - The weights balance `syn_c` within every (compound, dose half) cell, so
+    `dr`'s arm fits stay balanced whatever λ is.
+- Predictions:
+  - DiD(`conditional`) ≈ (1 − λ̂) · DiD(`naive`), with λ̂ read off the arm
+    (finding 3's slope, per compound).
+  - `dr` ≈ `dr_design` ≈ 0.
+  - `naive` stays strongly biased, though possibly below −6.85: shrinking
+    toward structure shared across compounds no longer carries the bias, since
+    the directions differ by compound. The memoriser's −10.56 is the bound.
+  - `naive`'s unscored leak should vanish for the same reason. That tests
+    finding 5.
+- Power: the DiD's seed noise is ~0.02, so even λ = 0.99 would put
+  `conditional` ~3 σ off.
+- Code: `synthetic.py` (directions per compound, ρ, a sha1 of the direction
+  matrix), the two `inject` call sites (`dataset.py`, `evaluate.py`),
+  `bias_along_v` (each arm projected on its own v_k), the vehicle offset, the
+  provenance guards, `check_phase5` and the smoke.
+- Compute: a new injected oracle (CPU, seconds) and 24 runs at ρ = 1, ~7 GPU-h
+  or ~1.5 h of wall time on six `zabih` GPUs.
+- Risk: the MLP learns every compound's interaction (λ̂ → 1), which would give a
+  null again. The escalation is a direction per (compound, dose half), which is
+  still the positivity cell, so the weights still balance it.
+
+**Recommendation: B at ρ = 1.**
+- It tests what ADIGen actually claims: DR protects against an outcome model
+  that cannot learn the confounder's interaction with the treatment.
+- It rehearses step A, where the cell line × compound interaction plays the same
+  role, with a known truth.
+- A is optional. It is worth running only if the write-up wants the full 2×2 of
+  double robustness, and it can run on the existing injection while B is being
+  coded.
+
+### Step C2 implementation and review (2026-10-01)
+
+Code for §3.8.4, written after the plan text above and before any C2 result.
+- **Local checks** (numpy only, torch made unimportable):
+  - unit checks of the directions, the injection, the readout and λ̂ on
+    synthetic arrays;
+  - the real `syn_meta_compound_r1.json` resolved and read back, including
+    four tampering refusals;
+  - `step_c_report` re-run on the 24 step-C arms. The deltas are identical, and
+    all 12 weighted runs' weight hashes match their files.
+- **Jobs:** a CPU job on `bindel` (`ma` was at 13.6% free memory, under the 20%
+  rule) builds the injected oracle and runs `check_phase4` and `check_phase5`.
+  The `zabih` GPU smoke depends on it. The first pair (850067 / 850069) ran
+  before the matrix was stored (table below) and was discarded; 850257 / 850258
+  are the runs of record.
+
+The resolved injection: beta 25.4828, the same as step C, and 1,751 directions
+(the vocab, vehicle included). The stored matrix's sha1 is `11c32b37`; step C's v
+is `492aa3d1` and is C2's shared component. Median cos(v_k, v) is 0.0011, and the
+median |cos| between compounds is 0.0216, the isotropic value 0.6745/√978. The
+maximum is 0.158.
+
+| Change | Why |
+|---|---|
+| `synthetic.py`: `--mode compound --rho`, `effect_directions`, a matrix form of `inject`, `inject_meta` / `directions_for` as the single call shape, and `default_meta_name` | Trainer, oracle and tests must apply one injection through one function. At ρ = 0 the compound path is **bit-identical** to the global one (asserted in the unit checks and in `check_phase5`), so C2 at ρ = 0 is step C |
+| In compound mode, `v_sha1` hashes the whole direction matrix, and `v_shared_sha1` hashes v | Every existing guard (arch.json `syn_v_sha1`, `check_arm_against_data`, `TRUTH_GUARD`) then tells C2 from C with no new field |
+| **The matrix is stored** in a sidecar, `syn_meta_compound_r1_V.npy` (13.7 MB). It is written atomically before the JSON that names it, and **written once**: rerunning `synthetic` on the same injection is a no-op. Every consumer loads the stored bytes and holds them to `v_sha1`; regenerating from the seeds is now only a construction check, to 1e-12 | Found by the first CPU job (850067). The first design regenerated the matrix on load and compared hashes. On `bindel` the same seeds gave sha1 `f42063ad`; the dev box gave `11c32b37`; the entries agree to ~1e-16. Each normalisation goes through BLAS, which rounds the last bits differently on different CPUs. The job had also rewritten the file with its own hash, because the parameters matched. Unfixed, a `zabih` trainer could have refused the file, or recorded a hash the oracle did not share. The stale oracle and smoke (850067 / 850069) were discarded and rerun on the stored matrix |
+| `CaseConfig.syn_meta_name` and `--syn_meta` (trainer, evaluate), with `check_syn_args` refusing `--syn_meta` without a nonzero `--syn_effect` | Not on `OutcomeSpec`, which `decisions_record` embeds (a new field would invalidate both builds). The refusal comes from review: `syn_effect` alone switches the injection on, so `--syn_meta` without it would silently train or score uninjected data |
+| `evaluate`: the per-compound injection and vehicle offset; `bias_along_v` projects each arm on its own v_k; oracle tag `_syn1-cmp1`; `learned_syn_effect` (λ̂) on the generation pool's kept arms | §3.8.4's readout and diagnostic. λ̂ is restricted to the arms the accuracy block keeps (`min_dose_n`), so both describe one arm set (review) |
+| arch.json gains `syn_meta_name`, `syn_mode`, `syn_rho` | Readability only: `syn_v_sha1` already pins the injection. Uninjected runs record `None` for all three, so resuming a v1 arm is unaffected. A step-C run resumed now would show these three as differing; none is planned |
+| `check_phase5`, compound mode: the matrix shape (one row per vocab entry), the rows **rebuilt independently** from the raw RNG streams and the §3.8.4 formula, unit norms, cos with v ≈ √(1−ρ), near-orthogonality at ρ = 1, the ρ = 0 bit-identity, and the shift of beta · v_k on each row | Review: the first version compared the matrix with `effect_directions` on the same arguments, which could never fail |
+| `check_phase5`: **τ now moves, by exactly beta · (mix_a · v_k − mix_0 · v_0)**, asserted instead of "the injection leaves τ alone" | Found while writing the check. In C2 the vehicles move along v_0 and a compound's wells along v_k, so `syn_c` modifies the treatment effect (§3.8.4). Step C's check still runs in global mode |
+| `check_phase4` and `smoke_phase5_torch` apply the injection the oracle or `--syn_meta` names | Their independent recomputes would otherwise disagree with a C2 oracle by the injection |
+| `step_c_report`: `--syn_meta` selects JSONs by `v_sha1` (step C and C2 share a runs dir); the reference is loaded through `load_syn_meta`; the λ̂ columns and the (1 − λ̂) × `naive` diagnostic; criterion 2 judged in full; criterion 4 recomputes each weighted run's `dr_weights_sha1` from the file it names; the verdict file is named from the basename | §3.8.4. The first version read the reference raw (unvalidated), always passed criterion 4 with constants, and built the verdict path from a path-valued `--syn_meta` (review) |
+| `phase5_arms.sh` `VARIANT=c2`, `phase5_gpu.sub` `SYN_META=...` (plus two cross-injection refusals: a C2 arm scored under step C's injection, and against step C's oracle), and a new `phase5_oracle_cpu.sub` | One launcher and one smoke for both variants; the oracle is a CPU job |
+
+Review findings not acted on:
+- Regenerating the matrix on every load costs ~1,751 small RNG draws per
+  process, a fraction of a second. A cache would hand out a shared mutable
+  array.
+- In global mode, `directions_for` broadcasts v to (N, G), materialising ~16 MB
+  per sub-pool. The 1-D branch of `bias_along_v` stays reachable for other
+  callers.
+
+### Step C2 scoring: numpy's matrix products are wrong on the Sapphire Rapids nodes (2026-10-02)
+
+**What happened.** The first five C2 scoring jobs (850419, 850421, 850423,
+850425, 850427, and 850430 before the cancel landed) all died in the quality
+block with `LinAlgError: Eigenvalues did not converge`. Every PC-projected row,
+real and generated alike, was non-finite: the PCA basis itself was NaN. The
+other 18 scoring jobs were cancelled before they could repeat it. Training was
+unaffected, and all 24 runs continued.
+
+**Diagnosis** (`src/tests/check_eigh.py` and `src/tests/check_blas.py`, run as
+short CPU-only jobs on `bindel` and on `zabih`, and locally):
+
+| | `zabih-compute-01` (Xeon Gold 6426Y) | login node (Gold 6448Y) | `bindel` (E5-2620 v3) |
+|---|---|---|---|
+| dgemm, 300×300 and larger | **wrong** (rel. err ~1.5) at 1, 4 and all threads | **wrong** | correct |
+| dgemm, 100×300 @ 300×100 | wrong at 4 threads, correct at 1 | the same | correct |
+| `eigh`, `svd` (they are built on dgemm) | **wrong** (NaN or finite garbage) | **wrong** | correct |
+| dgemv, ddot, `np.cov` (syrk), element-wise ops | correct | correct | correct |
+| everything above with `OPENBLAS_CORETYPE=Haswell` | **correct** | **correct** | correct |
+
+numpy 1.23.5's bundled OpenBLAS picks its Sapphire Rapids kernels on both Intel
+Sapphire Rapids hosts, and their dgemm is wrong. On the C2 covariance the
+result was NaN, which crashed the job. On every earlier eval it was **finite
+garbage**, which crashed nothing.
+
+**Scope: what was computed wrong.** Every MMD, PC Fréchet and full Fréchet (and
+KID / PRDC where requested) from `evaluate` runs on `zabih`:
+- all 12 Phase 4 arms, the E10 step check (`eval_steps`) and the Phase 4 smokes;
+- all 24 step-C arms.
+
+Each of those logs carries the "negative Frechet … clamping" warning. One
+example had a cross term of 476,123 against covariance traces of ~7,000, which
+is impossible.
+
+**Not affected, so the Phase 4 and step-C conclusions stand:**
+- τ̂, the per-arm cosine and Pearson, Spearman, pooled MSE, `bias_along_v` (a
+  matrix-vector product), λ̂ (`einsum`), and the marginal Fréchet (closed form,
+  element-wise);
+- everything computed on `bindel`: all oracles, `check_phase1/4/5`, and the
+  data layer;
+- training, which runs in torch on the GPU, and torch ships its own BLAS.
+
+The local step-C analysis in §5 was recomputed with `OPENBLAS_CORETYPE=Haswell`
+and is identical to every printed digit. That includes the λ slope of
+25.48–25.52, which had gone through `np.polyfit`.
+
+The Phase 4 and step-C **quality numbers must not be quoted.** Rescoring them is
+optional:
+- step C: 24 × ~7.6 min on `zabih`;
+- Phase 4: the 4 DDPM arms on `--pool all` (MLP ~16 min, DiT ~3.9 h each) and
+  the 8 FM arms on the holdout.
+
+| Change | Why |
+|---|---|
+| Every `scripts/*.sub` exports `OPENBLAS_CORETYPE=Haswell` | It must be set before numpy loads. On `bindel` it is a no-op |
+| `evaluate` refuses a broken BLAS at start-up (`dist_metrics.assert_blas_ok`: a 300×300 dgemm against a loop reference, like the CUDA preflight) and logs the result | A wrong dgemm corrupts metrics silently. 300×300 failed 12/12 draws at every thread count tested; the 100×300 case slipped through at 1 thread |
+| `dist_metrics._eigh_psd` replaces the three bare eigensolver calls (`fit_pca`, `_matrix_sqrt`, the Fréchet cross term). It accepts a result only if it is finite, orthonormal and reconstructs the matrix (1e-7), falls back to scipy's MRRR driver and then to an SVD, raises if none verifies, and records any fallback in the quality JSON (`eigh_fallbacks`) | A NaN check alone would have missed the finite garbage of every earlier run |
+| Known gap, now covered: the GPU smoke runs eval with `--quality_n 0`, so the quality block never ran there | The BLAS guard runs in every eval regardless of `--quality_n` |
+
+C2 scoring is resubmitted on the fixed scripts after one full scoring job
+passes end to end (below). The 24 trainings are untouched.
+
+### Step C2 results: all 24 arms (2026-10-02)
+
+MLP-B, DDPM, 500 epochs, on the seed-42 tier instances, under the per-compound
+injection (ρ = 1, beta 25.483, matrix sha1 `11c32b37`).
+- Training: jobs 850418–850465, all exit 0.
+- Scoring: 854859 and 856859–856968, all exit 0, on the fixed scripts (BLAS
+  verified, no eigensolver fallbacks, no Fréchet warnings).
+- Verdict: `runs/mcf7_24h/eval_artifacts/step_c_verdict_compound_r1.json`
+  (`step_c_report --syn_meta syn_meta_compound_r1.json`). The split by
+  kept-train status and the data-level memorisers below were computed locally
+  (numpy, `OPENBLAS_CORETYPE=Haswell`) from the `_tau.npz` files, the tier splits
+  and the weight files.
+
+| arm | DiD, scored (mean ± seed sd) | DiD, unscored | λ̂ scored (γ = 1) | λ̂ unscored | pooled gene MSE |
+|---|---|---|---|---|---|
+| `naive` | −1.93 ± 0.03 | −0.29 ± 0.01 | 0.000 | 0.001 | 0.334–0.340 |
+| `conditional` | **−0.28 ± 0.01** | +0.00 | 0.520 | 0.720 | 0.286–0.296 |
+| `dr` (counts) | **+0.58 ± 0.05** | −0.05 ± 0.02 | 0.349 | 0.143 | 0.369–0.383 |
+| `dr_design` | **+0.56 ± 0.03** | −0.05 ± 0.01 | 0.402 | 0.209 | 0.347–0.364 |
+
+§3.8.4 criteria (fixed before any C2 result):
+
+1. **Pass.** `naive` is biased, 56 seed-sd from 0.
+2. **Fail.** `dr` does not beat `conditional`. Its |DiD| is 0.58 against 0.28,
+   so `dr_vs_conditional_sigma` is −10.9: it is significantly *worse*, and of
+   the opposite sign.
+3. **Pass.** `dr` is close to the true weights: |0.58 − 0.56| = 0.01, against the
+   bound 0.25 × |−0.28 − 0.56| = 0.21.
+4. **Pass**, at the 25% threshold: the largest unscored |DiD| is 0.29, which is
+   `naive`'s.
+
+Diagnostics:
+- λ̂ < 1 on `conditional`: yes, 0.52.
+- (1 − λ̂) × DiD(`naive`) = −0.93 against the measured −0.28. That is off by
+  3.3×, outside the factor of 2, so the linear-shrinkage picture is too simple.
+- `naive`'s leak onto unscored compounds was predicted to vanish. It did not:
+  −0.29, 15% of its scored DiD (step C: 8%).
+
+Findings:
+
+1. **C2 achieved its first aim: `conditional` is now biased.** Its DiD is
+   −0.28 ± 0.01, 40 seed-sd from 0, in `naive`'s direction. In step C it was
+   +0.005. The generator learns only about half of each scored compound's
+   shift (λ̂ 0.52; 0.72 on unthinned compounds), against ~1.00 for the shared
+   shift in step C.
+2. **But the weighted risk over-corrects, with the true weights as much as the
+   estimated ones.** `dr` and `dr_design` agree (+0.58 / +0.56), so this is
+   not weight-estimation error. It is how the weights meet the outcome model.
+3. **Mechanism: the weights balance `syn_c` per (compound, dose half) cell, but
+   the generator fits arms, and the thinning leaves an arm 1–2 train wells.**
+   - The data alone shows it. Take a memoriser of each arm's (weighted) mean of
+     its kept train wells, with bias β · (its `syn_c` mix − the pool's), and
+     arms classed by their own instance's kept wells. Its DiD of the scored
+     high − low contrast:
+
+     | | arms that kept both `syn_c` levels | arms that kept one level | all |
+     |---|---|---|---|
+     | unweighted | −1.63 | −14.05 | −10.56 |
+     | counts / design weights | **+8.71 / +8.30** | −14.05 | −7.67 / −7.81 |
+
+   - On an arm that kept both levels, the scarce level's few wells carry the
+     whole cell's weight, and the arm's self-normalised (Hájek) mean
+     **over-corrects**. On an arm that kept one level (2,345 of 3,835 scored arms
+     at γ = 1; 589 kept none), reweighting cannot change the mix at all.
+   - The weights are right for cell-level means, and wrong in both directions
+     at the arm level, where the outcome model works.
+   - The generator shows the same split, by the arm's kept wells at γ = 1
+     (mean of 3 seeds):
+
+     | arm | none | one level | both levels |
+     |---|---|---|---|
+     | `naive` | −0.43 | −2.10 | −2.44 |
+     | `conditional` | +0.53 | −0.41 | −0.43 |
+     | `dr` | −0.13 | +0.50 | **+1.23** |
+     | `dr_design` | +0.39 | +0.37 | **+1.22** |
+
+   - The over-correction is largest exactly where the arm kept both levels. So
+     it is not an extrapolation artefact of arms with no train wells.
+4. **The weighted risk also learns the interaction less.** λ̂ drops from 0.52
+   to 0.35 / 0.40 on scored compounds, and from 0.72 to 0.14 / 0.21 on unthinned
+   ones. At γ = 1 it also differs by dose half (low 0.31–0.38, high 0.37–0.44);
+   `conditional`'s does not.
+5. **The weights' precision cost is much larger than in step C:** pooled gene
+   MSE is 25–30% above `conditional`'s (step C: a few %).
+6. **What C2 says about ADIGen:** with cell-level weights (P12) and an outcome
+   model that resolves finer than the cell, DR is not protective. The
+   finite-sample ratio bias of the weights at the model's resolution can exceed
+   the outcome model's own bias. DR needs the positivity cell to match the
+   resolution at which the generator learns the confounder's interaction.
+   - On MCF7 that cannot be arranged. An arm has ~2 train wells, about one per
+     `syn_c` level, so arm-level positivity leaves nothing to thin (§3.8.2).
+   - **Step A's design already matches it.** Its positivity cell is (compound,
+     `dose_level`, `cell_id`), the arm × line level, and §3.8.3 notes that
+     "arm-level positivity survives the thinning". That makes step A the regime
+     where a DR advantage is possible.
+
+**The pre-declared escalation does not apply.** It was for "criterion 2 fails
+because λ̂ ≈ 1"; here λ̂ = 0.52 and the failure is the weights'
+over-correction. Per §3.8.4, any further C2 run is a new decision.

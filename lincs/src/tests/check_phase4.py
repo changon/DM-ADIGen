@@ -43,7 +43,7 @@ from datasets import load_from_disk  # noqa: E402
 
 from src.data.expr_stats import load_expr_meta, normalize_expr, plate_codes  # noqa: E402
 from src.data.splits import CONTROL_ARM, arm_keys, load_splits  # noqa: E402
-from src.data.synthetic import inject, load_syn_meta  # noqa: E402
+from src.data.synthetic import inject_meta, load_syn_meta  # noqa: E402
 from src.eval.evaluate import TRUTH_GUARD, _min_n_for  # noqa: E402
 from src.spec import (  # noqa: E402
     add_adjustment_set_cli, add_paths_cli, apply_paths_args, config_from_args)
@@ -107,7 +107,10 @@ def main():
         from dataclasses import replace as _replace
         cfg.outcome = _replace(cfg.outcome, syn_effect=float(doc["syn_effect"]),
                                syn_seed=int(doc["syn_seed"]))
-        syn = load_syn_meta(cfg, n_genes=cfg.outcome.n_genes)
+        # The oracle names the injection file it used (step C2 has its own,
+        # §3.8.4); oracles from before that record no name and are step C's.
+        syn = load_syn_meta(cfg, name=(doc.get("syn") or {}).get("name"),
+                            n_genes=cfg.outcome.n_genes)
         check(syn["v_sha1"] == (doc.get("syn") or {}).get("v_sha1"),
               f"syn_meta v_sha1 {syn['v_sha1'][:12]} == the oracle's recorded direction")
         check(abs(syn["beta"] - float((doc.get("syn") or {})["beta"])) < 1e-9,
@@ -172,8 +175,8 @@ def main():
             idx = np.sort(np.asarray(idx, dtype=np.int64))
             z = normalize_expr(np.asarray(expr[idx]), pc[idx], m)
             if syn is not None:
-                z = inject(z, meta["syn_c"].values.astype(np.int64)[idx],
-                           syn["beta"], syn["v"])
+                z = inject_meta(z, meta["syn_c"].values.astype(np.int64)[idx],
+                                meta["compound_idx"].values.astype(np.int64)[idx], syn)
             return z
 
         mu0_re = _y(ctl_rows).mean(0)

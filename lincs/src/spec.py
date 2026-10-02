@@ -385,6 +385,13 @@ class CaseConfig:
     # THE ENVIRONMENT SET -- the E fields, GIVEN, not inferred.
     environment_set: Sequence[str] | None = None
 
+    # Which resolved step-C injection `syn_effect` switches on (§3.8.2, §3.8.4):
+    # a file name under the split dir, falling back to the base build's.
+    # "syn_meta.json" is step C; "syn_meta_compound_r1.json" is step C2. It lives
+    # here, not on OutcomeSpec, because OutcomeSpec is embedded verbatim in
+    # decisions_record, and a new field there would invalidate every build.
+    syn_meta_name: str = "syn_meta.json"
+
     def __post_init__(self):
         if self.paths is None:
             self.paths = Paths(population=self.population.name)
@@ -464,6 +471,24 @@ def add_syn_cli(parser) -> None:
                         help="The syn_c ASSIGNMENT seed. It must equal the one the table "
                              "was built with (population_qc.json), so this exists to make "
                              "a mismatch explicit, not to re-draw syn_c.")
+    parser.add_argument("--syn_meta", default=None,
+                        help="Which resolved injection --syn_effect switches on: "
+                             "syn_meta.json (step C, the default) or e.g. "
+                             "syn_meta_compound_r1.json (step C2, §3.8.4).")
+
+
+def check_syn_args(cfg: CaseConfig, args) -> None:
+    """Refuse `--syn_meta` when `--syn_effect` is 0 (the default).
+
+    `syn_effect` alone switches the injection on, so a `--syn_meta` without it
+    would be dropped silently: the run would train or score on uninjected data
+    while its command line says step C2. Called by the trainer and by evaluate;
+    the test scripts build uninjected configs on purpose and do not call it.
+    """
+    if getattr(args, "syn_meta", None) and float(cfg.outcome.syn_effect) == 0:
+        raise SystemExit(f"--syn_meta {args.syn_meta} selects an injection, but --syn_effect "
+                         f"is 0, which switches it off. Pass --syn_effect (steps C and C2 "
+                         f"use 1.0).")
 
 
 def config_from_args(args) -> CaseConfig:
@@ -492,6 +517,8 @@ def config_from_args(args) -> CaseConfig:
            if getattr(args, k, None) is not None}
     if syn:
         cfg.outcome = replace(cfg.outcome, **syn)
+    if getattr(args, "syn_meta", None):
+        cfg.syn_meta_name = str(args.syn_meta)
     if raw is not None or raw_e is not None:
         cfg.__post_init__()
     return cfg

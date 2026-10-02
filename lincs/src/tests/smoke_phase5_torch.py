@@ -18,6 +18,9 @@ Exits nonzero on any failure.
 
     python -m src.tests.smoke_phase5_torch --device cuda \
         --tier data/mcf7_24h/nuisances_tier_Csyn_c_k0_g1_s42
+    # step C2 (§3.8.4): the same checks under the per-compound injection
+    python -m src.tests.smoke_phase5_torch --device cuda --syn_meta syn_meta_compound_r1.json \
+        --tier data/mcf7_24h/nuisances_tier_Csyn_c_k0_g1_s42
 """
 from __future__ import annotations
 
@@ -40,7 +43,7 @@ from datasets import load_from_disk  # noqa: E402
 from src.data.dataset import LincsDataset, build_cond_spec, cond_from_batch  # noqa: E402
 from src.data.splits import load_splits  # noqa: E402
 from src.data.synthetic import (  # noqa: E402
-    SYN_META, load_syn_meta, resolve_syn_meta_path, table_syn_seed)
+    SYN_META, directions_for, load_syn_meta, resolve_syn_meta_path, table_syn_seed)
 from src.models.conditioning import CondEmbedder  # noqa: E402
 from src.spec import (  # noqa: E402
     add_adjustment_set_cli, add_paths_cli, apply_paths_args, config_from_args)
@@ -78,6 +81,10 @@ def main():
     p.add_argument("--device", default="cuda")
     p.add_argument("--tier", default=None, help="A tiered split dir (for the DR-leg check).")
     p.add_argument("--n_rows", type=int, default=3000, help="Rows to load (keep it small).")
+    p.add_argument("--syn_meta", default=SYN_META,
+                   help="The injection under test: syn_meta.json (step C) or e.g. "
+                        "syn_meta_compound_r1.json (step C2). config_from_args carries "
+                        "it into every cfg built below.")
     add_adjustment_set_cli(p)
     add_paths_cli(p)
     args = p.parse_args()
@@ -93,7 +100,8 @@ def main():
         print(f"      device: {torch.cuda.get_device_name(0)}")
 
     nz = cfg.paths.nuisance_dir
-    sp = os.path.join(nz, SYN_META)
+    NAME = cfg.syn_meta_name
+    sp = resolve_syn_meta_path(cfg)
     if not os.path.isfile(sp):
         print(f"[smoke5] no {sp}; run `python -m src.data.synthetic --syn_effect ...` first")
         sys.exit(1)
@@ -111,15 +119,26 @@ def main():
           "syn_meta is None without the injection and populated with it "
           "(so the trainer can pin beta in arch.json)")
     m = load_syn_meta(cfg_syn, n_genes=cfg.outcome.n_genes)
-    sc = (load_from_disk(cfg.paths.tabular_dataset_dir).select_columns(["syn_c"])
-          .to_pandas()["syn_c"].values.astype(np.int64))[idx]
+    print(f"      injection under test: {m['name']} (mode {m['mode']}"
+          + (f", rho {m['rho']:g}, {m['n_directions']} directions" if m["mode"] != "global" else "")
+          + f", sha1 {m['v_sha1'][:12]})")
+    tbl = (load_from_disk(cfg.paths.tabular_dataset_dir)
+           .select_columns(["syn_c", "compound_idx"]).to_pandas())
+    sc = tbl["syn_c"].values.astype(np.int64)[idx]
+    ci = tbl["compound_idx"].values.astype(np.int64)[idx]
+    # Each syn_c = 1 row moves along ITS compound's direction (one shared v in
+    # step C; v_k per compound in step C2).
     want = torch.from_numpy(
-        (sc[:, None] * m["beta"] * m["v"][None, :]).astype(np.float32))
+        (sc[:, None] * m["beta"] * directions_for(m, ci)).astype(np.float32))
     got = syn.y - plain.y
     err = float((got - want).abs().max())
     check(err < 3e-3,
-          f"y_syn - y_plain == syn_c * beta * v row for row (max |diff| {err:.2e}, "
-          f"on a shift of norm {float(np.linalg.norm(m['beta'] * m['v'])):.2f})")
+          f"y_syn - y_plain == syn_c * beta * v{'_k' if m['mode'] != 'global' else ''} "
+          f"row for row (max |diff| {err:.2e}, on a shift of norm {m['beta']:.2f})")
+    if m["mode"] != "global":
+        n_k = int(np.unique(ci[sc == 1]).size)
+        check(n_k > 1, f"the loaded rows span {n_k} compounds with syn_c = 1, so the "
+                       f"per-compound directions are actually exercised")
     check(float(got[sc == 0].abs().max()) == 0.0,
           f"syn_c=0 rows are bit-identical to the uninjected dataset")
     check(bool(torch.isfinite(syn.y).all()), "the injected y is finite")
@@ -139,7 +158,7 @@ def main():
     # build's: the injection belongs to the population and the table, not to a
     # split, and two copies could drift (a drifted beta looks exactly like
     # step-C bias). So this is a positive check, not a refusal.
-    if args.tier and not os.path.isfile(os.path.join(args.tier, SYN_META)):
+    if args.tier and not os.path.isfile(os.path.join(args.tier, NAME)):
         shared = apply_paths_args(config_from_args(args), args)
         shared.outcome = replace(shared.outcome, syn_effect=eff, syn_seed=seed)
         shared.paths.nuisance_dir = os.path.abspath(args.tier)
@@ -147,25 +166,25 @@ def main():
         check(abs(got["beta"] - m["beta"]) < 1e-12
               and got["v_sha1"] == m["v_sha1"]
               and resolve_syn_meta_path(shared) == os.path.abspath(sp),
-              f"a tiered dir with no {SYN_META} resolves to the base build's "
+              f"a tiered dir with no {NAME} resolves to the base build's "
               f"(same beta {got['beta']:.4f}, same v {got['v_sha1'][:12]})")
     else:
-        print(f"skip  the fallback check needs a --tier dir with no {SYN_META}")
+        print(f"skip  the fallback check needs a --tier dir with no {NAME}")
 
     # ...but a build that has no syn_meta.json anywhere must still refuse.
     LIMIT = os.path.join(os.path.dirname(cfg.paths.data_dir), "mcf7_24h_limit1500")
     if os.path.isdir(LIMIT) and not os.path.isfile(
-            os.path.join(LIMIT, "nuisances", SYN_META)):
+            os.path.join(LIMIT, "nuisances", NAME)):
         import copy as _copy
         ns = _copy.copy(args)
         ns.data_dir, ns.nuisance_dir = LIMIT, None
         lim = apply_paths_args(config_from_args(ns), ns)
         lim.outcome = replace(lim.outcome, syn_effect=eff, syn_seed=table_syn_seed(lim))
         _refuses(lambda: LincsDataset(lim, indices=np.arange(64, dtype=np.int64)),
-                 f"a build with no {SYN_META} anywhere", FileNotFoundError,
-                 expect=SYN_META)
+                 f"a build with no {NAME} anywhere", FileNotFoundError,
+                 expect=NAME)
     else:
-        print(f"skip  the refusal check needs a build with no {SYN_META} "
+        print(f"skip  the refusal check needs a build with no {NAME} "
               f"(looked in {LIMIT})")
 
     # ---- 3. the step-C conditioning contract -----------------------------

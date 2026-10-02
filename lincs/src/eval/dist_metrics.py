@@ -50,10 +50,95 @@ def _stats(feats: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return mu, sigma
 
 
+def assert_blas_ok() -> float:
+    """Refuse to compute anything on a numpy whose BLAS gets matrix products wrong.
+
+    numpy's bundled OpenBLAS selects its Sapphire Rapids kernels on
+    zabih-compute-01 and on the login node, and their dgemm returns garbage
+    (relative error ~1.5; eigh and svd fail with it), while matrix-vector
+    products stay correct (§5, step C2 scoring). Which shapes fail depends on
+    the thread count (100x300 @ 300x100 fails at 4 threads but not at 1), but a
+    300x300 product failed 12/12 draws at 1, 4 and all threads, so that is the
+    shape tested here. Every
+    MMD and PC / full Frechet computed there before 2026-10-02 is therefore
+    invalid. `OPENBLAS_CORETYPE=Haswell` fixes it but must be set before numpy is
+    imported, so it lives in the job scripts; this check is the backstop, like
+    the CUDA preflight. Returns the measured relative error.
+    """
+    rng = np.random.default_rng(12345)
+    a, b = rng.normal(size=(300, 300)), rng.normal(size=(300, 300))
+    ref = np.einsum("ik,kj->ij", a, b, optimize=False)    # loops, no BLAS
+    err = float(np.abs(a @ b - ref).max() / np.abs(ref).max())
+    if not err < 1e-10:
+        import os
+        raise RuntimeError(
+            f"numpy's BLAS computes matrix products wrongly on this node (relative "
+            f"error {err:.2e} on a 300x300 @ 300x300 dgemm; "
+            f"OPENBLAS_CORETYPE={os.environ.get('OPENBLAS_CORETYPE')!r}). Set "
+            f"OPENBLAS_CORETYPE=Haswell before Python starts (the job scripts do).")
+    return err
+
+
+# How often `_eigh_psd` had to leave numpy's eigh, per fallback. evaluate.py
+# records it in the quality block, so a number computed on a fallback is traceable.
+EIGH_FALLBACKS = {"scipy_evr": 0, "svd": 0}
+
+
+def _eigh_psd(mat: np.ndarray, vectors: bool = True):
+    """Eigendecomposition of a symmetric PSD matrix (ascending), VERIFIED.
+
+    On zabih-compute-01, numpy's eigh (OpenBLAS dsyevd in this env) is wrong:
+    on the step-C2 train covariance it returned finite eigenvalues with NaN
+    eigenvectors, so every PC projection was NaN and the eval died; and on
+    every Phase 4 / step-C eval it returned FINITE garbage, which surfaced only
+    as "negative Frechet" warnings (a cross term of 476,123 against traces of
+    ~7,000; §5, step C2 scoring). The same matrices decompose correctly on
+    bindel. So a result is accepted only if it is finite, orthonormal, and
+    reconstructs `mat`; otherwise this falls back to scipy's MRRR driver
+    (scipy bundles its own LAPACK), then to an SVD (for a PSD matrix the
+    singular values and vectors ARE the eigenpairs), and raises if all fail.
+    """
+    mat = (np.asarray(mat, dtype=np.float64) + np.asarray(mat, dtype=np.float64).T) * 0.5
+    if not np.isfinite(mat).all():
+        raise ValueError("_eigh_psd: the matrix itself is not finite")
+    scale = max(float(np.abs(mat).max()), np.finfo(np.float64).tiny)
+
+    def ok(w, v):
+        if not (np.isfinite(w).all() and np.isfinite(v).all()):
+            return False
+        orth = float(np.abs(v.T @ v - np.eye(v.shape[1])).max())
+        rec = float(np.abs((v * w) @ v.T - mat).max()) / scale
+        return orth < 1e-7 and rec < 1e-7
+
+    w, v = np.linalg.eigh(mat)
+    if ok(w, v):
+        return (w, v) if vectors else w
+    try:
+        from scipy.linalg import eigh as _s_eigh
+        w, v = _s_eigh(mat, driver="evr")
+        if ok(w, v):
+            EIGH_FALLBACKS["scipy_evr"] += 1
+            print(f"[dist_metrics] WARNING: numpy eigh failed verification on a "
+                  f"{mat.shape[0]}-d matrix; used scipy eigh(driver='evr') "
+                  f"(fallback #{sum(EIGH_FALLBACKS.values())})", file=sys.stderr)
+            return (w, v) if vectors else w
+    except Exception as e:                        # noqa: BLE001
+        print(f"[dist_metrics] WARNING: scipy eigh(evr) failed too ({e})", file=sys.stderr)
+    u, sv, _ = np.linalg.svd(mat)
+    w, v = sv[::-1], u[:, ::-1]                    # ascending, like eigh
+    if ok(w, v):
+        EIGH_FALLBACKS["svd"] += 1
+        print(f"[dist_metrics] WARNING: numpy and scipy eigh failed verification on a "
+              f"{mat.shape[0]}-d matrix; used its SVD", file=sys.stderr)
+        return (w, v) if vectors else w
+    raise FloatingPointError(f"no verified eigendecomposition of a {mat.shape[0]}-d matrix "
+                             f"(numpy eigh, scipy evr and SVD all failed)")
+
+
 def _matrix_sqrt(mat: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     """Stable PSD-matrix square root via eigendecomposition (real, symmetric)."""
     mat = (mat + mat.T) * 0.5
-    w, v = np.linalg.eigh(mat)
+    w, v = _eigh_psd(mat)
     w = np.clip(w, a_min=0.0, a_max=None)
     return (v * np.sqrt(w + eps)) @ v.T
 
@@ -118,7 +203,7 @@ def frechet_distance(feat_a: np.ndarray, feat_b: np.ndarray, eps: float = 1e-6) 
     sa = _matrix_sqrt(sig_a, eps)
     inner = sa @ sig_b @ sa
     inner = (inner + inner.T) * 0.5
-    ev = np.clip(np.linalg.eigvalsh(inner), 0.0, None)
+    ev = np.clip(_eigh_psd(inner, vectors=False), 0.0, None)
     tr_cross = float(np.sqrt(ev).sum())
     mean_term = float(diff @ diff)
     fid = mean_term + float(np.trace(sig_a)) + float(np.trace(sig_b)) - 2.0 * tr_cross
@@ -173,7 +258,7 @@ def fit_pca(y_train: np.ndarray, var: float = 0.90, max_k: int | None = None) ->
               f"the tail eigenvalues are not identified.", file=sys.stderr)
     mean = y.mean(0)
     cov = np.cov(y, rowvar=False)
-    w, v = np.linalg.eigh(cov)            # ascending
+    w, v = _eigh_psd(cov)                 # ascending; never non-finite
     w = np.clip(w[::-1], 0.0, None)       # descending
     v = v[:, ::-1]
     total = float(w.sum())
