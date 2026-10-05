@@ -128,6 +128,33 @@ def positivity_cells(confounder: str, compound_idx, dose_level, is_control, c_va
     raise ValueError(f"no positivity cell declared for confounder {confounder!r}; have {list(POSITIVITY_KEYS)}")
 
 
+def target_groups(confounder: str, compound_idx, dose_level, is_control) -> np.ndarray:
+    """(N,) the POSITIVITY CELL WITH THE CONFOUNDER DROPPED; vehicles are CONTROL_ARM.
+
+    This is the resolution P1's targeting correction is computed at (§3.3.1 of
+    `understand.md`): every level of the confounder is represented inside a
+    group by construction, because the thinning keeps >= 1 train well in each
+    of the group's positivity cells. So the weights can rebalance the
+    confounder within a group, which is exactly what the AIPW correction needs,
+    and the arm-level ratio that broke the weighted risk in step C2 cannot
+    arise.
+
+        syn_c   -> "<compound_idx>|h<dose half>"      (coarser than an arm)
+        cell_id -> "<compound_idx>|<dose_level>"      (EXACTLY the arm key)
+
+    It is derived from `positivity_cells` rather than written out again, so the
+    two can never drift. Each cell lies inside exactly one group (a property
+    `src/eval/dr_target.py` asserts), and summing the counts-weight identity
+    sum_{i in cell} w_i = n_nu(cell) over a group's cells gives
+    sum_{i in g} w_i = n_nu(g).
+    """
+    cells = positivity_cells(confounder, compound_idx, dose_level, is_control,
+                             np.zeros(np.asarray(is_control).shape[0], dtype=np.int8))
+    # The confounder is the last "|<name>=<value>" component of every cell key.
+    return np.array([c if c == CONTROL_ARM else c.rsplit("|", 1)[0] for c in cells],
+                    dtype=object)
+
+
 def split_strata(cell_id, compound_idx, dose_level, is_control, det_plate) -> np.ndarray:
     """(N,) stratum of each row: "arm|<cell_id>|<arm>" for treated wells,
     "dmso|<det_plate>" for vehicles (DMSO stratified by plate, P3). cell_id is

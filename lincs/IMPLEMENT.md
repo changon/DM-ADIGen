@@ -1081,10 +1081,20 @@ will have (cell line × compound), here with a known truth.
   1. `naive` is biased: |DiD| > 3 seed sd.
   2. **`dr` beats `conditional`**: `dr`'s |DiD| is below `conditional`'s by
      > 2σ (`step_c_report`'s `dr_vs_conditional_sigma`; §3.8.1 criterion 2).
-  3. `dr` is close to the true weights:
+  3. `dr` **agrees with** the design-weight arm:
      |DiD(`dr`) − DiD(`dr_design`)| < 0.25 · |DiD(`conditional`) − DiD(`dr_design`)|.
      §3.8.1 criterion 2 always said "close to `dr_design`'s"; the step-C report
      judged only its first half, and now judges both.
+     - **Reworded 2026-10-05** (was "`dr` is close to the true weights"). The
+       design weights are the true *inclusion probabilities*, which is not the
+       same as the weights that balance the realised sample: they balance only
+       in expectation over thinning draws. Measured (§5, "P1 results"): the
+       `counts` weights reproduce the unthinned confounder mix of every group
+       **exactly**, while the design weights leave a systematic 0.5% dose-half
+       contrast that accounts for ~90% of the design arm's residual bias. So
+       `design` is not a target to converge on; this criterion tests that the
+       two weight sets **agree in sign and magnitude**, which is a check on the
+       weight model, not a ranking.
   4. Unscored compounds unchanged (§3.8.1 criterion 3).
 - **Diagnostics, not gates:**
   - λ̂ < 1 on `conditional`'s scored arms.
@@ -1865,15 +1875,82 @@ implementation and review".
           pass; **criterion 2 fails**: `dr` over-corrects (+0.58 against
           `conditional`'s −0.28), from arm-level Hájek bias of cell-level
           weights. Whether Phase 6 proceeds is the user's decision.
+        - **Resolved by P1** (§5, "P1 results", 2026-10-05): the same weights
+          spent on the estimand instead of the training risk remove
+          essentially all of the bias, so the failure was *where* α was
+          applied, not α itself.
+- [ ] **P1 — post-hoc DR targeting** (`understand.md` §3.3.1), the response to
+      C2's criterion-2 failure: stop weighting the training risk, keep the
+      unweighted generator as the outcome model, and spend α only on an AIPW
+      correction to the estimand at the group where positivity holds —
+      g = the positivity cell with the confounder dropped
+      (`splits.target_groups`).
+  - [ ] `src/eval/dr_target.py` (the estimator, numpy only, post hoc over
+        finished scoring runs), `src/tests/check_p1.py`,
+        `scripts/p1_target_cpu.sub`, and `step_c_report`'s `--dr_arm` /
+        `--design_arm` / `--baseline_arm` so a targeted arm can be judged by
+        the same four criteria without moving the existing verdicts
+  - [ ] Targeted arms: `conditional` **and `naive`** sources × {`counts`,
+        `design`} = `p1_{cond,naive}_{counts,design}`, plus the `ones`
+        α-sensitivity control. `naive` is the textbook double-robustness case
+        (outcome model blind to the confounder, α correct) and fills the 2×2
+        corner the retired "Option A" was to provide
+  - [ ] **Success**, judged by §3.8.4's criteria with `--dr_arm
+        p1_cond_counts --design_arm p1_cond_design` (and the `naive` family
+        against `--baseline_arm naive`), plus three controls that must all
+        hold: the step-C NULL (where `conditional` is already unbiased, so the
+        correction must not introduce a bias), the α-sensitivity control
+        (`ones` must be far WORSE than `counts` — the evidence that P1 is not
+        fitting the statistic with one free parameter per group), and the
+        unscored negative control
+  - [ ] Read on `--pool holdout` as well as `all`: δ is built from train rows
+        and the `all` oracle shares those wells, so the holdout (three disjoint
+        row sets) is the leakage diagnostic for the absence of cross-fitting
+  - [ ] Verdict written up in §5; if it passes, P1 goes into Phase 6 beside the
+        weighted arm and step A compares the two
+        - **PASSED** (2026-10-04), see §5 "P1 results". All four criteria in
+          both families, on `--pool all` and `holdout`. Unchecked pending the
+          user's review.
 
 ### Phase 6 — step A: cell line on `core5_24h` (§3.8.3)
 
 - [ ] Effect-modification gate: responders' centred \(\hat\tau\) differs
       across the 5 lines beyond the 3-well noise floor
+      - `src/data/line_gate.py` + `scripts/phase6_gate_cpu.sub`, written and
+        launched 2026-10-02 (job 862040 on `bindel`; `ma` was at 8.6% CPU /
+        8.7% memory free, failing the 20% rule). **PASSED** — see §5, "Phase 6
+        effect-modification gate". Cell line modifies the response, so step A
+        is not another null check.
+      - It needs **no `core5_24h` build**: it selects the population from
+        `inst_info`, reads the 641 MCF7 responders' wells in the 5 lines
+        straight from the GCTX (76,587 wells, 286 MiB), and applies the same
+        outcome rules the build would (3x plate QC on each line's median
+        spread, DMSO-median centring, one pooled z-scale).
+      - **Statistic.** Per arm and line pair, \(\cos(\hat\tau_{L_1},
+        \hat\tau_{L_2})\) against the full-sample reliability
+        \(r_\text{full} = 2 r_\text{half} / (1 + r_\text{half})\) from the
+        within-line split-half (E11): two independent estimates of the *same*
+        \(\tau\) correlate at \(r_\text{full}\), so
+        \(r_\text{cross} < r_\text{full}\) is effect modification. Plus
+        §3.8.3's literal reading, \(\|\hat\tau_{L_1} - \hat\tau_{L_2}\|\)
+        over \(\sqrt{\text{floor}_1^2 + \text{floor}_2^2}\), which is ~1
+        under one shared \(\tau\). Restricted to arms responding in at least
+        one of the two lines; the threshold
+        (`--max_ratio_alike`, default 0.8) is recorded in the artifact.
+      - **MCF7 pairs are reported apart.** `responders.json` is MCF7's, so
+        MCF7's \(\hat\tau\) is selected on being large. The headline is the
+        median over the 6 pairs among the four unselected lines.
 - [ ] `--population` switch; `core5_24h` paths; `PopulationSpec.name` in
       every artifact and result
+      - **Not written yet**, and it is what blocks every remaining Phase 6
+        item: `PopulationSpec.name` and `Paths(population=...)` exist, but no
+        CLI selects a population, so `build_dataset` can only build
+        `mcf7_24h`. The gate above was written to need none of it.
 - [ ] Ingest, plate QC (per-line median), splits, `expr_stats`, Phase 4
       oracle and `responders.json` for `core5_24h`
+      - Blocked on the `--population` switch, and gated on the result above:
+        §3.8.3 says to measure before building. Scale (§3.8.3): ~183k rows,
+        ~9 GB from the GCTX, a CPU job.
 - [ ] `build_tiered_split` step-A instance: positivity cells (compound,
       `dose_level`, `cell_id`), `keep_frac` 0.6; line groups declared in
       `spec.py`
@@ -1881,6 +1958,13 @@ implementation and review".
       (weights at (arm, `cell_id`), P12); weights track `dr_weights_design.npz`
 - [ ] `naive` / `conditional` / `dr` (+ `dr_design`) × γ ∈ {0, γ>0} × ≥2
       seeds trained and scored; group-contrast bias readout
+      - **Carry P1 too** (§5, "P1 results"): `src/eval/dr_target.py` needs no
+        change for step A — the group is derived from `POSITIVITY_KEYS`, and
+        for `cell_id` it is the arm itself. That is the resolution C2 showed
+        the weighted risk cannot reach, so step A is where the two approaches
+        should separate on real data. Watch the degeneracy: at arm level the
+        group holds ~2 train rows per line, so n_eff ≈ 2 against the ≈ 6 that
+        step C2 had, and δ_g is correspondingly noisier.
 
 ### Phase 7 — optional
 
@@ -2763,3 +2847,201 @@ Findings:
 **The pre-declared escalation does not apply.** It was for "criterion 2 fails
 because λ̂ ≈ 1"; here λ̂ = 0.52 and the failure is the weights'
 over-correction. Per §3.8.4, any further C2 run is a new decision.
+
+### Phase 6 effect-modification gate: PASSED (2026-10-02)
+
+§3.8.3 requires this before `core5_24h` is built: if the five lines respond
+alike, `cell_id` has no effect on centred `Y` and step A collapses into another
+null check, which would make the ~9 GB ingest pointless.
+
+New: `src/data/line_gate.py`, `scripts/phase6_gate_cpu.sub`. Job 862040 on
+`bindel` (`ma` was at 8.6% CPU / 8.7% memory free, failing the 20% rule),
+3 min 21 s. It needs **no `core5_24h` build** and so no `--population` switch:
+it selects the population from `inst_info`, reads the 641 MCF7 responders'
+wells in the five lines straight from the GCTX (76,140 wells on 494 plates
+after QC dropped 2), and applies the outcome rules the build would — 3× plate
+QC on each line's median spread, DMSO-median plate centring, one pooled
+z-scale. Result: `runs/core5_24h_line_gate.json`.
+
+**The statistic.** Two independent estimates of the *same* τ correlate at the
+full-sample reliability $r_\text{full} = 2r_\text{half}/(1+r_\text{half})$
+(Spearman–Brown on the within-line split-half, E11). So per arm and line pair,
+$\cos(\hat\tau_{L_1}, \hat\tau_{L_2})$ *below* $r_\text{full}$ is effect
+modification. Restricted to arms responding in at least one of the two lines;
+the 0.8 threshold was declared before the run and is recorded in the artifact.
+
+| | pairs | $r_\text{cross}$ | $r_\text{full}$ | ratio | $\|\Delta\hat\tau\|$ / floor |
+|---|---|---|---|---|---|
+| the 4 unselected lines (headline) | 11,033 | 0.232 | 0.516 | **0.449** | 1.62 |
+| pairs involving MCF7 | 7,913 | 0.248 | 0.516 | 0.481 | 1.57 |
+
+- **Verdict: effect modification.** Cross-line agreement is 45% of what two
+  estimates of one shared τ would reach, and every one of the 10 line pairs
+  lands in 0.36–0.55 — this is not one odd line. The difference between two
+  lines' τ̂ is 1.62× the noise floor, where one shared τ predicts ~1.
+- **MCF7's pairs are reported apart** because `responders.json` is MCF7's, so
+  its τ̂ is selected on being large. The headline is the median over the six
+  pairs among the four lines that were never selected on; MCF7's pairs agree
+  (0.481), so the selection does not drive the result.
+- The lines are otherwise comparable: 3,825–3,845 arms each, median ‖τ̂‖
+  16.8–18.3, responder arm fraction 35–43%.
+- **It is compound-specific, which is what step A needs.** Per-compound median
+  cross-line cosine over the unselected pairs runs from −0.10 (tetrindole,
+  KU-60019, JW55) to +0.73 (triptolide, CGP-60474, WZ-3105). Broadly cytotoxic
+  compounds act alike everywhere; others are line-specific. So `cell_id`
+  genuinely modifies the compound response, and step A has a real effect to
+  measure rather than another null.
+
+### P1 implementation and review (2026-10-04)
+
+Code for `understand.md` §3.3.1, written after C2's criterion-2 failure and
+before any P1 result. New: `src/eval/dr_target.py`, `src/tests/check_p1.py`,
+`scripts/p1_target_cpu.sub`, `splits.target_groups`; `step_c_report` extended.
+
+**The estimator.** Over the kept train rows of each group,
+δ_g = Σ w_i (Y_i − μ̂(X_i, A_i)) / Σ w_i, and τ̂_P1(a) = τ̂_gen(a) + δ_{g(a)}.
+The generator is untouched; the vehicle side is uncorrected because μ̂(0) comes
+from real DMSO wells, which are never thinned. It is post hoc and CPU only: it
+reads `*_gen.npz` from a finished scoring run and never samples a model.
+
+| Change | Why |
+|---|---|
+| **The group is derived, never written out again**: `splits.target_groups` returns the positivity cell with the confounder dropped. `syn_c` → (compound, dose half), 3,497 groups; `cell_id` → **the arm key itself**, verified equal to `arm_keys` on every treated row | It is the coarsest key at which positivity holds, which is what makes the AIPW correction well posed where C2's arm-level weighting was not. Deriving it from `positivity_cells` means the two cannot drift, and it makes P1 Phase-6-ready: under `cell_id` it runs at full arm resolution, the resolution C2 showed the weighted risk cannot reach |
+| **Hájek, not Horvitz–Thompson** | Measured on both γ: `counts` satisfies Σ_{i∈g} w_i = n_ν(g) to 3e-08 relative, so the two coincide there — but the `design` weights are off by 7–9% on average and up to 20 rows, because P_c/π is HT and its sum is only *unbiased* for n_ν(g). `understand.md` §3.3.1's "the normaliser is exact" was wrong and is corrected. The module asserts the identity only for `counts`, and records the HT/Hájek gap otherwise |
+| A standalone module rather than a flag in `evaluate.py` | `evaluate.main()`'s generated branch samples the model, so reusing it would mean threading a "load `_gen.npz` instead of generating" path through the code that produced the numbers already in this section. P1 must also run against runs scored weeks ago |
+| The targeted document is built by **copy-and-overwrite**, then its `pools.<p>` and `.accuracy` key sets are asserted equal to the source's, recursively | A second module that rebuilds the schema would drift from `_pool_block`. This way a new real-side key is inherited silently and a renamed one raises |
+| `learned_syn_effect`, `quality`, `reference` and `per_compound` are inherited and asserted byte-identical | λ̂ reads `row_mean`, which P1 does not touch, so it is identical by construction rather than merely invariant. `reference` holds a 200-draw RNG floor that must not be redrawn |
+| **The baseline-reproduction guard.** Before applying δ, the module recomputes the source's own `cos_all`, `cos_responder`, `pooled_gene.mse` and `bias_along_v` on the *uncorrected* τ̂ and refuses unless they match within 1e-6 | It proves y_all, the oracle, the arm intersection and the whole metric path reproduce the original scoring before a single correction is applied. Measured 8.5e-10 |
+| The frame is rebuilt from the **base** nuisance dir, the weights and train_idx from the **tier** dir | Found by the guard firing on the first run: a tiered arm trains on the thinned split but is *scored* on the unablated base split (§3.8.1), so its document carries the base fingerprint while its weights live on the tier's train_idx. The module also asserts the tier's `expr_meta` shares the base z-scale, or Y_i and μ̂ would be in different spaces |
+| `step_c_report` gains `--dr_arm` / `--design_arm` / `--baseline_arm`; criteria 2–4 and the λ̂ diagnostic range over the ACTIVE set, the table shows every arm found | With the defaults the active set is the original four in the original order, so the recorded step-C and C2 verdicts do not move — asserted by a regression section in `check_p1` that re-runs the default invocation and diffs every criterion and every judged arm. `--baseline_arm` exists because the `p1_naive_*` family's comparator is `naive`, not `conditional` |
+| `targeted_label(doc, src_label)` **derives** the arm from the source arch label plus the recorded weight mode, and only cross-checks `targeting.arm` | Keeps `arm_label`'s principle — the label comes from what was trained, never from a string the producer wrote — and rejects a hand-edited block |
+| Criterion 4 gained a `targeting` branch | A targeted run's arch says `dr_mode: conditional`, so the existing weight-hash check never fired and a targeted arm could have passed with weights that no longer exist. It now recomputes the sha1 from the file the targeting block names, and also gates on that run's baseline reproduction and counts identity. `ones` is exempt (no file) and can never be a DR arm |
+| **`ones` is an α-sensitivity control, not a negative control** | It was planned as a null expected to reproduce `conditional`. It is not: with flat weights the Hájek mean runs over the *thinned* mix, so δ_g ≈ β·p_kept(g)·v and the correction ADDS the thinning bias. Same one free parameter per group, wrong α, far worse — which is the evidence that P1 is not fitting the statistic it is judged on. `understand.md` is corrected |
+
+**Review** (automated `code-review`, high): five findings, all fixed.
+
+| Finding | Fix |
+|---|---|
+| **`gof` derived the dose half from the POOL's arm table.** `dose_half` ranks a compound's *distinct* dose levels, so a pool that dropped arms (`--min_dose_n`, or the holdout's one-well arms) shifts those compounds' halves. Measured: 12 arms in `all` and 150 in `holdout` got the other half's δ while `bias_along_v` still classified them by the table's halves — a direct bias on the statistic P1 is judged by | The arm → group map is now resolved on the whole table, exactly as `evaluate.py` builds `half_of_arm` and for the same reason. `check_p1` gained the check that would have caught it: the stored map must equal the whole-table derivation. Run against the pre-fix artifacts it reports exactly 12 and 150; after the fix, 0 |
+| The §3.8.4 diagnostic indexed `per_arm["conditional"]`, which `--baseline_arm naive` would not populate (KeyError) | It follows `--baseline_arm` |
+| `check_p1`'s α-sensitivity message formatted a `None` baseline, aborting the run instead of reporting | Guarded |
+| `check_p1` assumed a full `_tau.npz`; a `--npz delta` artifact would KeyError | Missing arrays are skipped |
+| The default `--out` suffix used only `--dr_arm`, so verdicts differing in `--baseline_arm` would overwrite each other | All three judged arms name the file |
+
+**Checks before launch**: the unit section (closed form, Hájek scale invariance,
+HT ≡ Hájek when Σw = n, gene-blocking invariance, within-group contrast
+invariance) locally; then on `bindel` a two-run smoke in which δ re-derived
+independently from `expr.npy` + `_gen.npz` matched to 5.5e-08, the arm → group
+map matched the table, and every array P1 does not touch was identical to the
+source's. Measured 2.7 GB peak and ~1 min per targeted output.
+
+### P1 results: targeting passes every criterion (2026-10-04)
+
+Jobs 959846 (48 targeted documents, 1 h) and 962295 (checks + verdicts) on
+`bindel`. 959846 wrote all 48 and passed every artifact check, then died in
+`check_p1`: the step-C source documents predate `learned_syn_effect` (it
+arrived with the C2 code) and the inherited-block comparison assumed every
+source had it. It now compares only the keys the source carries, and flags a
+dropped or invented one. Re-running the checks and verdicts on the existing
+outputs takes ~3 min (repeated as job 964812 on 2026-10-05, identical results). `check_p1`: ALL CHECKS PASSED, including that `step_c_report` with
+its defaults still reproduces `step_c_verdict.json` and
+`step_c_verdict_compound_r1.json` — every criterion and every judged arm — so
+the recorded C2 verdict has not moved.
+
+**DiD of the scored high − low contrast, step C2, `--pool all`**, mean ± sd over
+the 3 training seeds. P1 arms are the SAME generators, re-estimated:
+
+| arm | DiD | vs its baseline | criteria |
+|---|---|---|---|
+| `naive` | −1.930 ± 0.035 | — | |
+| `conditional` | −0.279 ± 0.007 | — | |
+| `dr` (C2's weighted risk) | +0.575 ± 0.046 | **worse** than `conditional` | **fails 2** |
+| `dr_design` | +0.562 ± 0.032 | | |
+| **`p1_cond_counts`** | **+0.047 ± 0.013** | 28.5σ better than `conditional` | **all 4 PASS** |
+| `p1_cond_design` | +0.133 ± 0.010 | | |
+| **`p1_naive_counts`** | **−0.001 ± 0.012** | 90.8σ better than `naive` | **all 4 PASS** |
+| `p1_naive_design` | −0.147 ± 0.014 | | |
+| `p1_cond_ones` (control) | −3.893 ± 0.098 | | |
+| `p1_naive_ones` (control) | −9.000 ± 0.012 | | |
+
+Findings:
+
+1. **P1 removes the bias the weighted risk could not.** On the same generators
+   C2 scored, targeting takes `conditional` from −0.279 to **+0.047** and
+   `naive` from −1.930 to **−0.001**, where C2's weighted arm went the wrong
+   way to +0.58. §3.8.4's criterion 2 passes in both families, on both halves
+   (beats the baseline, and close to the true-weight arm).
+2. **`p1_naive_counts` is the textbook double-robustness result.** Its outcome
+   model is blind to `syn_c` (λ̂ = 0.000, measured), so the entire correction
+   is carried by α — and the bias lands at −0.001 ± 0.012. That is the 2×2
+   corner the retired "Option A" was to provide, obtained with no retraining.
+3. **The weights are load-bearing: the α-sensitivity control is decisive.**
+   With w ≡ 1 — the same one free parameter per group, the wrong α — the
+   contrast goes to −3.89 and −9.00, far WORSE than the untargeted arms. So
+   P1's near-zero result is not an artefact of having 3,497 free parameters for
+   10,446 arms; it is the weights doing the work.
+4. **It is not leakage from the missing cross-fitting.** On `--pool holdout`,
+   where the generator's rows, the oracle's wells and δ's train rows are three
+   disjoint sets, the result survives: `conditional` −0.234 → **+0.144**,
+   `naive` −2.026 → **−0.009** (criteria pass on that pool too).
+5. **Step C is the null, and it behaves.** Where `conditional` is already
+   unbiased, targeting leaves it there (+0.005 → −0.062), and it still repairs
+   `naive` (−6.855 → **+0.022**). Unscored compounds move by ≤ 0.004 everywhere.
+6. **P1 trades variance for bias, and the trade is visible.** Pooled gene MSE on
+   C2 *improves* (−3.8% `p1_cond_counts`, −12.5% `p1_naive_counts`), because
+   there δ carries real signal. On step C, where there is nothing to correct,
+   it *costs* +13.4% / +12.2%: δ_g is then an estimate of ~0 built from a
+   handful of rows, i.e. pure added variance. Both are expected and only the
+   first is asserted.
+7. **`counts` beats `design`, consistently** (+0.047 vs +0.133; −0.001 vs
+   −0.147), and the gap is measured, not just asserted. The design weights are
+   the true *inclusion probabilities*: they balance the confounder in
+   expectation over thinning draws, not in the draw we have. The counts
+   weights are post-stratification on the positivity cell, so they balance the
+   realised sample exactly. Over scored groups:
+
+   | weights | realised confounder mix − unthinned target | median per-group error | high − low contrast, γ = 1 |
+   |---|---|---|---|
+   | `counts` | **exactly 0** | 0.00000 | 0.00000 |
+   | `design` | systematic | 0.071 | +0.0052 |
+
+   That leftover imbalance does not cancel: its DiD is −0.0052, and × β = 25.48
+   predicts a residual bias of **−0.133** against the observed
+   `p1_naive_design` −0.147 — ~90% of the gap. The mechanism is ratio bias: a
+   design weight is constant within a cell, so the cell's total weight is
+   proportional to a *random* kept count, and the cells the thinning shrinks
+   (low π, large w) fluctuate most — and which cell is shrunk is set by the
+   dose half, the very axis the readout measures. This is the classical result
+   that IPW with estimated propensities beats IPW with the known true ones
+   (Hirano, Imbens & Ridder 2003; post-stratification in survey sampling).
+   **§3.8.4 criterion 3 was reworded on 2026-10-05 because of this**: `design`
+   is not a gold standard to converge on, so that criterion tests agreement in
+   sign and magnitude, not convergence.
+8. **`p1_naive_*` is the most favourable misspecification, not an arbitrary
+   one.** `naive` omits exactly the covariate the weights reweight, so its
+   residual *is* the quantity the correction averages. `p1_naive_counts` ≈ 0
+   shows AIPW's algebra works here; it does not show robustness to an
+   arbitrary wrong outcome model, and no such arm exists on disk.
+
+**The honest uncertainty is larger than the seed sd, and must be quoted with
+it.** The three seeds share one `Y`, one weight set and one thinning draw, so
+their spread measures generator noise alone, and the 28.5σ / 90.8σ figures are
+correspondingly inflated. The compound-clustered SE of a single scored contrast
+(jackknifing the 641 independently thinned compounds) is **0.088** for
+`p1_cond_counts` and **0.160** for `p1_naive_counts`, against a seed sd of
+~0.013. Read against that, P1's residual bias is **indistinguishable from
+zero**, `conditional`'s −0.279 is ~2σ from zero, and `dr`'s +0.58 is clearly
+non-zero. The ranking stands; the σ counts do not.
+
+**What this says about ADIGen.** C2 showed the α-weighted *training risk* fails
+when the positivity cell is coarser than the resolution the generator works at.
+P1 shows the same α, spent on the *estimand* at the cell's group, removes the
+bias — on a correctly specified outcome model and on one blind to the
+confounder alike. The failure in C2 was the place α was spent, not α itself.
+
+**For Phase 6.** `splits.target_groups` derives the group from the positivity
+key, and under `cell_id` that group *is* the arm, so P1 runs at full arm
+resolution in step A with no new code. It should be scored there beside the
+weighted arm. Note the regime differs: with ~2 train rows per (arm, line) cell
+the effective sample size per group falls from ~6 to ~2, which is where the
+added-variance cost in finding 6 would bite hardest.

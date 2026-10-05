@@ -61,7 +61,17 @@ from src.data.synthetic import SYN_META, load_syn_meta, table_syn_seed  # noqa: 
 from src.spec import (  # noqa: E402
     add_adjustment_set_cli, add_paths_cli, apply_paths_args, config_from_args)
 
-ARMS = ("naive", "conditional", "dr", "dr_design")
+# The ADMISSIBLE arms. The four trained ones, plus P1's post-hoc targeted
+# variants (`src/eval/dr_target.py`), which are a re-estimation of tau from the
+# SAME generator -- so they are arms of the verdict, not new runs. Which of them
+# a given verdict judges is the ACTIVE set (`--dr_arm` / `--design_arm` /
+# `--baseline_arm`); with the defaults the active set is the original four, in
+# the original order, so existing verdicts are unchanged.
+ARMS = ("naive", "conditional", "dr", "dr_design",
+        "p1_cond_counts", "p1_cond_design", "p1_cond_ones",
+        "p1_naive_counts", "p1_naive_design", "p1_naive_ones")
+P1_SRC_SHORT = {"naive": "naive", "conditional": "cond"}
+P1_MODES = ("counts", "design", "ones")
 
 # The scoring settings every step-C arm must share: §3.14 E1 (checkpoint-0499,
 # EMA), E2 (w = 1), E3 (16 samples per real row) and E10 (100 steps). A JSON
@@ -91,6 +101,29 @@ def arm_label(arch: dict) -> str | None:
         if "design" in f:
             return "dr_design"
     return None
+
+
+def targeted_label(doc: dict, src_label: str | None) -> str | None:
+    """The arm a P1-targeted document is, DERIVED from its source arch label and
+    the weight mode it recorded. `targeting.arm` is only cross-checked.
+
+    Same principle as `arm_label`: the label comes from what was actually
+    trained and which weights were actually used, never from a string the
+    producer wrote down. A self-inconsistent document is skipped, not trusted.
+    """
+    t = doc.get("targeting")
+    if not t:
+        return src_label
+    if str(t.get("method")) != "P1" or int(t.get("version") or 0) != 1:
+        return None
+    short = P1_SRC_SHORT.get(str(src_label))
+    mode = str((t.get("weights") or {}).get("mode"))
+    if short is None or mode not in P1_MODES:
+        return None
+    lbl = f"p1_{short}_{mode}"
+    if str(t.get("arm")) != lbl or str(t.get("source_arm")) != str(src_label):
+        return None
+    return lbl
 
 
 def _mean_sd(v: list[float]) -> tuple[float | None, float | None, int]:
@@ -123,9 +156,17 @@ def main():
                    help="The injection the arms were scored against (step C: syn_meta.json; "
                         "step C2: syn_meta_compound_r1.json). JSONs with another v_sha1 are "
                         "skipped.")
+    p.add_argument("--dr_arm", default="dr", choices=ARMS,
+                   help="The arm criterion 2 judges as 'DR'.")
+    p.add_argument("--design_arm", default="dr_design", choices=ARMS,
+                   help="The true-weight reference criterion 2 compares it with.")
+    p.add_argument("--baseline_arm", default="conditional", choices=ARMS,
+                   help="The arm 'DR' must beat. For the p1_naive_* family this is "
+                        "`naive`, whose outcome model P1 is correcting.")
     p.add_argument("--out", default=None,
                    help="Relative to <runs>/eval_artifacts/, or a path. Default: "
-                        "step_c_verdict.json (step C), step_c_verdict_<variant>.json otherwise.")
+                        "step_c_verdict.json (step C), step_c_verdict_<variant>.json "
+                        "otherwise, plus _<dr_arm> when --dr_arm is not the default.")
     for k, v in SCORING.items():
         p.add_argument(f"--{k}", type=type(v), default=v,
                        help=f"Required scoring setting (default {v}, §3.14); JSONs scored "
@@ -146,7 +187,14 @@ def main():
     variant = ("" if base == SYN_META else
                os.path.splitext(base)[0].replace("syn_meta_", "", 1))
     if args.out is None:
-        args.out = f"step_c_verdict{'_' + variant if variant else ''}.json"
+        # Criterion 2 depends on all three, so all three have to name the file.
+        suffix = "" if (args.dr_arm, args.design_arm, args.baseline_arm) == \
+            ("dr", "dr_design", "conditional") else (
+            "_" + args.dr_arm
+            + ("" if args.design_arm == args.dr_arm.replace("counts", "design")
+               else "_vs" + args.design_arm)
+            + ("" if args.baseline_arm == "conditional" else "_base" + args.baseline_arm))
+        args.out = f"step_c_verdict{'_' + variant if variant else ''}{suffix}.json"
     print(f"[report] injection {args.syn_meta}: mode {want_meta.get('mode', 'global')}, "
           f"beta {float(want_meta['beta']):.4f}, sha1 {want_sha1[:12]}")
     tag = f"syn{args.syn_effect:g}"
@@ -185,16 +233,31 @@ def main():
             skipped.append(f"{os.path.basename(f)}: no arch.json at {ap}"); continue
         with open(ap) as fh:
             arch = json.load(fh)
-        lbl = arm_label(arch)
+        lbl = targeted_label(d, arm_label(arch))
         tier = arch.get("tier") or {}
         if lbl is None or not tier.get("active"):
             skipped.append(f"{os.path.basename(f)}: not a step-C arm "
                            f"(C={arch.get('adjustment_set')}, dr_mode={arch.get('dr_mode')}, "
-                           f"tier.active={tier.get('active')})")
+                           f"tier.active={tier.get('active')}"
+                           + (f", targeting={d.get('targeting', {}).get('arm')!r}"
+                              if d.get("targeting") else "") + ")")
             continue
         key = (lbl, float(tier["gamma"]), int(arch["seed"]))
         wcheck = None
-        if arch.get("dr_mode") == "weighted":
+        tgt = d.get("targeting") or {}
+        if tgt and not (tgt.get("weights") or {}).get("is_control"):
+            # A targeted run's arch.json says dr_mode=conditional, so the branch
+            # below never fires for it and criterion 4 would silently ignore an
+            # estimate that depends on a weight file. Check the file it names.
+            wp = (tgt.get("weights") or {}).get("path")
+            want = (tgt.get("weights") or {}).get("sha1")
+            try:
+                w = np.load(wp)["w"].astype(np.float32)
+                now = hashlib.sha1(np.ascontiguousarray(w).tobytes()).hexdigest()
+                wcheck = {"file": wp, "ok": now == want, "via": "targeting"}
+            except (OSError, TypeError, ValueError) as e:
+                wcheck = {"file": wp, "ok": False, "error": str(e), "via": "targeting"}
+        elif arch.get("dr_mode") == "weighted":
             # The trainer hashes the raw float32 weights it loaded (before the
             # mean-1 normalisation); recompute from the file the run names.
             wp = os.path.join(arch.get("nuisance_dir") or "", str(arch.get("dr_weights_file")))
@@ -217,6 +280,17 @@ def main():
                       "cos_responder": (acc.get("cos_responder") or {}).get("median"),
                       "pooled_mse": (acc.get("pooled_gene") or {}).get("mse"),
                       "weights": wcheck,
+                      "targeting": ({"sum_w_ok": ((tgt.get("delta") or {})
+                                                  .get("sum_w_equals_n_nu") or {}),
+                                     "baseline": max(
+                                         [(v.get("baseline_check") or {}).get("max_abs_diff", 0.0)
+                                          for v in (tgt.get("pools") or {}).values()] or [0.0]),
+                                     "baseline_tol": max(
+                                         [(v.get("baseline_check") or {}).get("tol", 0.0)
+                                          for v in (tgt.get("pools") or {}).values()] or [0.0]),
+                                     "is_control": bool((tgt.get("weights") or {})
+                                                        .get("is_control"))}
+                                    if tgt else None),
                       # §3.8.4's lambda-hat (absent from JSONs scored before it existed)
                       "lambda_scored": (ls.get("scored") or {}).get("mean"),
                       "lambda_unscored": (ls.get("unscored") or {}).get("mean")}
@@ -242,6 +316,10 @@ def main():
         print(f"[warn] pool {args.pool!r} has 1-well arms; only the MEAN contrast is used",
               file=sys.stderr)
 
+    # The arms this verdict JUDGES. The table below shows every arm found, but
+    # the criteria range over the active set only, so adding P1's targeted
+    # documents to a runs dir cannot move an existing verdict.
+    active = tuple(dict.fromkeys(("naive", args.baseline_arm, args.dr_arm, args.design_arm)))
     seeds = sorted({k[2] for k in cells})
     gammas = sorted({k[1] for k in cells})
     print(f"[report] pool={args.pool}  {len(cells)} arm-runs  "
@@ -252,8 +330,12 @@ def main():
             print("    ", s)
 
     # ---- per-arm Delta over seeds ----
+    # Every arm with runs, plus the judged ones (so a criterion never reads a
+    # missing key). Arms with no runs and no role are left out entirely, which
+    # keeps a verdict's `per_arm` the same as before P1's labels existed.
+    have = {k[0] for k in cells}
     per_arm: dict[str, dict] = {}
-    for arm in ARMS:
+    for arm in [a for a in ARMS if a in have or a in active]:
         d_scored, d_unscored, raw = [], [], {}
         for s in seeds:
             c1, c0 = cells.get((arm, 1.0, s)), cells.get((arm, 0.0, s))
@@ -283,7 +365,7 @@ def main():
     print("\n| arm | n seeds | Delta scored (mean +/- sd) | Delta unscored | |Delta|/sd "
           "| lambda-hat scored (g1) | lambda-hat unscored |")
     print("|---|---|---|---|---|---|---|")
-    for arm in ARMS:
+    for arm in per_arm:
         a = per_arm[arm]
         ratio = a["abs_over_seed_sd"]
         print(f"| `{arm}` | {a['n_seeds']} "
@@ -307,11 +389,13 @@ def main():
                 "the gamma=0 contrast itself should sit near 0",
     }
     crit["2_dr_beats_conditional_and_approaches_design"] = {
-        "dr_vs_conditional_sigma": _sep(per_arm["dr"]["delta_scored"],
-                                        per_arm["conditional"]["delta_scored"]),
-        "dr_vs_design_sigma": _sep(per_arm["dr"]["delta_scored"],
-                                   per_arm["dr_design"]["delta_scored"]),
-        "delta": {a: per_arm[a]["delta_scored_mean"] for a in ARMS},
+        "arms": {"dr": args.dr_arm, "design": args.design_arm,
+                 "baseline": args.baseline_arm},
+        "dr_vs_conditional_sigma": _sep(per_arm[args.dr_arm]["delta_scored"],
+                                        per_arm[args.baseline_arm]["delta_scored"]),
+        "dr_vs_design_sigma": _sep(per_arm[args.dr_arm]["delta_scored"],
+                                   per_arm[args.design_arm]["delta_scored"]),
+        "delta": {a: per_arm[a]["delta_scored_mean"] for a in active},
         "pass": None,
         "note": "dr_vs_conditional_sigma > 2 means dr's |bias| is below conditional's by "
                 "more than seed noise. A null result is an admissible outcome (§3.8.1 "
@@ -326,20 +410,22 @@ def main():
     # quarter of the way to the unweighted arm.
     c2 = crit["2_dr_beats_conditional_and_approaches_design"]
     sep = c2["dr_vs_conditional_sigma"]
-    dd = {a: per_arm[a]["delta_scored_mean"] for a in ("dr", "dr_design", "conditional")}
+    dd = {k: per_arm[a]["delta_scored_mean"] for k, a in
+          (("dr", args.dr_arm), ("design", args.design_arm), ("base", args.baseline_arm))}
     close = (None if any(v is None for v in dd.values()) else
-             bool(abs(dd["dr"] - dd["dr_design"])
-                  < 0.25 * abs(dd["conditional"] - dd["dr_design"])))
+             bool(abs(dd["dr"] - dd["design"])
+                  < 0.25 * abs(dd["base"] - dd["design"])))
     c2["beats_conditional"] = None if sep is None else bool(sep > 2.0)
     c2["close_to_design"] = close
-    c2["close_rule"] = "|dr - dr_design| < 0.25 x |conditional - dr_design| (§3.8.4)"
+    c2["close_rule"] = (f"|{args.dr_arm} - {args.design_arm}| < 0.25 x "
+                        f"|{args.baseline_arm} - {args.design_arm}| (§3.8.4)")
     c2["pass"] = (None if sep is None or close is None
                   else bool(c2["beats_conditional"] and close))
     worst = max((abs(per_arm[a]["delta_unscored_mean"])
-                 for a in ARMS if per_arm[a]["delta_unscored_mean"] is not None), default=None)
+                 for a in active if per_arm[a]["delta_unscored_mean"] is not None), default=None)
     crit["3_unscored_unchanged"] = {
         "max_abs_delta_unscored": worst,
-        "by_arm": {a: per_arm[a]["delta_unscored_mean"] for a in ARMS},
+        "by_arm": {a: per_arm[a]["delta_unscored_mean"] for a in active},
         "pass": (worst is not None and nav["delta_scored_mean"] is not None
                  and worst < 0.25 * abs(nav["delta_scored_mean"])),
         "note": "unscored compounds were never thinned, so their Delta is the internal "
@@ -349,29 +435,47 @@ def main():
     # instances, which steps C and C2 share). What IS checked here: every weighted
     # run trained on exactly the weights in its tier instance's file today.
     wbad = sorted(f"{a}|g{g:g}|s{s}" for (a, g, s), c in cells.items()
-                  if c.get("weights") is not None and not c["weights"]["ok"])
-    n_w = sum(1 for c in cells.values() if c.get("weights") is not None)
+                  if a in active and c.get("weights") is not None and not c["weights"]["ok"])
+    n_w = sum(1 for (a, _, _), c in cells.items()
+              if a in active and c.get("weights") is not None)
+    # A targeted arm must additionally have reproduced the source metrics before
+    # correcting, and (with counts weights) satisfied the sum_w == n_nu identity.
+    tbad = sorted(
+        f"{a}|g{g:g}|s{s}" for (a, g, s), c in cells.items()
+        if a in active and c.get("targeting") and not (
+            c["targeting"]["baseline"] <= c["targeting"]["baseline_tol"]
+            and (c["targeting"]["is_control"]
+                 or not c["targeting"]["sum_w_ok"].get("checked")
+                 or c["targeting"]["sum_w_ok"].get("max_rel_err", 1.0)
+                 <= c["targeting"]["sum_w_ok"].get("tol", 1e-6))))
+    n_t = sum(1 for (a, _, _), c in cells.items()
+              if a in active and c.get("targeting"))
     crit["4_weights_track_design"] = {
-        "pass": bool(n_w and not wbad), "measured_before_training": True,
+        "pass": bool(n_w and not wbad and not tbad), "measured_before_training": True,
         "corr_counts_design": {"gamma=0": 0.73, "gamma=1": 0.88},
         "weighted_runs_checked": n_w, "weights_mismatch": wbad,
+        "targeted_runs_checked": n_t, "targeting_bad": tbad,
         "note": "correlations cited from the data layer (check_phase1 --adjustment_set "
                 "syn_c on the shared tier instances); each weighted run's arch.json "
-                "dr_weights_sha1 is recomputed from the file it names, and must match",
+                "dr_weights_sha1 is recomputed from the file it names, and must match. "
+                "A P1-targeted arm is checked through its targeting block instead: the "
+                "weight file it used, its baseline reproduction, and the sum_w == n_nu "
+                "identity.",
     }
 
     # §3.8.4 diagnostics, not gates: conditional's DiD should be the share of the
     # shift it did NOT learn, times naive's.
-    lam_c = per_arm["conditional"]["lambda_scored_g1"]
-    diag = {"lambda_scored_g1": {a: per_arm[a]["lambda_scored_g1"] for a in ARMS},
-            "conditional_delta": per_arm["conditional"]["delta_scored_mean"],
+    lam_c = per_arm[args.baseline_arm]["lambda_scored_g1"]
+    diag = {"lambda_scored_g1": {a: per_arm[a]["lambda_scored_g1"] for a in active},
+            "baseline_arm": args.baseline_arm,
+            "conditional_delta": per_arm[args.baseline_arm]["delta_scored_mean"],
             "conditional_delta_predicted": (
                 None if lam_c is None or nav["delta_scored_mean"] is None
                 else (1.0 - lam_c) * nav["delta_scored_mean"]),
-            "note": "predicted = (1 - lambda-hat of conditional's scored arms at gamma=1) x "
-                    "naive's Delta; §3.8.4 expects agreement within a factor of 2"}
+            "note": f"predicted = (1 - lambda-hat of {args.baseline_arm}'s scored arms at "
+                    f"gamma=1) x naive's Delta; §3.8.4 expects agreement within a factor of 2"}
     if diag["conditional_delta_predicted"] is not None:
-        print(f"\n[diag] conditional Delta {diag['conditional_delta']:+.3f} vs "
+        print(f"\n[diag] {args.baseline_arm} Delta {diag['conditional_delta']:+.3f} vs "
               f"(1 - lambda-hat {lam_c:.3f}) x naive's = {diag['conditional_delta_predicted']:+.3f}")
 
     print("\n### §3.8.1 criteria\n")
