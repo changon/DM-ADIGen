@@ -63,7 +63,7 @@ from src.data.synthetic import directions_for, inject_meta, load_syn_meta  # noq
 from src.eval import dist_metrics as dm  # noqa: E402
 from src.eval.evaluate import (  # noqa: E402
     META_COLUMNS, TRUTH_GUARD, _accuracy, _cos, _cos_rows, _jsonable, _load_truth,
-    _pearson_rows, _q, _split_key, bias_along_v, corrected_ceiling)
+    _pearson_rows, _q, _split_key, bias_along_contrast, bias_along_v, corrected_ceiling)
 from src.spec import (  # noqa: E402
     add_adjustment_set_cli, add_paths_cli, add_syn_cli, apply_paths_args, config_from_args)
 
@@ -206,7 +206,16 @@ def accuracy_block(tau_est: np.ndarray, truth: dict, keys: np.ndarray, src_acc: 
         acc["bias_along_v"] = bias_along_v(
             te, tt, shared, directions_for(syn, comp), half_of_arm,
             scored_ci or set(), n_wells=n_wells[i_est])
-    return acc, cos, pear, shared, comp, i_est
+    # Step A (STEP_A.md §3): the readout along each arm's line-group contrast,
+    # recomputed on the corrected tau exactly as `_pool_block` computes it.
+    cproj = None
+    if truth.get("contrast_dir") is not None and half_of_arm is not None:
+        acc["bias_along_contrast"], cp = bias_along_contrast(
+            te, tt, shared, truth["contrast_dir"][i_tr], half_of_arm,
+            scored_ci or set(), n_wells=n_wells[i_est])
+        cproj = np.full(keys.size, np.nan)
+        cproj[i_est] = cp
+    return acc, cos, pear, shared, comp, i_est, cproj
 
 
 def _assert_same_keys(new: dict, old: dict, where: str) -> None:
@@ -467,7 +476,8 @@ def main():
             checks = {}
             for path_ in (("cos_all", "median"), ("cos_responder", "median"),
                           ("pooled_gene", "mse"),
-                          ("bias_along_v", "scored_high_minus_low_mean")):
+                          ("bias_along_v", "scored_high_minus_low_mean"),
+                          ("bias_along_contrast", "scored_high_minus_low_mean")):
                 aa = (base_acc.get(path_[0]) or {}).get(path_[1])
                 bb = (blk["accuracy"].get(path_[0]) or {}).get(path_[1])
                 if aa is not None and bb is not None:
@@ -540,7 +550,7 @@ def main():
                 keys, gof, truth = pp["keys"], pp["gof"], pp["truth"]
                 n_wells, checks, worst = pp["n_wells"], pp["checks"], pp["worst"]
                 tau_new = pp["tau_src"] + delta[gof]
-                acc, cos, pear, shared, comp_sh, i_est = accuracy_block(
+                acc, cos, pear, shared, comp_sh, i_est, cproj = accuracy_block(
                     tau_new, truth, keys, blk["accuracy"], syn, half_of_arm,
                     scored_ci, n_wells)
                 nb = copy.deepcopy(blk)
@@ -570,6 +580,8 @@ def main():
                 tz[f"{pname}/arm_cos"] = arm_cos
                 tz[f"{pname}/arm_pearson"] = arm_pear
                 tz[f"{pname}/group_of_arm"] = gof.astype(np.int32)
+                if cproj is not None:
+                    tz[f"{pname}/contrast_proj"] = cproj
 
                 rec = {"baseline_check": {"tol": args.baseline_tol, "max_abs_diff": worst,
                                           "fields": checks}}
@@ -583,6 +595,16 @@ def main():
                     rec["scored_high_minus_low_mean"] = bv["scored_high_minus_low_mean"]
                     rec["scored_contrast_se_compound_cluster"] = clustered_contrast_se(
                         proj, halves, comp_sh, sc, seed=args.seed)
+                bc = acc.get("bias_along_contrast")
+                if bc is not None and cproj is not None:
+                    okc = np.isfinite(cproj[i_est])
+                    halves = np.array([int(half_of_arm.get(k, -1)) for k in shared])
+                    sc = np.isin(comp_sh, list(scored_ci))
+                    rec["line_contrast_scored_high_minus_low_mean"] = bc.get(
+                        "scored_high_minus_low_mean")
+                    rec["line_contrast_se_compound_cluster"] = clustered_contrast_se(
+                        np.where(okc, cproj[i_est], 0.0), np.where(okc, halves, -1),
+                        comp_sh, sc, seed=args.seed)
                 pool_recs[pname] = rec
 
             tgt_delta_rec = {
@@ -651,7 +673,9 @@ def main():
                              "targeting/n_rows": nrows, "targeting/n_eff": n_eff})
                 np.savez_compressed(out_json[:-5] + "_tau.npz", **arrs)
             written.append(out_json)
-            bvm = (pool_recs.get("all") or {}).get("scored_high_minus_low_mean")
+            bvm = ((pool_recs.get("all") or {}).get("scored_high_minus_low_mean")
+                   if syn is not None else
+                   (pool_recs.get("all") or {}).get("line_contrast_scored_high_minus_low_mean"))
             print(f"[p1] {lbl:18s} {os.path.basename(run_dir):26s} "
                   f"||delta|| med {tgt_delta_rec['norm']['median']:7.3f}  "
                   f"n_eff med {tgt_delta_rec['n_eff']['median']:5.2f}  "

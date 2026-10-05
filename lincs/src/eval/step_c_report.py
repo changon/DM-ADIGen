@@ -58,6 +58,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.data.build_dataset import _atomic_write  # noqa: E402
 from src.data.synthetic import SYN_META, load_syn_meta, table_syn_seed  # noqa: E402
+from src.nuisances.weight_norm import P2_CLIP  # noqa: E402
 from src.spec import (  # noqa: E402
     add_adjustment_set_cli, add_paths_cli, apply_paths_args, config_from_args)
 
@@ -69,7 +70,14 @@ from src.spec import (  # noqa: E402
 # the original order, so existing verdicts are unchanged.
 ARMS = ("naive", "conditional", "dr", "dr_design",
         "p1_cond_counts", "p1_cond_design", "p1_cond_ones",
-        "p1_naive_counts", "p1_naive_design", "p1_naive_ones")
+        "p1_naive_counts", "p1_naive_design", "p1_naive_ones",
+        "dr_p2", "dr_design_p2")
+# P2 (STEP_A.md §4): the weighted risk with group-normalised weights and this
+# cap. A weighted run with any OTHER normalisation or cap is not an arm of the
+# verdict at all, so an ablation cannot fill a `dr` or `dr_p2` cell. The cap is
+# `weight_norm.P2_CLIP`, the one place it is written down.
+# The pass rule, fixed on 2026-10-05 before any P2 run (STEP_A.md §4, D5).
+P2_RULE = {"lambda_unscored_min": 0.60, "mse_ratio_max": 1.10, "abs_did_max": 0.58}
 P1_SRC_SHORT = {"naive": "naive", "conditional": "cond"}
 P1_MODES = ("counts", "design", "ones")
 
@@ -83,8 +91,9 @@ SCORING = {"gen_epoch": 499, "which_wgt": "ema", "guidance_scale": 1.0,
            "n_per_row": 16, "num_inference_steps": 100}
 
 
-def arm_label(arch: dict) -> str | None:
-    """The §3.8.1 arm this run is, from its own arch.json.
+def arm_label(arch: dict, confounder: str = "syn_c") -> str | None:
+    """The §3.8.1 arm this run is, from its own arch.json. `confounder` is the
+    field the step thins on: `syn_c` (steps C / C2) or `cell_id` (step A).
 
     Read from `arch.json` rather than the directory name: the name is derived
     from the flags, so trusting it would make the report agree with itself by
@@ -93,13 +102,21 @@ def arm_label(arch: dict) -> str | None:
     c = tuple(arch.get("adjustment_set") or ())
     mode = str(arch.get("dr_mode"))
     if mode == "conditional":
-        return "naive" if not c else ("conditional" if c == ("syn_c",) else None)
-    if mode == "weighted" and c == ("syn_c",):
+        return "naive" if not c else ("conditional" if c == (confounder,) else None)
+    if mode == "weighted" and c == (confounder,):
         f = str(arch.get("dr_weights_file") or "")
+        # Absent keys are runs trained before P2 existed: global, no cap.
+        norm, clip = arch.get("dr_weight_norm"), arch.get("dr_weight_clip")
+        if norm in (None, "global") and clip is None:
+            suffix = ""
+        elif norm == "group" and clip is not None and abs(float(clip) - P2_CLIP) < 1e-12:
+            suffix = "_p2"
+        else:
+            return None
         if "counts" in f:
-            return "dr"
+            return "dr" + suffix
         if "design" in f:
-            return "dr_design"
+            return "dr_design" + suffix
     return None
 
 
@@ -239,6 +256,10 @@ def main():
             skipped.append(f"{os.path.basename(f)}: not a step-C arm "
                            f"(C={arch.get('adjustment_set')}, dr_mode={arch.get('dr_mode')}, "
                            f"tier.active={tier.get('active')}"
+                           + (f", dr_weight_norm={arch.get('dr_weight_norm')!r} "
+                              f"dr_weight_clip={arch.get('dr_weight_clip')!r} -- neither the "
+                              f"global `dr` nor P2 (group, cap {P2_CLIP:g})"
+                              if arch.get("dr_mode") == "weighted" else "")
                            + (f", targeting={d.get('targeting', {}).get('arm')!r}"
                               if d.get("targeting") else "") + ")")
             continue
@@ -478,6 +499,66 @@ def main():
         print(f"\n[diag] {args.baseline_arm} Delta {diag['conditional_delta']:+.3f} vs "
               f"(1 - lambda-hat {lam_c:.3f}) x naive's = {diag['conditional_delta_predicted']:+.3f}")
 
+    # ---- P2's pass rule (STEP_A.md §4), reported whenever dr_p2 runs exist ----
+    # The thresholds were set from step C2's numbers, so the rule is judged on the
+    # C2 injection and --pool all only; elsewhere the arm is tabulated, not judged.
+    p2 = None
+    p2_scope = (want_meta.get("mode") == "compound" and float(want_meta.get("rho") or 0) == 1.0
+                and args.pool == "all")
+    if "dr_p2" in have and not p2_scope:
+        print("\n[p2] dr_p2 runs found, but the P2 pass rule is defined on step C2 "
+              "(--syn_meta syn_meta_compound_r1.json, --pool all) only; not judged here")
+    if "dr_p2" in have and p2_scope:
+        def _mse(arm, keys):
+            v = [cells[(arm, g_, s_)]["pooled_mse"] for g_, s_ in keys]
+            return None if any(x is None for x in v) or not v else float(np.mean(v))
+        keys = sorted((g_, s_) for (a_, g_, s_) in cells if a_ == "dr_p2")
+        full = (len(keys) == 6 and all(("conditional", g_, s_) in cells for g_, s_ in keys)
+                and per_arm["dr_p2"]["n_seeds"] == 3)
+        m_p2 = _mse("dr_p2", keys)
+        m_c = _mse("conditional", keys) if all(("conditional", *k) in cells for k in keys) else None
+        m_dr = _mse("dr", keys) if all(("dr", *k) in cells for k in keys) else None
+        lam, did = per_arm["dr_p2"]["lambda_unscored"], per_arm["dr_p2"]["delta_scored_mean"]
+        parts = {
+            "lambda_unscored": {"value": lam, "min": P2_RULE["lambda_unscored_min"],
+                                "conditional": per_arm.get("conditional", {}).get("lambda_unscored"),
+                                "dr": per_arm.get("dr", {}).get("lambda_unscored"),
+                                "pass": None if lam is None else bool(lam >= P2_RULE["lambda_unscored_min"])},
+            "mse_ratio_vs_conditional": {
+                "value": None if not (m_p2 and m_c) else m_p2 / m_c,
+                "max": P2_RULE["mse_ratio_max"],
+                "dr": None if not (m_dr and m_c) else m_dr / m_c,
+                "pass": None if not (m_p2 and m_c) else bool(m_p2 / m_c <= P2_RULE["mse_ratio_max"])},
+            "abs_did_scored": {"value": None if did is None else abs(did),
+                               "max": P2_RULE["abs_did_max"], "signed": did,
+                               "dr": per_arm.get("dr", {}).get("delta_scored_mean"),
+                               "pass": None if did is None else bool(abs(did) <= P2_RULE["abs_did_max"])},
+        }
+        ok = [v["pass"] for v in parts.values()]
+        # dr_p2 is not in the judged (`active`) set of criterion 4, so its weight
+        # provenance is checked here: every run trained on the weights its tier
+        # instance's file holds today.
+        w_bad = sorted(f"g{g_:g}|s{s_}" for g_, s_ in keys
+                       if not (cells[("dr_p2", g_, s_)].get("weights") or {}).get("ok"))
+        p2 = {"rule": P2_RULE, "clip": P2_CLIP, "complete": bool(full), "cells": len(keys),
+              "parts": parts, "weights_mismatch": w_bad,
+              "pass": (None if (not full or any(x is None for x in ok))
+                       else bool(all(ok) and not w_bad)),
+              "note": "all three must hold over gamma in {0,1} x 3 seeds; MSE is the mean "
+                      "pooled gene MSE over the dr_p2 cells against conditional's same cells"}
+        print("\n### P2 pass rule (STEP_A.md §4)\n")
+        for k_, v in parts.items():
+            mark = {True: "PASS", False: "FAIL", None: "UNDECIDED"}[v["pass"]]
+            val = "n/a" if v["value"] is None else format(v["value"], ".3f")
+            bound = f">= {v['min']}" if "min" in v else f"<= {v['max']}"
+            ref = "n/a" if v.get("dr") is None else format(abs(v["dr"]) if k_ == "abs_did_scored" else v["dr"], ".3f")
+            print(f"- **{mark}** {k_}: {val} (needs {bound}; `dr` {ref})")
+        if w_bad:
+            print(f"- **FAIL** weights: {len(w_bad)} dr_p2 run(s) no longer match their "
+                  f"weight file ({', '.join(w_bad)})")
+        print(f"- **{ {True: 'PASS', False: 'FAIL', None: 'UNDECIDED'}[p2['pass']] }** overall "
+              f"({len(keys)}/6 cells)")
+
     print("\n### §3.8.1 criteria\n")
     for k, c in crit.items():
         mark = {True: "PASS", False: "FAIL", None: "UNDECIDED"}[c["pass"]]
@@ -486,6 +567,7 @@ def main():
            "n_arm_runs": len(cells), "seeds": seeds, "gammas": gammas,
            "plan_contrast": args.plan_contrast, "per_arm": per_arm,
            "criteria": crit, "diagnostics": diag, "skipped": skipped,
+           **({"p2_pass_rule": p2} if p2 is not None else {}),
            "syn_meta": args.syn_meta, "syn_mode": want_meta.get("mode", "global"),
            "syn_rho": want_meta.get("rho"),
            "scoring": {k: getattr(args, k) for k in SCORING},

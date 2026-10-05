@@ -193,7 +193,14 @@ def main():
         check(worst < 2e-4,
               f"{pname}: tau recomputed for {len(pick)} arms (max diff {worst:.2e})")
 
-        if arm_size_counts and pname == "all" and len(rows) == len(meta):
+        if len(cfg.population.cell_ids) > 1:
+            # population_qc counts (cell_id, compound, dose) arms; the estimand's
+            # arm pools the lines, so the two are different tables. The pandas
+            # recount above is the arm check on a multi-line population.
+            if pname == "all":
+                print("      (QC arm_size_counts not compared: they are per cell line, "
+                      "the estimand's arms pool the lines)")
+        elif arm_size_counts and pname == "all" and len(rows) == len(meta):
             below = sum(v for kk, v in arm_size_counts.items() if int(kk) < min_n)
             check(block["n_arms_below_min_dose_n"] == below,
                   f"all: {below:,} arms below min_dose_n {min_n} per "
@@ -251,6 +258,12 @@ def main():
             # REAL data, so the band does not apply to an injected oracle.
             print(f"      (responder band skipped: syn_effect="
                   f"{doc['syn_effect']} raises the floor; frac={frac:.3f})")
+        elif len(cfg.population.cell_ids) > 1:
+            # The band is §3.8.1's ~29%, measured on MCF7's 3-well arms. A
+            # multi-line population pools ~3 wells per line into each arm, so its
+            # floor is lower and its responder share is another quantity.
+            print(f"      (responder band skipped: it is calibrated on the single-line "
+                  f"3-well arms of mcf7_24h; frac={frac:.3f} on {cfg.population.name})")
         elif args.no_bands or frac is None:
             print(f"      (responder band skipped; frac={frac})")
         else:

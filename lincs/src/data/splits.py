@@ -49,9 +49,20 @@ CONTROL_ARM = "0|ctl"   # every vehicle row: compound_idx 0, no dose
 
 
 def table_fingerprint(cfg: CaseConfig) -> str:
-    """The fingerprint build_dataset recorded for the table under cfg.paths.data_dir."""
+    """The fingerprint build_dataset recorded for the table under cfg.paths.data_dir.
+
+    Also the one place every split consumer passes through, so it refuses a
+    config whose population is not the build's: mixing them would key a split of
+    one population's table with another population's name.
+    """
     with open(cfg.paths.population_qc_json) as f:
-        return json.load(f)["table_fingerprint"]
+        qc = json.load(f)
+    if str(qc["population"]) != cfg.population.name:
+        raise ValueError(
+            f"{cfg.paths.data_dir} is a build of population {qc['population']!r}, but the "
+            f"config's population is {cfg.population.name!r}. Pass --data_dir alone (the "
+            f"build's population is adopted) or a matching --population.")
+    return qc["table_fingerprint"]
 
 
 def population_key(cfg: CaseConfig) -> dict:

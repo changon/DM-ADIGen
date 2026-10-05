@@ -19,6 +19,13 @@ need the train split (src.data.expr_stats, after src.data.splits).
 Run from lincs/ as a CPU job (the full population reads ~1.9 GB of the GCTX):
     python -m src.data.build_dataset                  # -> data/mcf7_24h/
     python -m src.data.build_dataset --limit 1500     # smoke -> data/mcf7_24h_limit1500/
+    python -m src.data.build_dataset --population core5_24h                # step A -> data/core5_24h/
+    python -m src.data.build_dataset --population core5_24h --limit 11000  # smoke: 2 whole plate maps
+
+A population with more than one cell line (step A's core5_24h) keeps only
+compounds with a treated well in EVERY line, applied after plate QC; its --limit
+keeps whole plate MAPS (every line's and replicate's plates of a map), so the
+smoke build still has each compound in each line.
 """
 from __future__ import annotations
 
@@ -43,8 +50,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.data.synthetic import assign_syn_c, max_group_imbalance  # noqa: E402
 from src.spec import (  # noqa: E402
-    CONTEXT_FIELDS as _CONTEXT_FIELDS, DECLARED_LEVELS, CaseConfig, Paths,
-    decisions_record, default_config, format_role_summary)
+    CONTEXT_FIELDS as _CONTEXT_FIELDS, DECLARED_LEVELS, POPULATIONS, CaseConfig, Paths,
+    decisions_record, format_role_summary, line_groups)
 
 CONTROL_COMPOUND_NAME = "__control__"
 CONTROL_COMPOUND_IDX = 0  # index 0 is reserved for control
@@ -203,13 +210,37 @@ def build_compound_vocab(pert_ids: pd.Series) -> dict[str, int]:
     return vocab
 
 
-def limit_whole_plates(df: pd.DataFrame, limit: int) -> pd.DataFrame:
+def limit_whole_plates(df: pd.DataFrame, limit: int, *, by_map: bool = False) -> pd.DataFrame:
     """Smoke subset: whole plates in sorted det_plate order until >= `limit` wells.
-    Whole plates keep plate QC and DMSO-per-plate meaningful."""
-    sizes = df.groupby("det_plate").size().sort_index()
+    Whole plates keep plate QC and DMSO-per-plate meaningful.
+
+    `by_map` (a multi-line population): whole plate MAPS instead -- the first
+    token of det_plate, i.e. every line's and replicate's plates of one layout --
+    so each compound of the subset is still present in each line."""
+    unit = df["det_plate"].str.split("_").str[0] if by_map else df["det_plate"]
+    sizes = df.groupby(unit.values).size().sort_index()
     n_keep = int(np.searchsorted(sizes.cumsum().values, limit)) + 1
     keep = set(sizes.index[:n_keep])
-    return df[df["det_plate"].isin(keep)].copy()
+    return df[unit.isin(keep).values].copy()
+
+
+def common_compound_rows(df: pd.DataFrame, cell_ids) -> tuple[np.ndarray, dict]:
+    """Keep-mask and record for the multi-line rule: a treated well stays only if
+    its compound has a treated well in EVERY line of the population (after plate
+    QC). Vehicles always stay. On a single-line population it keeps everything."""
+    ctl = df["is_control"].values.astype(bool)
+    lines = sorted(set(cell_ids))
+    n_lines = df.loc[~ctl].groupby("pert_id")["cell_id"].nunique()
+    ok = set(n_lines.index[n_lines == len(lines)])
+    keep = ctl | df["pert_id"].isin(ok).values
+    dropped = sorted(set(n_lines.index) - ok)
+    rec = {"rule": ("a treated well is kept only if its pert_id has a treated well in every "
+                    "cell line of the population, after plate QC; vehicles are always kept"),
+           "applies": len(lines) > 1, "cell_ids": lines,
+           "n_compounds_before": int(n_lines.size), "n_compounds_kept": int(len(ok)),
+           "n_treated_wells_dropped": int((~keep).sum()),
+           "dropped_compounds": [{"pert_id": p, "n_lines": int(n_lines[p])} for p in dropped]}
+    return keep, rec
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +539,13 @@ def summarize(df: pd.DataFrame, expr: np.ndarray, vocab: dict, qc: dict, cfg: Ca
                            "by_plate": {k: int(v) for k, v in dmso.items()}},
         "plates_dropped_by_qc": [d["plate"] for d in qc["dropped_plates"]],
         "expr_range": [float(expr.min()), float(expr.max())],
+        **({"by_cell_id": {c: {"n_wells": int(m.sum()), "n_treated": int((m & ~ctl).sum()),
+                               "n_vehicle": int((m & ctl).sum()),
+                               "n_plates": int(df.loc[m, "det_plate"].nunique()),
+                               "n_compounds": int(df.loc[m & ~ctl, "pert_id"].nunique())}
+                           for c in sorted(set(df["cell_id"]))
+                           for m in [(df["cell_id"] == c).values]}}
+           if df["cell_id"].nunique() > 1 else {}),
     }
 
 
@@ -528,6 +566,9 @@ def print_summary(s: dict) -> None:
         for p, n in d["by_plate"].items():
             print(f"      {p:<32} {n}")
     print(f"  plates dropped QC  {s['plates_dropped_by_qc'] or 'none'}")
+    for c, r in (s.get("by_cell_id") or {}).items():
+        print(f"  line {c:<6}        {r['n_wells']:,} wells (treated {r['n_treated']:,}, vehicle "
+              f"{r['n_vehicle']:,}) on {r['n_plates']} plates, {r['n_compounds']:,} compounds")
 
 
 def main():
@@ -538,10 +579,14 @@ def main():
     parser.add_argument("--data_dir", default=None, help="Override cfg.paths.data_dir (all outputs go under it).")
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing build in the target dir.")
     parser.add_argument("--block_rows", type=int, default=1024, help="Max GCTX rows per contiguous read.")
+    parser.add_argument("--population", default=None, choices=sorted(POPULATIONS),
+                        help="Which declared population to build (default mcf7_24h).")
     args = parser.parse_args()
 
-    cfg: CaseConfig = default_config()
+    cfg: CaseConfig = CaseConfig() if args.population is None else CaseConfig(
+        population=POPULATIONS[args.population])
     pop = cfg.population
+    multi_line = len(pop.cell_ids) > 1
     data_dir = args.data_dir
     if data_dir is None and args.limit is not None:
         data_dir = os.path.join(os.path.dirname(cfg.paths.data_dir), f"{pop.name}_limit{args.limit}")
@@ -574,8 +619,9 @@ def main():
     check_metadata(df, cfg, pert_info, cell_info)
     df = df.sort_values("inst_id", kind="stable").reset_index(drop=True)
     if args.limit is not None:
-        df = limit_whole_plates(df, args.limit).reset_index(drop=True)
-        print(f"[build] --limit {args.limit}: {len(df):,} wells on {df['det_plate'].nunique()} whole plates")
+        df = limit_whole_plates(df, args.limit, by_map=multi_line).reset_index(drop=True)
+        print(f"[build] --limit {args.limit}: {len(df):,} wells on {df['det_plate'].nunique()} whole plates"
+              + (f" ({df['det_plate'].str.split('_').str[0].nunique()} whole plate maps)" if multi_line else ""))
 
     df = encode_action(df, cfg)
     df = pd.concat([df, parse_plate(df["det_plate"])], axis=1)
@@ -603,6 +649,17 @@ def main():
           f"(single-well arms {qc['n_arms_single_well']['before_qc']} -> {qc['n_arms_single_well']['after_qc']})")
     df = df.loc[keep].reset_index(drop=True)
     expr = np.ascontiguousarray(expr[keep])
+
+    # --- multi-line populations: compounds present in every line -----------------
+    keep_c, common = common_compound_rows(df, pop.cell_ids)
+    if multi_line:
+        print(f"[build] every-line rule: {common['n_compounds_kept']:,}/{common['n_compounds_before']:,} "
+              f"compounds have a treated well in all {len(pop.cell_ids)} lines; "
+              f"{common['n_treated_wells_dropped']:,} treated wells dropped")
+        df = df.loc[keep_c].reset_index(drop=True)
+        expr = np.ascontiguousarray(expr[keep_c])
+    elif not keep_c.all():
+        raise AssertionError("the every-line rule dropped rows of a single-line population")
 
     # --- compound vocab --------------------------------------------------------
     ctl = df["is_control"].values.astype(bool)
@@ -673,6 +730,9 @@ def main():
         "decisions": decisions_record(cfg),
         "filters": filter_counts,
         "plate_qc": qc,
+        # Recorded only for a multi-line population, so a single-line build's
+        # population_qc.json keeps the keys it has always had.
+        **({"common_compounds": common, "line_groups": line_groups(pop)} if multi_line else {}),
         "syn_c": syn_rec,
         "summary": summary,
     })

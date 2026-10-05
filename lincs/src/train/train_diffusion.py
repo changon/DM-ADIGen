@@ -74,6 +74,7 @@ from src.models import (  # noqa: E402
     resolve_arch_kwargs, write_arch_spec)
 from src.processes import make_train_flow_matching, make_train_scheduler, training_target  # noqa: E402
 from src.data.splits import load_splits  # noqa: E402
+from src.nuisances.weight_norm import NORM_MODES, group_normalize, train_groups  # noqa: E402
 from src.data.dataset import (  # noqa: E402
     LincsDataset, build_cond_spec, cond_from_batch, dose_probe)
 
@@ -86,7 +87,11 @@ VAL_SEED = 1234          # validation noise: the same draws every epoch, so val_
 VAL_ROWS_SEED = 12345    # the val_cap subsample of the holdout
 
 # arch.json keys not compared on resume: provenance of the latest launch.
-_NON_IDENTITY_KEYS = ("train_args",)
+# `dr_weight_stats` are floating-point summaries (ESS, max) whose last bits can
+# differ between CPU types. The settings that produce them ARE compared, and so
+# are the exact integer counts (`dr_weight_groups`), which would move if the
+# grouping or the cap routine changed between a run and its resume.
+_NON_IDENTITY_KEYS = ("train_args", "dr_weight_stats")
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +316,8 @@ def _parse_args():
     p.add_argument("--max_steps", type=int, default=0, help="Stop each epoch after N optimizer steps. 0 = full epoch.")
     p.add_argument("--class_dropout_prob", type=float, default=0.1, help="CFG dropout on the whole treatment (every role-A field); >0 gives guidance a true unconditional branch.")
     p.add_argument("--dr_mode", default="conditional", choices=("conditional", "weighted"), help="Training risk. 'weighted' weights the factual loss by per-row weights from --dr_weights_file; 'conditional' is unweighted. Weights are normalized to mean 1.")
+    p.add_argument("--dr_weight_norm", default="global", choices=NORM_MODES, help="weighted: how the weights are normalised. 'global' (default, the v1 / step-C risk): one mean-1 normalisation over all train rows. 'group' (P2, STEP_A.md §4): within each target group (the positivity cell minus the confounder), so every group keeps its unweighted mass; needs a tiered split.")
+    p.add_argument("--dr_weight_clip", type=float, default=None, help="weighted: cap each normalised weight at this value, the group (or global) total preserved. >= 1. Default: no cap.")
     p.add_argument("--dr_weights_file", default="dr_weights_urr.npz", help="weighted: {row_id, w} npz in the split dir: dr_weights_urr.npz (export --mode net, v1 primary), dr_weights_counts.npz, dr_weights_design.npz.")
     p.add_argument("--diffusion_method", default="ddpm", choices=("ddpm", "fm"), help="'ddpm' = VP cosine zero-SNR, v-prediction; 'fm' = flow matching (velocity). Not resume-compatible.")
     p.add_argument("--invariance_lambda", type=float, default=0.0, help="V-REx penalty weight: loss = mean_e[L_e] + lam*Var_e[L_e], e over spec.invariance_env_fields (plate; set with --environment_set).")
@@ -330,6 +337,10 @@ def _parse_args():
         p.error("--train_batch_size, --num_epochs, --checkpoint_every, --val_every and --log_every must be >= 1")
     if not 0.0 <= a.ema_decay < 1.0:
         p.error("--ema_decay must be in [0, 1)")
+    if a.dr_mode != "weighted" and (a.dr_weight_norm != "global" or a.dr_weight_clip is not None):
+        p.error("--dr_weight_norm / --dr_weight_clip apply to --dr_mode weighted only")
+    if a.dr_weight_clip is not None and not a.dr_weight_clip >= 1.0:
+        p.error("--dr_weight_clip must be >= 1 (the mean weight is 1)")
     return a
 
 
@@ -341,6 +352,10 @@ def _default_output_subdir(args, cfg: CaseConfig, plate_center: str) -> str:
     if args.dr_mode == "weighted":
         stem = os.path.splitext(os.path.basename(args.dr_weights_file))[0]
         dr += "-" + (stem[len("dr_weights_"):] if stem.startswith("dr_weights_") else stem)
+        if args.dr_weight_norm != "global":
+            dr += "-gn"
+        if args.dr_weight_clip is not None:
+            dr += f"-c{args.dr_weight_clip:g}"
     parts += [dr, args.diffusion_method]
     if args.cmean_lambda > 0:
         cstem = os.path.splitext(os.path.basename(args.cmean_file))[0]
@@ -498,6 +513,7 @@ def main():
     dr_w = None
     dr_weights_mode = None
     dr_weights_sha1 = None
+    dr_weight_stats = None
     if args.dr_mode == "weighted":
         wpath = os.path.join(nz, args.dr_weights_file)
         wz = np.load(wpath)
@@ -518,8 +534,34 @@ def main():
         _raw_mean, _raw_max = float(dr_w.mean()), float(dr_w.max())
         _ess = lambda a: float((a.sum() ** 2) / max((a ** 2).sum(), 1e-12) / len(a))
         _ess_raw = _ess(dr_w.astype(np.float64))
-        # normalize to mean 1 so the gradient scale matches the conditional arm
-        dr_w = (dr_w / max(float(dr_w.mean()), 1e-8)).astype(np.float32)
+        if args.dr_weight_norm == "global" and args.dr_weight_clip is None:
+            # normalize to mean 1 so the gradient scale matches the conditional arm
+            dr_w = (dr_w / max(float(dr_w.mean()), 1e-8)).astype(np.float32)
+        else:
+            # P2 (STEP_A.md §4). 'group': every target group keeps its unweighted
+            # mass, so the weights only rebalance the confounder within a group.
+            # 'global' with a cap is the same routine with one group.
+            if args.dr_weight_norm == "group":
+                if not tier.get("active"):
+                    raise SystemExit("[init] --dr_weight_norm group needs a tiered split: the group is the "
+                                     "positivity cell minus the confounder, and this split thins on nothing")
+                _grp = train_groups(cfg, tier["confounder"], train_idx)
+            else:
+                _grp = np.zeros(len(dr_w), dtype=np.int8)
+            _w64, dr_weight_stats = group_normalize(dr_w, _grp, cap=args.dr_weight_clip)
+            if dr_weight_stats["max_group_sum_rel_err"] > 1e-9:
+                raise RuntimeError(f"group normalisation left a group off its row count by "
+                                   f"{dr_weight_stats['max_group_sum_rel_err']:.2e}")
+            dr_w = _w64.astype(np.float32)
+            # what the loss actually sees (float32), next to the float64 summary
+            dr_weight_stats["n_exactly_one"] = int((dr_w == 1.0).sum())
+            dr_weight_stats["max_f32"] = float(dr_w.max())
+            accelerator.print(
+                f"[init]   norm={args.dr_weight_norm} clip={args.dr_weight_clip}: "
+                f"{dr_weight_stats['n_groups']:,} groups, max |group sum / n - 1| "
+                f"{dr_weight_stats['max_group_sum_rel_err']:.1e}; capped {dr_weight_stats['n_capped']:,} rows "
+                f"({100 * dr_weight_stats['capped_frac']:.2f}%) in {dr_weight_stats['n_groups_with_cap']:,} groups, "
+                f"{dr_weight_stats['cap_passes']} pass(es)")
         accelerator.print(
             f"[init] dr_mode=weighted file={args.dr_weights_file} (mode {dr_weights_mode})\n"
             f"[init]   raw : mean={_raw_mean:.4f} max={_raw_max:.3f} ESS/n={_ess_raw:.3f}\n"
@@ -711,6 +753,15 @@ def main():
         dr_weights_file=_rel_to_nz(args.dr_weights_file) if args.dr_mode == "weighted" else None,
         dr_weights_mode=dr_weights_mode,
         dr_weights_sha1=dr_weights_sha1,
+        # P2 (STEP_A.md §4). None = the global mean-1 normalisation with no cap,
+        # i.e. every run trained before these flags existed, so those runs still
+        # resume and still read as the original `dr` arm.
+        dr_weight_norm=(args.dr_weight_norm if args.dr_weight_norm != "global" else None),
+        dr_weight_clip=(float(args.dr_weight_clip) if args.dr_weight_clip is not None else None),
+        dr_weight_groups=(None if dr_weight_stats is None else
+                          {k: int(dr_weight_stats[k]) for k in
+                           ("n_groups", "n_capped", "n_groups_with_cap", "n_exactly_one")}),
+        dr_weight_stats=dr_weight_stats,
         cmean_lambda=float(args.cmean_lambda),
         cmean_file=_rel_to_nz(args.cmean_file) if args.cmean_lambda > 0 else None,
         cmean_min_n=cmean_min_n,
@@ -740,7 +791,7 @@ def main():
         train_args={k: v for k, v in sorted(vars(args).items())},
     )
 
-    # --- identity: every arch.json field except train_args must match ----------
+    # --- identity: every arch.json field except _NON_IDENTITY_KEYS must match ---
     def _identity_diff(prior: dict) -> list[str]:
         bad = []
         for _key in sorted((set(prior) | set(spec)) - set(_NON_IDENTITY_KEYS)):

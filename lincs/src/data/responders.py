@@ -23,6 +23,10 @@ are written, because at n = 3 the floor (14.5) is most of the measured median
 (15.2): E||tau_hat||^2 = ||tau||^2 + E||noise||^2, so the raw value is mostly
 noise and would set beta several times too large.
 
+Step A (`--confounder cell_id`): the positivity cell is (compound, dose_level,
+cell_id), so a compound is thinnable when every one of its dose levels has a
+train well in EVERY line of the population (and it has >= 2 levels).
+
 numpy/json only: no torch.
 
     python -m src.data.responders                        # -> <nuisance_dir>/responders.json
@@ -68,16 +72,17 @@ def default_oracle(cfg, pool: str) -> str:
     return path
 
 
-def thinnable(cfg, compound_idx: set[int]) -> tuple[set[int], dict]:
+def thinnable(cfg, compound_idx: set[int], confounder: str = "syn_c") -> tuple[set[int], dict]:
     """Which compounds `build_tiered_split` can actually thin.
 
-    `thin_compound` requires a TRAIN well in every one of the four cells
-    {low, high} x syn_c in {0, 1}, and >= 2 distinct dose levels for the
-    dose-half score to exist. A compound failing either cannot be thinned, and
-    the builder refuses the whole instance over one of them -- so screen here.
+    `thin_compound` requires a TRAIN well in every positivity cell -- the four
+    cells {low, high} x syn_c in {0, 1} (step C), or every (dose_level, cell_id)
+    of the compound (step A) -- and >= 2 distinct dose levels for the dose-half
+    score to exist. A compound failing either cannot be thinned, and the builder
+    refuses the whole instance over one of them -- so screen here.
     """
     meta = (load_from_disk(cfg.paths.tabular_dataset_dir)
-            .select_columns(["compound_idx", "dose_level", "is_control", "syn_c"])
+            .select_columns(["compound_idx", "dose_level", "is_control", "syn_c", "cell_id"])
             .to_pandas())
     comp = meta["compound_idx"].values.astype(np.int64)
     dl = meta["dose_level"].values.astype(np.float64)
@@ -87,6 +92,8 @@ def thinnable(cfg, compound_idx: set[int]) -> tuple[set[int], dict]:
     in_train = np.zeros(len(meta), dtype=bool)
     in_train[np.asarray(load_splits(cfg)["train_idx"], dtype=np.int64)] = True
 
+    line = meta["cell_id"].values.astype(str)
+    lines = sorted(cfg.population.cell_ids)
     want = {f"{h}|syn_c={c}" for h in ("low", "high") for c in ("0", "1")}
     ok, why = set(), {"few_levels": [], "empty_cell": []}
     for ci in sorted(compound_idx):
@@ -94,10 +101,16 @@ def thinnable(cfg, compound_idx: set[int]) -> tuple[set[int], dict]:
         if np.unique(dl[sel]).size < 2:
             why["few_levels"].append(int(ci)); continue
         tr = sel & in_train
-        cells = {f"{'high' if h == 1 else 'low'}|syn_c={v}"
-                 for h, v in zip(half[tr], syn[tr])}
-        if want - cells:
-            why["empty_cell"].append(int(ci)); continue
+        if confounder == "cell_id":
+            want_c = {(float(d), c) for d in np.unique(dl[sel]) for c in lines}
+            cells = set(zip(dl[tr].tolist(), line[tr].tolist()))
+            if want_c - cells:
+                why["empty_cell"].append(int(ci)); continue
+        else:
+            cells = {f"{'high' if h == 1 else 'low'}|syn_c={v}"
+                     for h, v in zip(half[tr], syn[tr])}
+            if want - cells:
+                why["empty_cell"].append(int(ci)); continue
         ok.add(int(ci))
     return ok, why
 
@@ -153,6 +166,9 @@ def main():
                         "{low,high} x syn_c positivity cells, which is what "
                         "build_tiered_split requires of every scored compound.")
     p.add_argument("--no_require_cells", dest="require_cells", action="store_false")
+    p.add_argument("--confounder", default="syn_c", choices=("syn_c", "cell_id"),
+                   help="Whose positivity cells the thinnability screen uses: syn_c (step C, "
+                        "{low,high} x syn_c) or cell_id (step A, every dose level in every line).")
     p.add_argument("--n_compounds", type=int, default=None, help="Score only this many responders.")
     p.add_argument("--frac", type=float, default=None, help="Score this fraction of them.")
     p.add_argument("--seed", type=int, default=42, help="Subsampling seed.")
@@ -186,7 +202,7 @@ def main():
     thin_ci = None
     if args.require_cells:
         cand = {int(c["compound_idx"]) for c in per_compound if c["responder"]}
-        thin_ci, why = thinnable(cfg, cand)
+        thin_ci, why = thinnable(cfg, cand, args.confounder)
         print(f"[responders] thinnable: {len(thin_ci):,} of {len(cand):,} responders "
               f"({len(why['few_levels'])} with < 2 dose levels, "
               f"{len(why['empty_cell'])} with an empty positivity cell)")
@@ -223,7 +239,7 @@ def main():
         "pool": args.pool,
         "table_fingerprint": doc["table_fingerprint"],
         "split_fingerprint": doc["split_fingerprint"],
-        "selection": report,
+        "selection": dict(report, confounder=args.confounder),
         "beta_scale": beta_scale,
         "detail": [{k: c[k] for k in ("pert_id", "pert_iname", "compound_idx", "n_arms",
                                       "max_tau_norm_real", "max_floor_ratio",

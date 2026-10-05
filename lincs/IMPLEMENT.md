@@ -995,6 +995,16 @@ Outputs, as in RxRx:
   estimates toward the over-kept group.
 - **Scale:** ingest reads ~183k full rows (~9 GB) from the GCTX (CPU job). The
   in-memory `y` is ~0.7 GB. Nuisance and training time grow ~5×.
+- **Plan of record, readout and success criteria (2026-10-05):** `STEP_A.md`.
+  Its §2 holds the decisions (line groups, arms, cuts), its §3 the bias readout
+  and criteria S0–S5, fixed before any step-A result, and its §5–§7 the TODO
+  list and jobs. Where it differs from the bullets above, it is the later text:
+  - the bias readout is the error projected on each arm's own line-group
+    contrast, taken over holdout wells, as a difference in differences against
+    γ = 0, with compound-clustered errors;
+  - `keep_frac` is the realised kept fraction, 0.75 (approved 2026-10-05);
+  - the arms are `naive` / `conditional` / `dr` / `dr_p2`, plus P1 as a
+    baseline.
 
 #### 3.8.4 Step C2 — compound-specific injection (decided 2026-10-01; before step A)
 
@@ -1761,9 +1771,19 @@ are in §5, "cmean ablation: training results".
 ### Phase 4 — eval
 
 §3.14 decisions E10–E12 chosen and recorded (2026-10-01, before any Phase 4
-code). Written and smoke-tested 2026-10-01; **no box is checked yet — the code
-review has not happened.** What landed and what it changed is in §5, "Phase 4
-implementation and review".
+code). Written, smoke-tested and run 2026-10-01. What landed and what it changed
+is in §5, "Phase 4 implementation and review".
+
+Reviewed 2026-10-05, in the status review the user asked for (§5, "Phase 4 and
+Phase 5 status review"):
+- an independent code review of the Phase 4 code, which had none until then;
+- every artifact and job of record read back from disk;
+- the results table recomputed from the arm JSONs.
+
+The review found no bug that changes a recorded number, so the two experiment
+boxes and `dist_metrics.py` are checked. It asks for follow-ups on three code
+items (R1–R8 in that entry), and those stay unchecked until the fixes land and
+are re-reviewed. The quality block is a further open item (last box).
 
 - [ ] `eval/generation.py`: CFG sampling → `(B, 978)`; no clamp, no
       `channels_last`; rebuild from `arch.json` only
@@ -1773,49 +1793,129 @@ implementation and review".
       - **`clip_sample=False`** had to be pinned in `processes/ddpm.py`: the
         diffusers default clips predicted \(x_0\) to \([-1, 1]\) every step,
         which truncated every DDPM sample (§5).
-- [ ] `eval/dist_metrics.py`: Frechet (marginal / PCs) + MMD on \(Y\)
+      - Reviewed 2026-10-05: the path every run used (DDIM or FM Euler, 100
+        steps) is correct. Open:
+        - R1: `--sampler ddpm` uses the wrong timestep spacing and is unseeded.
+          No run used it.
+        - R2: `check_arm_against_data` skips an identity field that is absent
+          from `arch.json`.
+        - R6: the reservoir cap (with `evaluate`).
+- [x] `eval/dist_metrics.py`: Frechet (marginal / PCs) + MMD on \(Y\)
       (copied math; no Inception, no torchvision)
       - RxRx's `rbf_mmd2` had to be rewritten: its `(n, n, d)` temporary is
         ~125 GB at d = 978 (§5).
+      - `_eigh_psd` and `assert_blas_ok` were added on 2026-10-02, after the
+        Sapphire Rapids BLAS was found to be wrong (§5, "Step C2 scoring").
+      - Reviewed 2026-10-05: the math is correct, and `_eigh_psd` fails closed.
+        Four notes are not acted on (§5).
 - [ ] `eval/evaluate.py`: gene-space \(\hat\tau(c,d)\) on `dose_level`;
       `--pool all` per-arm aggregates + holdout aggregates; real and
       generated \(\mu(0)\); `--truth` accuracy; no OpenPhenom / rescue panel
       - The `--source real` path imports no torch, so the oracle is a CPU job.
       - Plus the E11 reference scale: the DMSO noise floor per arm size and the
         split-half reliability ceiling.
+      - No `--gen_anchors` run was made: the generated \(\hat\mu(0)\) is
+        reported as a norm, and \(\hat\tau\) always uses the real vehicle.
+      - Reviewed 2026-10-05: the τ̂ path, the arm filters, the row alignment and
+        the floor are correct, and one arm's row was re-derived from its
+        `_tau.npz`. Open:
+        - R3: the oracle's file name omits `responder_mult` and three other
+          settings, so a non-default oracle run overwrites the one Phase 5
+          reads.
+        - R4: the `--truth` and overwrite guards run after sampling.
+        - R5: the `/ceil` column's arm set, and the unequal halves.
+        - R6: pooled-treated quality compares two dose mixtures.
+      - The responder rule itself passes noise often (§5, gap 3). That is a
+        question about E11, not about the code.
 - [ ] `src/tests/check_phase4.py` (numpy read-back) and
       `src/tests/smoke_phase4_torch.py` (GPU sampler), with
       `scripts/{eval_oracle,eval_arm,eval_steps,phase4_gpu}.sub` and
       `scripts/eval_all_arms.sh`
-- [ ] Oracle (`--source real`) + all four v1 generator arms scored
+      - Reviewed 2026-10-05: the scripts are clean, and the τ / μ̂(0) recompute
+        and the sampler's invariance checks do test what they claim. Open:
+        - R7: `check_phase4`'s responder and floor checks cannot fail.
+        - R8: `smoke_phase4_torch` does not test the schedule's start, and its
+          docstring lists a check that has no code.
+      - `phase4_gpu.sub` last ran on 2026-10-01 (job 792606), before the later
+        changes to `evaluate.py`. `check_phase4` passed again on 2026-10-05
+        (regression job 991754), and the later GPU smokes run the eval end to
+        end. The sampler checks themselves have not been rerun since.
+- [x] Oracle (`--source real`) + all four v1 generator arms scored
       - Settings are fixed in §3.14 (E1–E12): `checkpoint-0499` EMA, w = 1,
         16 samples per real row, `--min_dose_n 2`, 100 sampler steps, both
         Fréchet variants and MMD.
-      - The `mcf7_24h` oracle is built and checked (job 791843; §5). The four
-        generator arms are not scored yet.
-      - E10's step-count convergence check (`scripts/eval_steps.sub`) runs
-        before the DiT arms are launched.
-- [ ] `cmean` ablation (P9): FM `mlp_conditional` / `mlp_dr` with
+      - Oracle: job 793791 on `bindel`. It replaced job 791843's file with the
+        same numbers plus the noise-corrected ‖τ̂‖ arrays.
+      - Arms: jobs 793825–793828 on `zabih`, all exit 0. Results in §5,
+        "Phase 4 results": every arm is at the reliability ceiling, and `dr`
+        equals `conditional` on τ.
+      - E10's step-count check ran as job 792670. 100 steps are enough for τ̂
+        on the DDIM arms (§5, status review).
+      - The quality numbers of these runs are not valid (last box).
+- [x] `cmean` ablation (P9): FM `mlp_conditional` / `mlp_dr` with
       `--cmean_lambda` 0 vs > 0, scored with `--truth`
-      - Training is done for both backbones (eight FM arms; §5). Scoring is
-        open, so the box stays unchecked.
-      - Score all eight FM arms, with `--pool holdout` as the headline for
-        this ablation (E9), which is also their generation pool (E12).
+      - Training is done for both backbones (eight FM arms; §5).
+      - All eight FM arms are scored on `--pool holdout` (E9, E12): jobs
+        793829–793836, all exit 0.
+      - Verdict (§5, "Phase 4 results", finding 4): no. The τ gain is mixed, so
+        `--cmean_lambda 0` stays the default. The per-compound aggregate and the
+        DMSO marginal Fréchet agree (§5, status review).
+- [ ] **Open (status review, 2026-10-05): recompute the quality block** (PC
+      Fréchet, MMD) of the 12 Phase 4 arms and the 24 step-C arms
+      - They were scored on `zabih` before the BLAS fix, so those numbers are
+        wrong and E5 is not met for these arms.
+      - Phase 4's are visibly broken (PC Fréchet ~1e141). Step C's look
+        plausible, and nothing in the JSON marks them.
+      - Every `_gen.npz` holds its reservoirs, so this is a CPU recompute on
+        `bindel`, not the GPU rescoring §5 costed. No script does it yet.
+      - Fix R6 in the same pass: the pooled-treated numbers of every run,
+        C2's included, compare two dose mixtures.
+      - No Phase 4 or step-C conclusion uses these numbers.
 
 ### Phase 5 — step C: semi-synthetic confounder on MCF7 (§3.8.2)
 
-- [ ] `responders.json` from the Phase 4 real oracle (max-over-dose
+Reviewed 2026-10-05, in the status review the user asked for (§5, "Phase 4 and
+Phase 5 status review"):
+- an independent code review of the step-C base code, which had none until
+  then. C2, P1 and P2 had theirs when they were written (§5);
+- every artifact and job of record read back from disk;
+- the four verdict tables recomputed from the JSONs.
+
+The review found no bug that changes a recorded number. It asks for follow-ups
+on `step_c_report` and on the Phase 5 checks and launchers (R9–R14 in that
+entry), so those two boxes and C2's parent stay unchecked. One analysis item is
+also open (last box).
+
+A checked box means the item is built, reviewed and run. It does not mean its
+criterion passed: step C's criterion 2 is untestable, C2's fails, and P2's pass
+rule fails. Each is recorded under its item.
+
+- [x] `responders.json` from the Phase 4 real oracle (max-over-dose
       \(\|\hat\tau\|\) > 1.5× noise floor)
-- [ ] `synthetic.py`: seeded `v`, `β` resolution, injection in `dataset.py`
+      - `src/data/responders.py`. On `mcf7_24h`: 651 responders, 641 scored
+        after the thinnability screen (§5, "Phase 5 progress").
+      - The rule passes noise often, so part of the scored set may have no real
+        effect. Steps C and C2 do not depend on that; step A does (§5, status
+        review, gap 3).
+- [x] `synthetic.py`: seeded `v`, `β` resolution, injection in `dataset.py`
       after centring / z-scoring; `syn_effect` / `syn_seed` in `arch.json`
-- [ ] `evaluate.py`: `--syn_effect` / `--syn_seed` on the real oracle;
+      - The resolved injection is `syn_meta.json`: β = 25.483, `v` sha1
+        `492aa3d1`.
+- [x] `evaluate.py`: `--syn_effect` / `--syn_seed` on the real oracle;
       `--truth` refuses mismatches; signed bias along `v` by dose half,
       rare vs non-rare
-- [ ] `build_tiered_split` step-C instance: responders-only scored
+- [x] `build_tiered_split` step-C instance: responders-only scored
       compounds, \(z\) = dose half × `syn_c`, positivity cells (compound,
       dose half, `syn_c`), `keep_frac` 0.4, γ ∈ {0, 1}; `--plan` bias table;
       `dr_weights_design.npz`, `nu_rows.npy`, `tier_meta.json`
-- [ ] Nuisances: `export_urr_weights --mode counts --adjustment_set syn_c`
+      - Both instances are on disk (`nuisances_tier_Csyn_c_k0_g{0,1}_s42`):
+        21,293 / 21,600 train rows, and v1's 10,650 holdout rows in both.
+      - `--plan` prints its table and writes nothing. `tier_meta.json`'s `bias`
+        field still holds its Phase 1 placeholder text.
+      - The control is not size-matched: the realised kept fraction is 0.468 at
+        γ = 0 and 0.498 at γ = 1. Step A's fix for this (`STEP_A.md` D9) covers
+        `cell_id` only.
+- [x] Nuisances: `export_urr_weights --mode counts --adjustment_set syn_c`
       (positivity-cell weights, P12); weights vary in `syn_c` on scored
       compounds, are 1 on unscored ones, and track `dr_weights_design.npz`
       - Decided 2026-09-30 (P12). The cross-fitted net cannot run here. Share
@@ -1831,12 +1931,16 @@ implementation and review".
       - On the limit build's instances the positivity-cell weights track the
         design weights (kept scored rows, γ = 1: mean 2.18 vs 2.07, corr
         +0.83), where (arm, `syn_c`) keys gave means of 1.1–1.3.
-- [ ] `naive` / `conditional` / `dr` (+ `dr_design`) × γ ∈ {0, 1} × ≥2
+      - On `mcf7_24h`, kept scored rows (jobs 798892 and 817859): corr +0.27 at
+        γ = 0 and +0.84 at γ = 1; means 2.16 vs 2.14 and 2.03 vs 2.00. The +0.73
+        and +0.88 quoted in §5 and in the verdict files are over all train rows
+        (§5, status review, gap 5).
+- [x] `naive` / `conditional` / `dr` (+ `dr_design`) × γ ∈ {0, 1} × ≥2
       seeds trained and scored
       - All 24 runs trained and scored 2026-10-01 (3 training seeds, one
-        thinning seed; jobs 828810–828878 on `zabih`). Unchecked until the
-        Phase 5 code review. Results in §5, "Phase 5 step-C results".
-- [ ] Step-C verdict against the §3.8.1 success criteria written up (gate
+        thinning seed; jobs 828810–828878 on `zabih`, all exit 0). Results in
+        §5, "Phase 5 step-C results".
+- [x] Step-C verdict against the §3.8.1 success criteria written up (gate
       for Phase 6)
       - Written up in §5 (2026-10-01). Criteria 1, 3 and 4 pass. Criterion 2
         cannot be tested under step C's injection: the conditional arm is
@@ -1844,22 +1948,35 @@ implementation and review".
 - [ ] **Step C2** (§3.8.4): a step-C variant in which `dr` can beat
       `conditional`, via a compound-specific injection at ρ = 1 (user,
       2026-10-01: option B). **Runs before Phase 6.**
-  - [ ] `synthetic.py --mode compound --rho`: per-compound directions,
+      - The experiment is finished and its verdict is written. The box stays
+        unchecked for the two code sub-items below.
+  - [x] `synthetic.py --mode compound --rho`: per-compound directions,
         `v_sha1` over the whole matrix, ρ = 0 bit-identical to step C;
         `--syn_meta` selects the file (trainer, eval, report, tests)
-  - [ ] `evaluate.py`: injection and vehicle offset per compound;
+  - [x] `evaluate.py`: injection and vehicle offset per compound;
         `bias_along_v` projects each arm on its own v_k; `learned_syn_effect`
         (λ̂); oracle tag `_syn1-cmp1`
   - [ ] `step_c_report`: `--syn_meta` filter, λ̂ columns, criterion 2 judged
         in full (including "close to `dr_design`")
+        - Reviewed 2026-10-05: the labelling, the `SCORING` filter, the
+          duplicate refusal and the DiD arithmetic are correct, and both
+          verdicts match §5. Open:
+          - R9: criterion 1's γ = 0 half is not judged, criterion 4's
+            correlations are constants, and no clustered SE is reported.
+          - R10: admission does not pin the tier instance, the model class or
+            the sampler.
   - [ ] `check_phase5` / `smoke_phase5_torch` / `phase5_gpu.sub` cover the
         compound mode; `phase5_arms.sh` takes the variant
-  - [ ] Injected oracle (CPU) + GPU smoke green, then
+        - Reviewed 2026-10-05. Open:
+          - R11, R12: three checks cannot fail on what they name.
+          - R13: the step-C `--truth` refusal is not exercised.
+          - R14: `phase5_cpu.sub`'s tier-dir glob, and `phase5_arms.sh`'s
+            dependency flag.
+  - [x] Injected oracle (CPU) + GPU smoke green, then
         `naive` / `conditional` / `dr` / `dr_design` × γ ∈ {0, 1} × 3 seeds
         trained and scored on `zabih`
         - The code above is written, reviewed (automated `code-review`; 8 of 10
-          findings fixed, §5) and smoke-tested. Unchecked until the user's
-          review.
+          findings fixed, §5) and smoke-tested.
         - Oracle and checks: CPU job 850257 on `bindel`, 81 checks, 0
           failures. GPU smoke: 850258 on `zabih`, 52 checks, 0 failures.
         - The 24 runs were submitted 2026-10-01 with
@@ -1869,33 +1986,43 @@ implementation and review".
         - The first scoring wave crashed on a wrong BLAS (§5) and was
           cancelled. It was rescored on the fixed scripts: 854859 and
           856859–856968, all 24 exit 0.
-  - [ ] Verdict against §3.8.4's success criteria written up (gate for
+  - [x] Verdict against §3.8.4's success criteria written up (gate for
         Phase 6)
         - Written up in §5, "Step C2 results" (2026-10-02). Criteria 1, 3 and 4
           pass; **criterion 2 fails**: `dr` over-corrects (+0.58 against
           `conditional`'s −0.28), from arm-level Hájek bias of cell-level
-          weights. Whether Phase 6 proceeds is the user's decision.
-        - **Resolved by P1** (§5, "P1 results", 2026-10-05): the same weights
+          weights.
+        - **That mechanism is not established** (§5, status review, gaps 1 and
+          2). The whole gap is a difference in λ̂ between the dose halves, and
+          `conditional`'s −0.28 is its γ = 0 control's +0.32. The DiD values and
+          the FAIL do not change.
+        - **Resolved by P1** (§5, "P1 results", 2026-10-04): the same weights
           spent on the estimand instead of the training risk remove
           essentially all of the bias, so the failure was *where* α was
           applied, not α itself.
-- [ ] **P1 — post-hoc DR targeting** (`understand.md` §3.3.1), the response to
+        - Phase 6 proceeded on the user's instruction (2026-10-05; §5, "Step A
+          launch").
+- [x] **P1 — post-hoc DR targeting** (`understand.md` §3.3.1), the response to
       C2's criterion-2 failure: stop weighting the training risk, keep the
       unweighted generator as the outcome model, and spend α only on an AIPW
       correction to the estimand at the group where positivity holds —
       g = the positivity cell with the confounder dropped
       (`splits.target_groups`).
-  - [ ] `src/eval/dr_target.py` (the estimator, numpy only, post hoc over
+  - [x] `src/eval/dr_target.py` (the estimator, numpy only, post hoc over
         finished scoring runs), `src/tests/check_p1.py`,
         `scripts/p1_target_cpu.sub`, and `step_c_report`'s `--dr_arm` /
         `--design_arm` / `--baseline_arm` so a targeted arm can be judged by
         the same four criteria without moving the existing verdicts
-  - [ ] Targeted arms: `conditional` **and `naive`** sources × {`counts`,
+        - Reviewed when written (automated `code-review`; five findings, all
+          fixed, §5). Not reviewed again on 2026-10-05.
+  - [x] Targeted arms: `conditional` **and `naive`** sources × {`counts`,
         `design`} = `p1_{cond,naive}_{counts,design}`, plus the `ones`
         α-sensitivity control. `naive` is the textbook double-robustness case
         (outcome model blind to the confounder, α correct) and fills the 2×2
         corner the retired "Option A" was to provide
-  - [ ] **Success**, judged by §3.8.4's criteria with `--dr_arm
+        - 48 targeted documents on disk: 36 on C2 (2 sources × 3 weight sets ×
+          6 runs) and 12 on step C (2 sources × `counts` × 6 runs).
+  - [x] **Success**, judged by §3.8.4's criteria with `--dr_arm
         p1_cond_counts --design_arm p1_cond_design` (and the `naive` family
         against `--baseline_arm naive`), plus three controls that must all
         hold: the step-C NULL (where `conditional` is already unbiased, so the
@@ -1903,14 +2030,42 @@ implementation and review".
         (`ones` must be far WORSE than `counts` — the evidence that P1 is not
         fitting the statistic with one free parameter per group), and the
         unscored negative control
-  - [ ] Read on `--pool holdout` as well as `all`: δ is built from train rows
+        - All three controls are asserted by `check_p1` (job 964812, ALL CHECKS
+          PASSED).
+  - [x] Read on `--pool holdout` as well as `all`: δ is built from train rows
         and the `all` oracle shares those wells, so the holdout (three disjoint
         row sets) is the leakage diagnostic for the absence of cross-fitting
-  - [ ] Verdict written up in §5; if it passes, P1 goes into Phase 6 beside the
+  - [x] Verdict written up in §5; if it passes, P1 goes into Phase 6 beside the
         weighted arm and step A compares the two
         - **PASSED** (2026-10-04), see §5 "P1 results". All four criteria in
-          both families, on `--pool all` and `holdout`. Unchecked pending the
-          user's review.
+          both families, on `--pool all` and `holdout`.
+        - Those margins are in seed sd. The `naive` family is decisive on any
+          error (−1.93 → −0.001). The `cond` family's paired gain over
+          `conditional` has no clustered error yet (open item below).
+- [x] **P2 — group-normalised, capped weights in the training risk**
+      (`understand.md` §3.3.2; `STEP_A.md` §4, track B, where it is tracked as
+      B1–B5): six `dr_p2` runs on step C2
+      - Code: `src/nuisances/weight_norm.py`, `--dr_weight_norm` /
+        `--dr_weight_clip`, `step_c_report`'s `dr_p2` arm and `p2_pass_rule`,
+        `src/tests/check_p2.py`, `scripts/p2_gpu.sub`. Written and reviewed
+        2026-10-05 (§5, "P2 implementation and review").
+      - GPU smoke 990819; training 990856–990866 and scoring 990857–990867 on
+        `zabih`, all exit 0.
+      - **Pass rule: FAIL on the third part** (|DiD| 0.599 against ≤ 0.58).
+        The other two parts pass: λ̂ on unthinned compounds 0.67, and MSE
+        1.05× `conditional`'s (§5, "P2 results").
+      - User decision 2026-10-05: override. `dr_p2` runs in step A next to
+        `dr` (`STEP_A.md` D8).
+- [ ] **Open (status review, 2026-10-05): put the C2 readout on firm ground**
+      (§5, status review, gaps 1 and 2)
+      - Report λ̂ by dose half and the γ = 0 contrasts next to every DiD, and
+        split each DiD into its λ term and its remainder.
+      - Replace the seed sd with a compound-clustered error
+        (`src/eval/contrast_stats.py`), on both pools and for the paired
+        `p1_cond_counts` − `conditional` difference.
+      - Move the one-off analyses into the repo: the memoriser's DiD, the
+        tables by kept train wells, the λ slope, the MSE orthogonal to v.
+      - All of it is CPU work on the saved `_tau.npz` and `_gen.npz` files.
 
 ### Phase 6 — step A: cell line on `core5_24h` (§3.8.3)
 
@@ -1942,18 +2097,23 @@ implementation and review".
         median over the 6 pairs among the four unselected lines.
 - [ ] `--population` switch; `core5_24h` paths; `PopulationSpec.name` in
       every artifact and result
-      - **Not written yet**, and it is what blocks every remaining Phase 6
-        item: `PopulationSpec.name` and `Paths(population=...)` exist, but no
-        CLI selects a population, so `build_dataset` can only build
-        `mcf7_24h`. The gate above was written to need none of it.
+      - **Written 2026-10-05** (`spec.POPULATIONS`, `--population`; §5, "Step A
+        implementation and review"). A command needs only `--data_dir`: the
+        build names its own population, and a contradicting `--population` is
+        refused. Smoke-tested on a `--limit` build; no full build yet.
 - [ ] Ingest, plate QC (per-line median), splits, `expr_stats`, Phase 4
       oracle and `responders.json` for `core5_24h`
-      - Blocked on the `--population` switch, and gated on the result above:
-        §3.8.3 says to measure before building. Scale (§3.8.3): ~183k rows,
-        ~9 GB from the GCTX, a CPU job.
+      - Unblocked 2026-10-05: `scripts/phase6_cpu.sub` runs this and the two
+        items below as one CPU job. Done on a `--limit` build only (2 whole
+        plate maps, 11,904 wells); the full build (182,919 wells before QC) is
+        not run yet. The ingest reads landmark genes only, so it needs far less
+        than the ~9 GB §3.8.3 quotes.
 - [ ] `build_tiered_split` step-A instance: positivity cells (compound,
       `dose_level`, `cell_id`), `keep_frac` 0.6; line groups declared in
       `spec.py`
+      - Written 2026-10-05; line groups are `spec.LINE_GROUPS`
+        (`STEP_A.md` D3). **`keep_frac` is the realised fraction here, default
+        0.75** (`STEP_A.md` D9, approved 2026-10-05; §5).
 - [ ] Nuisances: `export_urr_weights --mode counts --adjustment_set cell_id`
       (weights at (arm, `cell_id`), P12); weights track `dr_weights_design.npz`
 - [ ] `naive` / `conditional` / `dr` (+ `dr_design`) × γ ∈ {0, γ>0} × ≥2
@@ -1962,9 +2122,10 @@ implementation and review".
         change for step A — the group is derived from `POSITIVITY_KEYS`, and
         for `cell_id` it is the arm itself. That is the resolution C2 showed
         the weighted risk cannot reach, so step A is where the two approaches
-        should separate on real data. Watch the degeneracy: at arm level the
-        group holds ~2 train rows per line, so n_eff ≈ 2 against the ≈ 6 that
-        step C2 had, and δ_g is correspondingly noisier.
+        should separate on real data. The group is the arm pooled over its
+        lines: ~10 train wells before thinning, 7–8 after (n_eff 7–9 measured
+        on the limit build), so δ_g is no noisier than in step C2. (An earlier
+        note here said n_eff ≈ 2; that was the (arm, line) cell, not the group.)
 
 ### Phase 7 — optional
 
@@ -2295,6 +2456,14 @@ recomputes pi, the positivity cells and the design weights from the table:
   at gamma = 1 there is real variation to track. This is §3.8.1's success
   criterion 4, measured on the full population for the first time (the limit
   build gave +0.83 at gamma = 1).
+- **Corrected 2026-10-05 (status review, §5).** +0.73 and +0.88 are
+  correlations over *all* train rows, including the ~16.6k unthinned and vehicle
+  rows where both weights are exactly 1. On the kept scored rows, where the
+  weights vary, `check_phase1` and `export_urr_weights` print **+0.273**
+  (gamma = 0, 4,662 rows) and **+0.840** (gamma = 1, 4,941 rows) in both jobs of
+  record (798892 and 817859). The limit build's +0.83 is on kept scored rows, so
+  the like-for-like comparison is +0.840 against +0.83. The reading stands, and
+  gamma = 0's +0.27 fits it better than +0.73 did.
 
 
 ### Phase 5 code (B2–B7) implemented 2026-10-01
@@ -2459,6 +2628,10 @@ fraction of the attainable ceiling (E11's Spearman–Brown lift).
    marginally worse on `--pool all` (0.778 vs 0.792) and on the holdout (0.441
    vs 0.451) -- for **49x the eval compute** (21,147 s vs 428 s). That supports
    decision 4's choice of the MLP as the headline backbone.
+   - **Qualified 2026-10-05** (§5, status review). On §3.7's per-compound
+     holdout aggregate the DiT is 0.013 ahead (0.509 against 0.496). With one
+     seed and no error bar the backbones are tied on held-out τ; the compute
+     argument is unchanged.
 4. **cmean (E9): no.** On the holdout, λ = 0.1 moves the responder cosine
    +0.016 on the MLP and −0.001 on the DiT, while Spearman falls on both
    (0.626 → 0.612, 0.630 → 0.619). E9 required a tau gain with no loss of
@@ -2786,6 +2959,13 @@ Diagnostics:
 - `naive`'s leak onto unscored compounds was predicted to vanish. It did not:
   −0.29, 15% of its scored DiD (step C: 8%).
 
+**Read with the status review of 2026-10-05** (§5, "Phase 4 and Phase 5 status
+review", gaps 1 and 2). The DiD values and the criteria above stand. The
+mechanism in findings 2, 3 and 6 is not established: the whole `dr` −
+`conditional` gap is a difference in λ̂ between the dose halves. Finding 1's
+−0.28 is `conditional`'s γ = 0 control (+0.32) subtracted from a γ = 1 contrast
+of +0.04.
+
 Findings:
 
 1. **C2 achieved its first aim: `conditional` is now biased.** Its DiD is
@@ -3045,3 +3225,624 @@ resolution in step A with no new code. It should be scored there beside the
 weighted arm. Note the regime differs: with ~2 train rows per (arm, line) cell
 the effective sample size per group falls from ~6 to ~2, which is where the
 added-variance cost in finding 6 would bite hardest.
+
+### P2 implementation and review (2026-10-05)
+
+Code for `STEP_A.md` §4 (track B): the weighted risk with weights normalised
+within each target group and capped. Written after the plan and its pass rule
+were fixed, and before any P2 result.
+- New: `src/nuisances/weight_norm.py`, `src/tests/check_p2.py`,
+  `scripts/p2_gpu.sub`.
+- Changed: `train_diffusion.py` (`--dr_weight_norm`, `--dr_weight_clip`),
+  `step_c_report.py` (the `dr_p2` arm and the pass rule),
+  `scripts/phase5_arms.sh` (the `dr_p2` arm; final checkpoint only).
+- **Local checks** (numpy only, torch unimportable): `check_p2` on synthetic
+  weights and on both tier instances' real weights; `step_c_report` with its
+  defaults still reproduces `step_c_verdict.json` and
+  `step_c_verdict_compound_r1.json` (criteria and judged arms identical).
+- **GPU smoke** (job 990819, `zabih`, 2 min 30 s): 50 checks, 0 failures.
+
+| Change | Why |
+|---|---|
+| `weight_norm.group_normalize`: every target group (`splits.target_groups`) sums to its row count; the cap is met **exactly** with the group total preserved, by capping and letting the group's other rows carry the rest until none exceeds it | `STEP_A.md` D6. A one-shot "cap, then renormalise" leaves weights above the cap. A row whose raw weight is 1 comes out at exactly 1.0, which is what "unthinned compounds are untouched" needs |
+| The groups are derived on the **whole table** and indexed by the train rows (`weight_norm.train_groups`) | `dose_half` ranks a compound's distinct dose levels, so a subset that lost a level shifts its halves. This is the bug `dr_target` had ("P1 implementation and review") |
+| The default path is untouched: `--dr_weight_norm global` with no cap runs the old line of code, and `arch.json` records `None` for every P2 field | Bit-identical weights for every existing arm, and old runs still resume and still read as `dr`. The smoke asserts both |
+| `arch.json`: `dr_weight_norm`, `dr_weight_clip` and the integer counts (`dr_weight_groups`: groups, capped rows, rows at exactly 1) are resume identity; the float summaries (`dr_weight_stats`: ESS, max) are not | Review: the floats can differ in the last bits between CPU types (as the direction matrix did in step C2), but the counts are exact and would move if the grouping or the cap routine changed under a resumed run |
+| An **infeasible cap is refused** | Review, confirmed: with zero-weight rows a group's positive rows can be too few to carry its row count at the cap (`[1, 0, 0, 0]`, cap 2). The first version returned the group short of its total without an error |
+| `step_c_report.arm_label`: a weighted run is `dr` only with the global normalisation and no cap, `dr_p2` only with group normalisation and the cap `weight_norm.P2_CLIP`; any other combination is not an arm | Without it a P2 run would have been labelled `dr` and collided with the recorded cell. An ablation at another cap cannot fill either cell, and the skip message now says why |
+| The P2 pass rule is judged in the report (`p2_pass_rule`), only on the C2 injection and `--pool all`, and it includes the `dr_p2` runs' weight-hash check | Review: the thresholds come from C2's numbers, so applying them to step C would be meaningless; and `dr_p2` is outside criterion 4's judged set, so its weight provenance was not being checked at all |
+| The cap is written once, `weight_norm.P2_CLIP = 5.0`; the launcher, the smoke and the report read it | Review: three copies could drift, and a run at another cap would have vanished from the report without a message |
+| `scripts/phase5_arms.sh`: `CKPT_EVERY` defaults to `$EPOCHS` | `STEP_A.md` D2: only the final checkpoint is ever scored. Pass `CKPT_EVERY=100` on the preemptible `gpu` partition |
+| The smoke compares the trainer's recorded counts with an independent recompute (plain loops over (compound, dose half)), asserts the cap binds, and checks the trainer's exit status | Review: three of its first assertions could not fail, among them "weight exactly 1" checked on the script's own numbers. `arch.json` is written before the first step, so its presence alone did not show that training ran |
+
+Review findings not acted on: the trainer's log line still uses its own ESS
+helper next to `knn_dr.ess` (same formula; `weight_norm` now uses the shared
+one).
+
+**What the normalisation does to the real weights** (`check_p2`, counts, γ = 1;
+the smoke's trainer log agrees to every digit):
+
+| | global (`dr`) | group + cap 5 (`dr_p2`) |
+|---|---|---|
+| weight of an unthinned or vehicle row | 0.809 | exactly 1 |
+| share of total weight on scored rows (23.4% of rows) | 38.0% | 23.4% |
+| largest weight | 17.80 | 5.00 |
+| ESS / n | 0.678 | 0.921 |
+| `syn_c` mix of a scored group against the unthinned pool, mean error | 0.0000 | 0.0004 |
+
+- **The cap hardly binds:** 4 rows in 4 groups at γ = 1, none at γ = 0 (the
+  largest group-normalised weight is 7.49). P2 is in effect the group
+  normalisation; the cap is a guard.
+- **The confounder balance inside each group is kept**, so the weights still
+  do the job they are for.
+- **The reallocation it removes is a 19% down-weighting** of 16,542 unthinned
+  and vehicle rows. That is smaller than the loss it is meant to explain (λ̂ on
+  unthinned compounds 0.72 → 0.14), so the lower weight noise (ESS 0.68 →
+  0.92) may matter as much. The six runs decide.
+- The design weights do not balance `syn_c` within a group under either
+  normalisation (mean error 0.078 at γ = 1), which is the P1 finding again.
+
+**Launched 2026-10-05:** `VARIANT=c2 ARMS=dr_p2 bash scripts/phase5_arms.sh`,
+training 990856–990866 (even IDs), each scored by the next ID, on `zabih`
+(3 of 6 A6000s free at submission). Run dirs `stepc2_dr_p2_g<γ>_s<seed>`. The
+verdict comes from `step_c_report --syn_meta syn_meta_compound_r1.json`.
+
+### P2 results: the generator is repaired, the bias is not (2026-10-05)
+
+Six `dr_p2` runs on step C2 (`stepc2_dr_p2_g{0,1}_s{0,1,2}`; training
+990856–990866, scoring 990857–990867, all 12 exit 0 on `zabih`), scored at the
+§3.14 settings on `--pool all`. Verdict in
+`runs/mcf7_24h/eval_artifacts/step_c_verdict_compound_r1.json`
+(`p2_pass_rule`). The clustered errors and the split by kept-train status below
+were computed locally (numpy, `OPENBLAS_CORETYPE=Haswell`) from the `_tau.npz`
+files.
+
+**Pass rule (`STEP_A.md` §4, fixed before the runs): FAIL, on the third part.**
+
+| Metric | `conditional` | `dr` | `dr_p2` | needed | |
+|---|---|---|---|---|---|
+| learned share λ̂ on unthinned compounds | 0.720 | 0.143 | **0.666** | ≥ 0.60 | pass |
+| pooled gene MSE, relative to `conditional` | 1.000 | 1.288 | **1.054** | ≤ 1.10 | pass |
+| \|DiD\|, scored | 0.279 | 0.575 | **0.599** | ≤ 0.58 | **fail** |
+
+By `STEP_A.md` §4, a failed rule drops `dr_p2` from the step-A matrix. Whether
+to override that is the user's decision; the facts for it are below.
+
+**Read with the status review of 2026-10-05** (§5, gap 1). Finding 5's "arm-level
+ratio bias" is not established. `dr_p2`'s learned share still differs between
+the dose halves at γ = 1 (0.415 low, 0.472 high). That term alone is +0.71,
+against a DiD of +0.60; the remainder is −0.11, as in `conditional`. The pass
+rule's outcome and the user's override stand.
+
+Findings:
+
+1. **P2 repairs what the global normalisation broke.** On unthinned compounds
+   the learned share recovers from 0.14 to 0.67 (0.70 at γ = 0, 0.63 at γ = 1),
+   against `conditional`'s 0.72, and the MSE excess over `conditional` falls
+   from +29% to +5%. So the degradation was the normalisation: the weights
+   moving mass between groups, and the weight noise that came with it.
+2. **The over-correction is unchanged.** DiD +0.599 ± 0.016 (seed sd), against
+   `dr`'s +0.575 ± 0.046. Per seed: 0.583, 0.598, 0.615.
+3. **The failed part is a miss by 0.019, well inside the noise.** With errors
+   clustered on the 641 scored compounds (jackknife, seeds averaged):
+   `dr_p2` +0.599 ± 0.054, `dr` +0.575 ± 0.072, and the paired difference is
+   +0.023 ± 0.055, or 0.4 SE. `dr_p2` is not distinguishable from `dr` on bias.
+   Against `conditional` it is clearly worse (|DiD| +0.32 ± 0.08 higher).
+4. **The rule had no noise allowance, which was a flaw in the rule.** The
+   threshold 0.58 was `dr`'s own value, rounded. "No worse than `dr`" should
+   have been written as "not worse by more than 2 SE"; under that reading the
+   third part passes. The rule is reported as declared all the same.
+5. **The two C2 problems are now separated.** P2 removes the generator's
+   degradation and leaves the bias where it was, so the over-correction is not
+   a side effect of a damaged generator. It is the arm-level ratio bias of
+   "Step C2 results", finding 3, and it shows the same signature. DiD by the
+   arm's kept train wells at γ = 1 (mean of 3 seeds):
+
+   | arm | none | one `syn_c` level | both levels | all |
+   |---|---|---|---|---|
+   | `conditional` | +0.53 | −0.41 | −0.43 | −0.28 |
+   | `dr` | −0.13 | +0.50 | +1.23 | +0.58 |
+   | `dr_p2` | −0.05 | +0.61 | **+1.05** | +0.60 |
+
+6. **What this means for step A.** There the target group is the arm itself,
+   so the within-group balance the weights provide is at the resolution the
+   generator fits, and the ratio bias of finding 5 has nowhere to arise. The
+   degradation of finding 1 does carry over: it comes from the global
+   normalisation, which step A's `dr` arm would still use. On mechanism,
+   `dr_p2` is therefore the better-founded weighted arm for step A, although
+   it failed the rule as written.
+
+**Decision (user, 2026-10-05): override.** `dr_p2` runs in step A next to
+`dr` (`STEP_A.md` D8), on the grounds of findings 3, 4 and 6. The pass rule's
+recorded outcome stays FAIL.
+
+### Step A implementation and review (2026-10-05)
+
+Code for `STEP_A.md` track A (A0 and A7), written after its plan and criteria,
+and before any step-A result. Nothing has run on the full `core5_24h`
+population: everything below is from a `--limit` build (2 whole plate maps,
+11,904 wells on 32 plates, 110 compounds, 103 of them scored).
+
+- **New:** `src/eval/{contrast_stats,step_a_power,step_a_report}.py`,
+  `src/tests/{check_phase6,smoke_phase6_torch}.py`,
+  `scripts/{phase6_cpu,phase6_gpu,phase6_p1_cpu,regress_mcf7_cpu}.sub`,
+  `scripts/phase6_arms.sh`.
+- **Changed:** `spec.py`, `build_dataset.py`, `splits.py`,
+  `build_tiered_split.py`, `responders.py`, `evaluate.py`, `dr_target.py`,
+  `step_c_report.py`, `check_build.py`, `check_phase1.py`, `check_phase4.py`,
+  `scripts/train.sub`.
+- **Jobs of record:**
+  - 991752 (`bindel`, 64 s): the whole data layer on a fresh limit build.
+    203 checks, 0 failures.
+  - 991753 (`zabih`, 3 min 40 s): the GPU smoke. 29 checks, 0 failures.
+  - 991754 (`bindel`, 3 min 24 s): the `mcf7_24h` regression. Every check
+    passes.
+- `ma` was at 4% of its memory unallocated, so every CPU job went to `bindel`.
+
+| Change | Why |
+|---|---|
+| `spec.POPULATIONS` and `--population`; `apply_paths_args` adopts the population a `--data_dir` build records and refuses a contradicting flag; `splits.table_fingerprint` refuses a config whose population is not the build's | One flag cannot point a command at the wrong table, and every existing command line keeps working with `--data_dir` alone. No field was added to `PopulationSpec`, whose `asdict` is embedded in `decisions_record`: the `mcf7_24h` build's decisions still compare equal (regression job) |
+| A population with more than one line keeps only compounds with a treated well in every line, after plate QC (`build_dataset.common_compound_rows`); its `--limit` keeps whole plate *maps* | §3.8.3. On the full population the rule drops nothing: all 1,750 compounds are in all five lines before QC (counted from `inst_info`). Whole maps keep each smoke-build compound in each line |
+| `spec.LINE_GROUPS`: G1 = {MCF7, HT29, PC3}, G2 = {HA1E, A375}. Recorded in `population_qc.json`, the tier dir tag (`…_G2-A375-HA1E`), `splits.json` (tier and params), `arch.json` and the oracle | `STEP_A.md` D3, declared before any step-A result |
+| `build_tiered_split`, `cell_id`: `z_C` from the line groups; cells are (dose level, line); the positivity redraw is **per cell** | With ~30 cells of ~2 wells per compound, redrawing the whole compound until every cell keeps a well would take ~10³–10⁵ draws. Cells are independent, so the per-cell redraw has the same distribution. Step C keeps its whole-compound loop, and an existing step-C instance still reads as "same parameters" (regression job) |
+| **`--keep_frac` for `cell_id` is the expected *realised* kept fraction, default 0.75** (`_calibrate_pi_realised`: the scale of π is set by bisection so that Σ πᵢ / P_cell = keep_frac · n). `STEP_A.md` D9, approved by the user 2026-10-05 | Review. With 2-well cells the redraw moves the realised fraction far from the nominal one, and by a γ-dependent amount: at nominal 0.6 the γ = 0 control kept 68.0% and γ = 1 kept 73.9%, so the control was not size-matched. After the change: 74.9% and 74.8%. 0.75 is about what nominal 0.6 produced at γ = 1 and near the strongest lever a 2-well cell allows; a realised 0.6 would be matched too, with a lever about 5× weaker |
+| `responders --confounder cell_id`: a compound is thinnable when every dose level has a train well in every line | The builder refuses a whole instance over one unthinnable compound (as in step C). Limit build: 103 of 108 responders |
+| The oracle stores each arm's G2 − G1 contrast twice: over the pool's wells (`contrast`, descriptive) and over its **holdout wells only** (`contrast_dir`, the readout's direction) | See the next row. Per-line τ̂ is not stored: nothing reads it |
+| **The readout's direction comes from holdout wells** (`evaluate.bias_along_contrast`) | Review, confirmed on the limit build. With a direction from the pool's own wells, an estimator that copies noise from its kept train wells projects on a direction built from those wells, and that term scales with the mix shift Δp. It is not removed by the γ = 0 control, because Δp is what γ switches on. The data-level bias read **−5.59** that way and **−1.69** with the holdout direction, so it was inflated ~3.3×, and S0 could have passed with no line effect at all. `STEP_A.md` §3 is corrected |
+| `contrast_stats`: every error is a delete-one-compound jackknife, from per-compound sums | `naive` has one seed, and seeds share one thinning draw ("P1 results"). Checked against a brute-force jackknife (identical) and by Monte Carlo with compound-level effects (mean SE / true sd = 0.97; the arm-level SE understates it) |
+| `step_a_power` (S0): the memoriser of each arm's kept train wells, with the report's statistic. Also `planned` (mix shift × the contrast over unthinned train wells) and the weighted memorisers | S0 must be read before any GPU job. `planned` shares no outcome noise with the memoriser, so their agreement is a cross-check |
+| `step_a_report`: S1–S5, arms labelled from `arch.json` (`arm_label(arch, "cell_id")`), P1 documents as their own arms, admission by scoring settings, population, oracle and line groups; duplicates refused; S2 is a testability flag (`not_testable`), never a failed criterion | `STEP_A.md` §3. Review: the first version recorded an untestable S2 as FAIL |
+| `dr_target` carries the step-A readout through the correction, and its reproduction guard covers it | P1's targeted documents must be judged by the same statistic. `STEP_A.md` had said "no code change expected" |
+| `phase6_arms.sh` launches only if S0 passed **on the tier instances it is about to train on** (split fingerprints compared); `FORCE=1` overrides | Review: a rebuilt tier with a stale `step_a_power.json` would have been waved through, and the message named a `FORCE` that nothing read |
+| `build_tiered_split.tier_dir` and `--print_out_dir` are the one definition of a tier dir's name | Review: the name was rebuilt by hand in five places |
+| `scripts/train.sub`: `AUTO_RESUME` / `PRUNE_CKPT`, set by the launcher on a preemptible partition only | Review: the `gpu` fallback had no resume path, so a requeued run would have died on "already holds checkpoints" and blocked its scoring job. The shell logic is tested on dummy directories; a real preempt-and-resume cycle is not |
+| `check_phase4`: the QC arm counts and the responder band are skipped on a multi-line population | Both are single-line quantities: QC counts (line, compound, dose) arms, while the estimand's arm pools the lines; the band is MCF7's ~29% at 3 wells per arm. First limit run: 2 false failures |
+| `regress_mcf7_cpu.sub` | The population switch touches every stage, so the MCF7 results are re-derived after it: both oracles rebuilt into scratch (24 arrays each, bit-identical; every recorded JSON value reproduced), both step-C verdicts reproduced, `check_build` / `check_phase1` (base and both tiers) / `check_phase4` / `check_phase5` / `check_p1` / `check_p2` all pass |
+
+Review findings not acted on: the (dose level, line) cell key is still written
+in three formats (the builder, the responder screen, and `check_phase1`'s
+independent recompute). `check_phase1` and `check_phase6` verify the outcome
+(every cell keeps a well; weights = n_unthinned / n_kept per cell).
+
+**Measured on the limit build** (103 scored compounds, 618 scored arms; these
+size the experiment and are not results):
+
+| | value |
+|---|---|
+| kept fraction of scored train wells, γ = 0 / γ = 1 | 0.749 / 0.748 |
+| shift of the G2 share among kept wells at γ = 1, low / high dose half | +0.18 / −0.13 |
+| scored arms with a holdout-well direction | 607 of 618 |
+| corr(counts, design weights) on kept scored rows, γ = 0 / γ = 1 | +0.10 / +0.72 |
+| line effect per unit of that shift, ⟨c_train, u⟩ | 5.45 |
+| **S0: bias in the training data** (memoriser DiD) | **−1.69 ± 0.16 (10.8 SE)** |
+| the same from the line mix alone (`planned`) | −1.63 ± 0.13 |
+| memoriser, counts weights | +0.01 ± 0.09 |
+| memoriser, design weights | −0.10 ± 0.10 |
+| counts-weighted G2 share of each scored arm against its unthinned share | equal to 1e-08 |
+| scoring, host memory (11.9k rows, quality block on) | 2.2 GB |
+
+- **The weights can work at the arm level here.** The counts weights restore
+  every scored arm's unthinned line mix exactly, and the counts-weighted
+  memoriser has no bias left. In step C2 the same weights over-corrected at the
+  arm level ("Step C2 results", finding 3); that mismatch is absent in step A
+  by construction.
+- **P2's group normalisation keeps that balance** and leaves every unthinned
+  row at exactly 1 (`check_phase6`); the cap does not bind on the limit build (max weight 4.0; on the full build it binds on 2 rows, see "Step A launch").
+- **Two code paths agree.** P1's flat-weight control on an untrained generator
+  is a memoriser, and the GPU smoke's report gives it −1.690 ± 0.157 against
+  `step_a_power`'s −1.688 ± 0.156. P1 with the counts weights gives
+  +0.015 ± 0.090 against the counts-weighted memoriser's +0.011 ± 0.087.
+- **P1's groups are larger than feared.** The group is the arm pooled over its
+  lines: n_eff 7–9 here, not the ~2 that "P1 results" expected for step A.
+- **Not yet known:** how much of the data-level bias a trained `naive`
+  generator shows (65% in step C, 18% in C2), the scoring memory on the full
+  build, and whether the full population's S0 passes. On the full population
+  the SE falls with ~6× the compounds, but so may the effect (next entry).
+
+### Track B re-read for step A; approvals (2026-10-05)
+
+**Approved by the user:** the holdout-well direction of the readout
+(`STEP_A.md` D10) and `keep_frac` as the realised fraction, 0.75 (D9).
+
+Track B is the six `dr_p2` runs of "P2 results"; nothing else ran. Read again
+for what it implies about step A:
+
+| Adjustment | Why |
+|---|---|
+| **S4 has a noise allowance** (`STEP_A.md` D11; `step_a_report`): an arm fails it only if its unscored DiD is above a quarter of `naive`'s scored bias **and** more than 2 SE from zero | The P2 rule failed on a threshold with no noise allowance (finding 4). S4 had the same shape, and on the GPU smoke's untrained arms it failed on differences of 1e-5. Re-run on those artifacts: it passes, with every arm within 2 SE of zero. S1–S3 already carried SE margins |
+| `step_a_report` prints, per arm, the MSE relative to `conditional` and the learned line contrast on scored **and unscored** compounds | Track B's damage to the generator showed on unthinned compounds and in the MSE, not in the bias column |
+
+No change to the arms, the data layer or the launch sequence.
+
+**The limit build overstates what the full population will show.** It is the
+first two plate maps, LJP005 and LJP006 (the kinase-inhibitor library):
+
+| | LJP compounds | REP compounds |
+|---|---|---|
+| share of the `core5_24h` population | 16% (273) | 84% (1,477) |
+| responders on MCF7 at 3 wells per arm | 96.7% | 26.2% |
+
+- The limit build's S0 (−1.69, 10.8 SE) comes from the most active sixth of
+  the compounds, so it cannot be scaled to the full population by the number
+  of compounds. The full build's own S0 decides.
+- It also made the scored share look extreme: 98% of the limit build's
+  compounds are responders. A rough projection from the MCF7 oracle (floor at
+  15 wells ≈ 6.5; a compound responds if its true ‖τ‖ exceeds ≈ 7.2) puts one
+  half to two thirds of the full population in the scored set. So step A
+  should keep a sizeable unthinned group, which S4 and the unscored diagnostics
+  need. That projection uses 3-well estimates and is rough.
+- With the global normalisation, unthinned rows sit at 0.78 on the limit tiers
+  (C2: 0.81), so the mechanism that damaged `dr` on C2 is present in step A,
+  and `dr` against `dr_p2` remains an informative comparison.
+
+#### Step A launch: full data layer, S0, GPU smoke (2026-10-05)
+
+Launched on the user's instruction. Nothing in the code changed for the launch.
+
+| Job | What | Partition | Result |
+|---|---|---|---|
+| 992724 | `phase6_cpu.sub`: build, base split, oracle, responders, tiers γ = 0 and 1, S0, `check_phase6` | `bindel` (15 GB; `ma` had 4% memory unallocated) | all checks pass; 6 min 30 s; peak 2.5 GB |
+| 992778 | `phase6_gpu.sub data/core5_24h`: the end-to-end smoke on the full build | `zabih` (32 GB requested) | all checks pass; 24 min; scoring peak 9.0 GB |
+| 993188–993215 | 14 × (train → score), `phase6_arms.sh` | `zabih`, 16 GB each | running |
+| 993216 | P1 + `step_a_report`, after every scoring job | `bindel` | pending |
+
+**The full population** (`data/core5_24h`, table fingerprint `95680ff4c5ad23f0`):
+
+- 182,174 wells on 494 plates; 1,750 compounds, every one with a treated well in
+  all five lines. Plate QC dropped 2 plates (745 wells).
+- 891 responders at 1.5× the floor (the pooled oracle, 10,484 arms); 848 pass
+  the thinnability screen and are the scored set. 902 compounds are not thinned.
+- Tiers keep 0.747 (γ = 0) and 0.751 (γ = 1) of the scored compounds' train
+  wells, so the control is size-matched. At γ = 1 the G2 share moves +0.145 in
+  the low dose half and −0.136 in the high half.
+
+**S0, the power gate: PASS.**
+
+| Quantity | DiD ± clustered SE |
+|---|---|
+| memoriser (the bias in the training data) | −0.941 ± 0.052 (18.2 SE; needs ≥ 5) |
+| planned (line-mix shift × the arm's own line contrast) | −0.917 ± 0.043 |
+| memoriser, counts weights | −0.046 ± 0.031 |
+| memoriser, design weights | −0.047 ± 0.035 |
+
+- The effect is 56% of the limit build's (−1.69), as its LJP-only composition
+  predicted, and the error is a third of it.
+- The counts weights remove 95% of the data-level bias; what is left is 1.5 SE
+  from zero. This is the arm-level property step C2 lacked.
+- An arm that learned all of the planted bias would show ≈ −0.94. Step C2's
+  `naive` learned 18% of its data-level bias and step C's 65%; here those
+  fractions would be −0.17 and −0.61, which are 3 and 12 SE. So S1 is not
+  guaranteed: it depends on how much a trained `naive` picks up.
+
+**P2's cap binds on the full build.** At γ = 1, 2 rows reach the cap of 5.00,
+and one arm's weighted G2 share is off by 0.058; every other arm is balanced
+to 1e-8. The earlier note that the cap never binds in step A came from the
+limit build. It is 2 of 114,222 training rows, so the readout is unaffected.
+
+**The smoke on the full build** repeats the limit build's checks (roles, CFG
+keeps the line, refusals, eight legs, scoring, P1, report, cross-population
+refusal). On its untrained generators the flat-weight P1 control reproduces the
+memoriser (−0.942 ± 0.052) and P1 with the counts weights gives −0.038 ± 0.032,
+so the P1 pipeline and `step_a_power` agree on the full population. Its eight
+run dirs `runs/core5_24h/p6smoke_992778_*` and
+`eval_artifacts/step_a_verdict_smoke_992778.json` are not results.
+
+**Other users' jobs are no longer visible** (`PrivateData` includes `jobs`), so
+preemptibility on `zabih` cannot be read from `squeue`. `sbatch --test-only`
+reports the start time and the jobs it would preempt, and is now the
+availability check.
+
+### Phase 4 and Phase 5 status review (2026-10-05)
+
+Asked for by the user: where Phases 4 and 5 stand, which §4 boxes can be
+checked, and what is missing. Nothing ran on a GPU and no code changed (the
+step-A jobs 993188–993216 were running from this tree).
+
+**What was checked.**
+- Every artifact of record, read back from disk: the three oracles, the 12
+  Phase 4 arm JSONs, the step-C data layer, all 54 step-C / C2 / P2 run dirs
+  (`arch.json` and scoring JSON), the 48 P1 documents and the six verdict files.
+- Every §5 table that comes from a JSON, recomputed from it: "Phase 4 results",
+  "Phase 5 step-C results", "Step C2 results", "P1 results", "P2 results".
+- The jobs of record in `sacct`, and their logs.
+- Two independent code reviews of the code that had none:
+  - Phase 4: `generation`, `dist_metrics`, `evaluate`, the scheduler pin, the
+    checks and the scripts;
+  - the step-C base path: `responders`, `synthetic`, the injection,
+    `build_tiered_split`, the counts weights, `step_c_report`, the checks and
+    the scripts.
+
+  C2, P1 and P2 had theirs when they were written. The reviews' main findings
+  were re-derived from the artifacts before being recorded here.
+
+**Outcome.**
+- **No bug changes a recorded number.** Both reviews traced the τ̂ path, the
+  injection, π, the positivity cells, both weight sets, the dose halves and the
+  DiD arithmetic, and found them correct. One reviewer re-derived the
+  `mlp-B_conditional_ddpm_s0` row from its `_tau.npz`; the other re-derived the
+  memoriser's DiD (−10.56) and the plan's medians from the table and the tiers.
+- **Every experiment is finished**: Phase 4's twelve arms, step C, C2, P1 and
+  P2. Their boxes are checked in §4.
+- **Six code boxes stay unchecked**, because the reviews ask for follow-ups and
+  §4's rule keeps a box open until those land:
+  - Phase 4: `generation.py`, `evaluate.py`, and the checks;
+  - Phase 5: `step_c_report`, the checks and launchers, and with them C2's
+    parent box.
+
+  The follow-ups are R1–R14 below.
+- **Two findings change how C2 is read** (gaps 1 and 2). They do not move a
+  verdict.
+
+**Confirmed.**
+- Phase 4: the twelve-arm table reproduces to every printed digit. The oracle on
+  disk is job 793791's, not 791843's: the same numbers, plus the noise-corrected
+  ‖τ̂‖ arrays that came with the Spearman–Brown correction. The arms of record
+  are scoring jobs 793825–793836, all exit 0.
+- Phase 5: all four verdict tables reproduce (step C, C2, P1 on both pools, P2's
+  pass rule). The 54 runs are configured as their names say:
+  - injection sha1 `492aa3d1` on the 24 step-C runs and `11c32b37` on the 30
+    C2 / P2 runs;
+  - γ and seed as labelled;
+  - counts or design weights on the weighted arms;
+  - group normalisation with cap 5 only on `dr_p2`.
+- Jobs: 24 + 24 step-C, 24 + 24 C2 and 6 + 6 P2 training and scoring jobs
+  COMPLETED. `check_p1` in job 964812 passes the three P1 controls (the step-C
+  null, the α-sensitivity control, unscored compounds).
+- C2 and P2 scoring ran on the fixed BLAS: no eigensolver fallback in any of the
+  30 JSONs, PC Fréchet 42–56 on treated wells.
+
+**Three results that were on disk but not in this log.**
+
+1. **E10, the sampler-step check** (job 792670, `mlp-B_conditional_ddpm_s0`,
+   `--pool holdout`). 100 steps are enough for τ̂:
+
+   | steps | median ‖τ̂_gen‖ | cos, responder arms | Spearman ‖τ‖ | marginal Fréchet, DMSO |
+   |---|---|---|---|---|
+   | 50 | 9.37 | 0.449 | 0.606 | 33.7 |
+   | 100 | 9.48 | 0.451 | 0.607 | 27.1 |
+   | 250 | 9.54 | 0.452 | 0.608 | 23.5 |
+   | 1000 | 9.56 | 0.453 | 0.608 | 21.9 |
+
+   - The amplitude at 100 steps is 0.9% below 1,000 steps, and the cosine 0.002
+     below. E10's choice stands for the DDIM arms.
+   - The marginal Fréchet of the DMSO wells is not converged at 100 steps. So
+     sample-quality numbers depend on the step count where τ̂ does not.
+   - The check covers DDIM only. The eight FM arms' 100 Euler steps were not
+     checked.
+   - The DiT arms started at 12:00, after the 50 / 100 / 250 runs and
+     13 minutes before the 1,000-step run finished.
+   - Only the 1,000-step JSON is still on disk. Its `/ceil` ratio (1.58)
+     predates the Spearman–Brown correction and should not be read.
+2. **The curated panel on the generated arms** (§3.7's high-n anchors), from the
+   four DDPM arms' `effects` blocks:
+   - bortezomib and MG-132 (968 / 971 wells, one arm each): cosine with the
+     oracle 0.999–1.000 and ‖τ̂_gen‖ / ‖τ̂_oracle‖ 1.01–1.02 on all four arms.
+   - `dr` equals `conditional` on every panel compound, to 0.003 on the MLP
+     and 0.02 on the DiT.
+   - So the anchors do not separate the backbones or the arms either. The other
+     14 compounds spread their wells over several dose arms, and their best-arm
+     cosines (0.46–0.98) are bounded by the oracle.
+   - The vehicle side: ‖μ̂_gen(0)‖ is 0.87–0.88× its DMSO sampling scale on the
+     MLP and 1.24–1.33× on the DiT (`--pool all`). No `--gen_anchors` run was
+     made, so τ̂ with a generated vehicle (§3.7) is not reported. It can be
+     rebuilt from the `_tau.npz` files without sampling.
+3. **§3.7's out-of-sample aggregate**: the per-compound cosine pooled over
+   doses, on the holdout (median over 1,698 compounds; `conditional` / `dr`).
+
+   | backbone | DDPM | FM, λ = 0 | FM, λ = 0.1 |
+   |---|---|---|---|
+   | MLP-B | 0.496 / 0.496 | 0.484 / 0.483 | 0.497 / 0.496 |
+   | DiT-S/10 | 0.509 / 0.511 | 0.509 / 0.511 | 0.504 / 0.504 |
+
+   - On this aggregate the DiT is 0.013 **ahead** of the MLP on the holdout.
+     "Phase 4 results", finding 3, calls it marginally behind there, from the
+     per-arm responder median (0.441 against 0.451). Both gaps come from one
+     seed and have no error bar, so the backbones are tied on held-out τ.
+     Finding 3's conclusion (no gain worth 49× the eval compute) stands; its
+     "marginally worse on the holdout" does not.
+   - This aggregate is the better holdout readout: the per-arm responder median
+     there rests on 1-well arms whose flags are mostly noise (gap 3).
+   - cmean: +0.013 on the MLP and −0.005 on the DiT. That is finding 4's mixed
+     picture again.
+   - On `--pool all` it is 0.825 (MLP) against 0.790 (DiT). That pool contains
+     the train wells (E9).
+   - Per dose level (τ(d) averaged over compounds, the six levels with ≥ 200
+     arms): 0.936–0.947 on every arm. No separation there either.
+
+**Gaps.** None changes a recorded verdict. In order of weight:
+
+1. **C2's mechanism is not established: the `dr` − `conditional` gap is a
+   difference in the learned share between the dose halves** (step-C code
+   review; re-derived here from the 30 C2 / P2 JSONs).
+   - With λ < 1, an arm's error along v_k is its intercept error minus
+     (1 − λ_a) · β · mix_a. So the high − low contrast holds a term
+     (β/2) · (λ̂_high − λ̂_low), taking mix = 1/2. §3.8.4's "~0 for any λ"
+     leaves it out by assuming one λ for both halves.
+   - `evaluate` writes λ̂ by half, and the report reads only the pooled mean.
+     "Step C2 results", finding 4, notes the difference by half and does not
+     connect it to the DiD.
+   - Mean of 3 seeds:
+
+     | arm | λ̂ low / high, γ = 0 | λ̂ low / high, γ = 1 | DiD of the λ term | recorded DiD | remainder |
+     |---|---|---|---|---|---|
+     | `naive` | 0.000 / 0.000 | 0.000 / 0.000 | −0.007 | −1.930 | −1.923 |
+     | `conditional` | 0.495 / 0.500 | 0.523 / 0.518 | −0.131 | −0.279 | −0.148 |
+     | `dr` | 0.400 / 0.406 | 0.317 / 0.380 | +0.720 | +0.575 | −0.144 |
+     | `dr_design` | 0.469 / 0.476 | 0.371 / 0.433 | +0.698 | +0.562 | −0.136 |
+     | `dr_p2` | 0.478 / 0.479 | 0.415 / 0.472 | +0.709 | +0.599 | −0.110 |
+
+   - The remainder is the same −0.11 to −0.15 in all four adjusted arms. The
+     whole +0.58 / +0.56 / +0.60 of the weighted arms is the λ term. Under the
+     weighted risk at γ = 1 the generator learns less of the shift in the low
+     dose half than in the high one; `conditional` learns the same share in
+     both.
+   - "Step C2 results", findings 2, 3 and 6, and "P2 results", finding 5,
+     attribute the sign flip to the arm-level Hájek mean. That would show in
+     the remainder, and it does not. Why the weights open a gap in λ̂ between
+     the halves is not known.
+   - `dr_p2` keeps that gap (0.057, against 0.063 for `dr`). So P2 repaired λ̂
+     on unthinned compounds and left this untouched, which is why its DiD did
+     not move.
+   - The statistic is a small difference of large errors: each half's mean
+     error is −4.8 to −8.7 along v_k at γ = 1, and the contrast is under 1.
+   - Unchanged: every DiD, criterion 2's FAIL, and P1's pass. P1 removes each
+     group's mean error whole, so it does not depend on which term carries the
+     contrast.
+   - Open: the mechanism, and with it the argument that step A's arm-level
+     cells avoid the problem. Step A's own result will say.
+2. **C2's γ = 0 control is not near zero, and nothing judges it.**
+   - Raw scored high − low contrast, mean of 3 seeds:
+
+     | arm | step C, γ = 0 / γ = 1 | C2, γ = 0 / γ = 1 |
+     |---|---|---|
+     | `naive` | +0.21 / −6.65 | +0.50 / −1.43 |
+     | `conditional` | −0.02 / −0.01 | **+0.32 / +0.04** |
+     | `dr` | −0.01 / −0.03 | +0.30 / +0.88 |
+     | `dr_design` | −0.01 / −0.06 | +0.33 / +0.89 |
+     | `dr_p2` | — | +0.26 / +0.86 |
+     | `p1_cond_counts` | −0.01 / −0.07 | −0.04 / +0.01 |
+     | `p1_naive_counts` | −0.17 / −0.14 | −0.06 / −0.07 |
+
+   - **`conditional`'s −0.279 on C2 is +0.04 at γ = 1 minus +0.32 at γ = 0.** At
+     γ = 1 its contrast is near zero. So "Step C2 results", finding 1
+     ("`conditional` is now biased"), rests on the control's offset being common
+     to both instances.
+   - Criterion 1 is named "biased at γ = 1, not at γ = 0", but `step_c_report`
+     tests only |DiD| / sd > 3. The γ = 0 contrasts are recorded and never
+     judged. By the same 3-sd rule, C2's are 9 to 50 seed sd from zero in every
+     untargeted arm.
+   - The seed sd holds training noise only: the three seeds share the two
+     seed-42 thinning draws. The reviewer redrew the thinning 400 times from
+     the stored π and scored the memoriser. Its DiD has a draw sd of about
+     0.30, and the realised γ = 0 draw sits +1.8 sd high. (Not re-derived
+     here.)
+   - A second draw with the same holdout cannot be built from the CLI, because
+     the thinning RNG is tied to the split seed.
+   - Each scoring JSON carries an arm-level SE of its contrast
+     (`scored_high_minus_low_se`, 0.10–0.16 on C2). The report loads it and
+     does not use it.
+   - The analyses behind the findings are not in the repo. One-off numpy
+     produced the memoriser's DiD, the tables by kept train wells, the λ slope,
+     the MSE orthogonal to v and every compound-clustered SE.
+   - Never computed: a clustered SE for step C, for the holdout pool, and for
+     the paired `p1_cond_counts` − `conditional` difference. So "P1 beats its
+     baseline" is established for the `naive` family (−1.93 → −0.001), and for
+     the `cond` family only against seed noise.
+   - `src/eval/contrast_stats.py`, step A's jackknife, can supply the errors.
+3. **The responder rule passes noise often** (Phase 4 code review). The code
+   follows E11, so this is a question about the rule.
+   - "‖τ̂‖ > 1.5 × the median null norm" is passed by a no-effect arm about 4%
+     of the time at 3 wells and 11% at 1 well (the reviewer's 20,000-draw
+     re-simulation of the floor). The oracle shows the second directly: at
+     n = 1 the null p90 is 35.96, above the threshold 1.5 × 23.25 = 34.9.
+   - A compound is a responder if any dose arm is. With six arms a no-effect
+     compound is flagged up to 22% of the time, and 37.2% of compounds are
+     flagged. So a sizeable part of the 651 responders, and of the 641 scored
+     compounds, may have no real effect.
+   - Steps C and C2 are not affected: their bias is read along the injected
+     direction, whatever the compound does.
+   - Step A is affected, by dilution: its readout needs a real line effect in
+     the scored compounds. Its pooled arms have ~15 wells, where the null is
+     tighter (p90 / median 1.23 at n = 8, against 1.33 at n = 3).
+   - On the holdout, 1,503 of the 1,546 responder arms have one well, so about
+     two thirds of those flags are expected from noise. The holdout `cos resp`
+     column of "Phase 4 results" (E9's cmean headline) is read on that set.
+     The comparison is paired across arms and still valid; the per-compound
+     aggregate above is the cleaner one.
+4. **The quality block of 36 scoring runs is invalid and was never
+   recomputed**: PC Fréchet and MMD for the 12 Phase 4 arms and the 24 step-C
+   arms, all scored on `zabih` before the BLAS fix ("Step C2 scoring").
+   - E5 asks for both Fréchet variants and MMD, so it is not met for these
+     arms.
+   - Phase 4's values are visibly broken (PC Fréchet ~1e141). Step C's look
+     plausible (PC Fréchet 32, MMD 0.11, against 0.001 on C2). A pre-fix JSON
+     can be told only by its missing `eigh_fallbacks` key.
+   - The pooled "treated" numbers have a second problem, in every run including
+     C2's (Phase 4 code review). The generated reservoir is capped per dose
+     group over rows × 16 and the real side over rows, so the two sides are
+     different dose mixtures. On `mlp-B_conditional_ddpm_s0` the 20 µM group is
+     13.0% of the generated pool and 7.3% of the real one.
+   - So the level of any pooled-treated metric, the marginal Fréchet included,
+     is not interpretable. Differences between arms on one pool are. Per-group
+     and DMSO numbers are not touched.
+   - E9 asked for "no loss of sample spread", and that was never read off a
+     valid metric. The valid ones agree with the decision. Marginal Fréchet on
+     the holdout DMSO wells: 23.8 → 24.9 with cmean on the MLP, 23.8 → 27.0 on
+     the DiT.
+   - Every `_gen.npz` holds its reservoirs, so the fix is a CPU recompute on
+     `bindel`, not the GPU rescoring "Step C2 scoring" costed. It should match
+     the two mixtures. No script does it yet.
+5. **Criterion 4's correlations are constants in `step_c_report.py`**
+   (`corr_counts_design`: 0.73 / 0.88; `measured_before_training`: `True`),
+   written into every verdict file. The criterion's `pass` checks only the
+   weight-file hashes, so it cannot fail on what it is named for.
+   - The constants are over all train rows. On kept scored rows, both
+     data-layer jobs print +0.273 (γ = 0) and +0.840 (γ = 1). Recomputed here
+     from the weight files, with the same result. The note under "Phase 5
+     progress" is corrected.
+   - The criterion still holds: at γ = 1 the weights track the design weights
+     (+0.84, means 2.03 against 2.00), and at γ = 0 the design weights are
+     nearly flat.
+6. **Step C and C2's control is not size-matched.** The realised kept fraction
+   of scored train wells is 0.468 at γ = 0 and 0.498 at γ = 1 (5,397 and 5,090
+   wells thinned). Step A found the same effect and fixed it for `cell_id`
+   (`STEP_A.md` D9). No run checks whether it moves the readout.
+7. **The `/ceil` column rests on a different arm set than `cos resp`**
+   (Phase 4 code review).
+   - On `--pool all`, `cos resp` is over 1,795 arms and `/ceil` over the 1,707
+     with a positive split-half. On those the cosine is 0.804 and the ceiling
+     0.802. E11's 0.788 is a third basis, the lift of the 1,795-arm median.
+   - Spearman–Brown assumes equal halves, and a 3-well arm splits 1 against 2.
+     So the ceiling is about 1.6% low for 85% of arms.
+   - Net: `/ceil` 1.01 → about 0.99–1.00 on `--pool all`. "At the ceiling"
+     stands. The holdout's 0.96 is over the 43 responder arms that have a
+     split-half there, not the 1,546.
+8. **P2 had no entry in §4.** It was tracked only in `STEP_A.md` §4 (B1–B5).
+   Added to Phase 5; B1–B5 are checked there.
+9. **Smaller items.**
+   - `tier_meta.json`'s `bias` field still holds its Phase 1 placeholder.
+     `--plan` writes nothing, no log holds the `mcf7_24h` table of "Phase 5
+     code", and `step_c_report --plan_contrast` defaults to the constant −8.32.
+   - `phase4_gpu.sub` last ran before the reference-scale rewrite, the BLAS
+     guard and the C2 / P1 / step-A changes to `evaluate.py`. Its sampler
+     checks have not been rerun on the current tree (~2 min on `zabih`).
+   - The P2 and step-A code, `STEP_A.md` and this file's changes are not
+     committed.
+
+**Code review: follow-ups.** All open; none affects a recorded number. Line
+numbers are the reviewers'.
+
+| # | Where | Finding | Asked |
+|---|---|---|---|
+| R1 | `processes/ddpm.py:37-41`, `generation.py:344` | `--sampler ddpm` returns before `timestep_spacing="trailing"` is set, so a zero-SNR arm never visits t = 999; its ancestral noise is also unseeded. Unused: every run logged `sampler=ddim` | Fix, or refuse the option |
+| R2 | `generation.py:158-206`, `evaluate.py:1003-1005` | `check_arm_against_data` and `_load_truth` skip an identity field that is absent from `arch.json` or the oracle. Every artifact on disk carries them all | Refuse a missing field |
+| R3 | `evaluate.py:633-648` | The oracle's file name omits `responder_mult`, `n_floor_draws`, `min_dose_n` and `seed`, so `--source real --responder_mult 2` overwrites the oracle Phase 5 reads. A generated run's name omits `--sampler` | Tag them, or refuse to overwrite a file with other settings |
+| R4 | `evaluate.py:1183`, `:1262`, `:1312` | The `--truth` and overwrite guards run after sampling: a mistyped `--truth` on a DiT arm fails after 5.9 h | Check before sampling |
+| R5 | `evaluate.py:256-295`, `:788-795` | Gap 7: the ceiling's arm set and the unequal halves | One arm set for `cos resp`, the ceiling and the ratio; the unequal-split form |
+| R6 | `generation.py:348-369`, `evaluate.py:944-961` | Gap 4: pooled-treated quality compares two dose mixtures | Match the mixtures, in the recompute too |
+| R7 | `tests/check_phase4.py` | The responder flag is checked for presence only. `FLOOR_RTOL = 0.25` cannot tell a floor at the wrong arm size (n = 2 and n = 4 both pass against n = 3). E4 / E12's thresholds are never asserted. No job runs `--arm` on the 12 production JSONs | Tighten |
+| R8 | `tests/smoke_phase4_torch.py` | Docstring item 8 has no code. Nothing asserts that sampling starts at t = 999 with trailing spacing. Six identity fields are doctored, not "each in turn" as "Phase 4 implementation" says. `:145` is a tautology | Add the missing checks |
+| R9 | `step_c_report.py:402-411`, `:474-485` | Gaps 2 and 5: criterion 1's γ = 0 half is not judged; criterion 4's constants; `scored_se` is unused | Judge γ = 0; compute the correlations; report a clustered SE and λ̂ by half |
+| R10 | `step_c_report.py:229-266` | A cell is keyed on (arm, γ, training seed) only. Not checked: the tier's `keep_frac` / `pmin` / seed / scored set, the model's arch / size / epochs, the scoring `sampler` / `gen_anchors`. Criteria 1–3 do not require all seeds. Both verdicts on disk are clean (every cell's fields read) | Pin them at admission |
+| R11 | `tests/smoke_phase5_torch.py:236-242` | "Weights vary with `syn_c`" compares marginal means at 1e-6. The lever is dose half × `syn_c`, so it passes at γ = 0 too (0.060). The real signal is within a half: 3.49 against 1.39 at γ = 1 | Test within the half |
+| R12 | `tests/check_phase5.py:302-317` | The kept-fraction and dp checks pass with the two instances swapped. dp is checked against the plan only, never against the realised mix (right by hand: kept 0.29 / 0.70 / 0.29 / 0.72 by cell at γ = 1) | Compare the realised mix |
+| R13 | `scripts/phase5_gpu.sub:191-205` | The step-C refusal omits `--syn_effect`, so `check_arm_against_data` fires first. `TRUTH_GUARD`'s syn entries are exercised only in C2 mode | Add the case |
+| R14 | `scripts/phase5_cpu.sub:44`, `:61`; `phase5_arms.sh:72-83` | `responders.json` is rewritten on every run. `ls -d …g${G}*_s42 \| head -1` would also match a γ = 0.5 instance. A failed training job leaves its scoring job pending for ever | `--print_out_dir`; `--kill-on-invalid-dep` |
+
+Review findings not acted on:
+- The floor has 1–2% Monte-Carlo error at 200 draws (n = 3: 14.48 against
+  14.32 at 20,000). It moves responder flags at the margin.
+- `amplitude_ratio_est_over_denoised` is a median over the arms above the floor
+  only, so one generator reads 0.997 on `--pool all` and 0.686 on the holdout.
+  It is in no §5 table.
+- The curated panel takes the first table row per `pert_iname`. Bortezomib has
+  two entries (968 and 17 wells); the row order picked the right one.
+- `dist_metrics`:
+  - a negative Fréchet is clamped with a stderr warning and no JSON flag;
+  - the MMD bandwidth is refit per call;
+  - the PC Fréchet runs whenever n > k, where E5 says large pools only;
+  - E5's per-compound quality is not implemented.
+- `--plan` silently skips compounds it cannot plan and prints IPW as a literal
+  0. Its "+0.0000" at γ = 0 is a median; the per-compound mean is +0.0015.
+- `load_syn_meta` records `table_fingerprint` and does not compare it.
+- The oracle JSON is written atomically and its `_tau.npz` is not.

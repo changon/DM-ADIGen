@@ -28,8 +28,17 @@ z_dose = +1 / -1 for the high / low half of the compound's dose levels (levels
 z_C = +1 / -1 for the two levels of C. A scored compound needs >= 2 dose levels,
 so the single-dose 20 uM proteasome plate controls cannot be scored. Positivity cells:
     syn_c   (step C): (compound, dose half, syn_c)
-    cell_id (step A): (compound, dose_level, cell_id); needs the line groups
-                      declared in spec.py (Phase 6), so it raises for now.
+    cell_id (step A): (compound, dose_level, cell_id), i.e. (arm, line); z_C is
+                      -1 / +1 for the population's two line groups
+                      (spec.LINE_GROUPS, recorded in the dir tag).
+
+The positivity redraw. The design conditions each cell on keeping >= 1 well, and
+cells are independent, so redrawing a whole compound until every cell keeps one
+(step C: 4 cells of ~6 wells) and redrawing each cell on its own until it keeps
+one have the SAME distribution. Step A uses the per-cell form: its ~30 cells of
+~2 wells per compound would need ~10^3 - 10^5 whole-compound draws. Step C
+keeps the whole-compound loop, so its instances and their RNG stream are
+unchanged.
 
 v1 = no scored compounds, hence no reserve and no thinning: splits.json and
 nu_rows.npy in the base nuisance dir. A thinning instance writes
@@ -42,6 +51,8 @@ compounds come from --scored_compounds (Phase 5 passes the responders); the
     python -m src.data.build_tiered_split                          # v1 -> data/mcf7_24h/nuisances/
     python -m src.data.build_tiered_split --scored_compounds responders.json \\
         --confounder syn_c --gamma 1 --keep_frac 0.4               # a step-C instance
+    python -m src.data.build_tiered_split --data_dir data/core5_24h \\
+        --scored_compounds responders.json --confounder cell_id --gamma 1   # a step-A instance
 """
 from __future__ import annotations
 
@@ -65,14 +76,25 @@ from src.data.splits import (  # noqa: E402
     POSITIVITY_KEYS, SPLITS_FILENAME, arm_keys, dose_half, population_key, population_rows,
     split_fingerprint, split_layer, split_report, split_strata)
 from src.spec import (  # noqa: E402
-    CaseConfig, add_adjustment_set_cli, add_paths_cli, apply_paths_args, config_from_args)
+    CaseConfig, add_adjustment_set_cli, add_paths_cli, apply_paths_args, config_from_args,
+    line_group_sign, line_group_tag, line_groups)
 
 TABLE_COLS = ["pert_id", "pert_iname", "cell_id", "compound_idx", "is_control",
               "dose_level", "det_plate", "syn_c"]
 COPIED_FROM_BASE = ("nuisance_meta.json", "compound_vocab.json", "covariate_encoder.json")
 WRITTEN = (SPLITS_FILENAME, NU_ROWS_FILENAME, "dr_weights_design.npz", "tier_meta.json") + COPIED_FROM_BASE
 CONFOUNDERS = ("syn_c", "cell_id")
-DEFAULT_KEEP_FRAC = {"syn_c": 0.4, "cell_id": 0.6}   # §3.8.2 / §3.8.3
+# §3.8.2 / §3.8.3. The two are different quantities (see `--keep_frac`):
+#   syn_c    the NOMINAL fraction, sum(pi) / n, before the positivity redraw
+#            (step C's instances were built this way and are unchanged);
+#   cell_id  the EXPECTED REALISED fraction under the per-cell redraw. With ~2
+#            train wells per (arm, line) cell the redraw moves the two far apart
+#            and by a gamma-dependent amount (nominal 0.6 realised 0.68 at
+#            gamma = 0 and 0.74 at gamma = 1 on the --limit build), so the
+#            gamma = 0 control was not size-matched. 0.75 is about what the
+#            planned nominal 0.6 gave at gamma = 1, and near the strongest lever
+#            a 2-well cell allows (over-kept cells whole, under-kept ones half).
+DEFAULT_KEEP_FRAC = {"syn_c": 0.4, "cell_id": 0.75}
 RESERVE_MIN_EXTRA = 3                                # a reserved arm keeps >= 3 wells for the split
 
 
@@ -93,6 +115,37 @@ def _calibrate_pi(q: np.ndarray, m: float, pmin: float) -> np.ndarray:
             break
         free = free & ~newly
     return np.clip(pi, pmin, 1.0)
+
+
+def _calibrate_pi_realised(q: np.ndarray, inv: np.ndarray, n_cells: int, m: float,
+                           pmin: float, iters: int = 80) -> np.ndarray:
+    """pi = clip(s * q, pmin, 1), with the scale s chosen so that the EXPECTED
+    KEPT COUNT under the per-cell positivity redraw equals m:
+
+        sum_i pi_i / P_cell(i) = m,   P_c = 1 - prod_{j in c} (1 - pi_j).
+
+    The kept count is nondecreasing in s, so s is found by bisection. If even
+    pi = pmin everywhere keeps more than m (cells of one well are always kept,
+    cells of two keep at least one), that floor is returned: the compound cannot
+    be thinned as far as asked, and `thin_compound` records it.
+    """
+    def kept(s: float) -> tuple[float, np.ndarray]:
+        pi = np.clip(s * q, pmin, 1.0)
+        none = np.ones(n_cells)
+        np.multiply.at(none, inv, 1.0 - pi)
+        return float((pi / (1.0 - none)[inv]).sum()), pi
+
+    lo, hi = pmin / float(q.max()), 1.0 / float(q.min())    # all at pmin ... all at 1
+    k_lo, pi_lo = kept(lo)
+    if m <= k_lo:
+        return pi_lo
+    for _ in range(iters):
+        mid = float(np.sqrt(lo * hi))
+        if kept(mid)[0] < m:
+            lo = mid
+        else:
+            hi = mid
+    return kept(hi)[1]
 
 
 def read_compound_list(raw: str) -> list[str]:
@@ -124,22 +177,57 @@ def default_out_dir(cfg: CaseConfig, base: str, scored: list[str], confounder: s
         tag += "_pop" + cfg.population.key()["compounds"].replace(":", "-")
     if scored:
         tag += f"_tier_C{confounder}_k{k}_g{gamma:g}_s{seed}"
+        if confounder == "cell_id":      # the line groups z_C contrasts (§3.8.3)
+            tag += "_" + line_group_tag(cfg.population)
     elif seed != cfg.seed:
         tag += f"_s{seed}"
     return os.path.normpath(base) + tag
 
 
+def tier_dir(cfg: CaseConfig, confounder: str, gamma: float, seed: int | None = None,
+             k_reserve: int = 0) -> str:
+    """The split dir of a thinning instance of cfg's build -- the one definition of
+    its name, for the builder, the checks and (via --print_out_dir) the scripts."""
+    base = os.path.join(cfg.paths.data_dir, "nuisances")
+    return default_out_dir(cfg, base, ["<tier>"], confounder, k_reserve, float(gamma),
+                           cfg.seed if seed is None else int(seed))
+
+
 def pi_and_cells(rows: np.ndarray, half: np.ndarray, c_val: np.ndarray,
                  confounder: str, gamma: float, keep_frac: float,
-                 pmin: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, set]:
+                 pmin: float, *, dose_level: np.ndarray | None = None,
+                 population=None) -> tuple[np.ndarray, np.ndarray, np.ndarray, set]:
     """The selection probabilities and positivity cells of one scored compound,
     with no draw. Shared by `thin_compound` and `--plan`, so the planned bias and
-    the realised thinning can never be computed from different pi."""
+    the realised thinning can never be computed from different pi.
+
+    `cell_id` (step A) needs `dose_level` (the table's, for the (dose_level,
+    cell_id) cells) and `population` (its line groups, spec.LINE_GROUPS)."""
     high = half[rows] == 1
+    if confounder == "cell_id":
+        if dose_level is None or population is None:
+            raise ValueError("--confounder cell_id needs dose_level and the population")
+        lines = c_val[rows].astype(str)
+        zc = line_group_sign(lines, population)            # -1 G1, +1 G2
+        z = standardize(np.where(high, 1.0, -1.0) * zc)
+        dl = dose_level[rows]
+        cells = np.array([f"{d:.6g}|cell_id={c}" for d, c in zip(dl, lines)])
+        # keep_frac is the REALISED fraction here (see DEFAULT_KEEP_FRAC): the
+        # gamma = 0 control and the confounded instance then keep the same share.
+        ucell, inv = np.unique(cells, return_inverse=True)
+        pi = _calibrate_pi_realised(np.exp(-gamma * z), inv, ucell.size,
+                                    keep_frac * rows.size, pmin)
+        # Every (dose level, line) of the compound: an arm missing from a line
+        # has no cell to keep, and the compound cannot be scored.
+        want = {f"{d:.6g}|cell_id={c}" for d in sorted(set(dl.tolist()))
+                for c in population.cell_ids}
+        missing = sorted(want - set(cells.tolist()))
+        if missing:
+            raise ValueError(f"positivity cells {missing[:4]}{' ...' if len(missing) > 4 else ''} "
+                             f"have no train well before thinning ({len(missing)} of {len(want)})")
+        return pi, cells, z, want
     if confounder != "syn_c":
-        raise NotImplementedError(
-            f"--confounder {confounder}: the step-A line groups (z_C) and (compound, dose_level, "
-            f"cell_id) positivity cells are declared in spec.py in Phase 6")
+        raise NotImplementedError(f"--confounder {confounder}: no selection score declared")
     cv = c_val[rows].astype(np.int64)
     z = standardize(np.where(high, 1.0, -1.0) * np.where(cv == 1, 1.0, -1.0))
     pi = _calibrate_pi(np.exp(-gamma * z), keep_frac * rows.size, pmin)
@@ -153,7 +241,7 @@ def pi_and_cells(rows: np.ndarray, half: np.ndarray, c_val: np.ndarray,
 
 def planned_bias(rows: np.ndarray, half: np.ndarray, c_val: np.ndarray,
                  confounder: str, gamma: float, keep_frac: float,
-                 pmin: float) -> dict:
+                 pmin: float, **kw) -> dict:
     """Expected naive-vs-IPW bias for one scored compound, per dose half (§3.8.2).
 
     The injected effect is `y + syn_c * beta * v`, so an estimator that
@@ -165,11 +253,19 @@ def planned_bias(rows: np.ndarray, half: np.ndarray, c_val: np.ndarray,
         IPW:    weights 1 / incl_i cancel incl exactly -> E[syn_c] -> bias 0
 
     Returned in units of beta; multiply by beta for the z-space bias.
+
+    Step A (`cell_id`): the same quantity with c = 1 for a G2 line, i.e. the
+    shift of the G2 share. There is no beta: the bias of arm a is that shift
+    times the arm's own line-group contrast (STEP_A.md §3), which the S0 power
+    gate reads off the oracle (`src.eval.step_a_power`).
     """
-    pi, cells, _, want = pi_and_cells(rows, half, c_val, confounder, gamma, keep_frac, pmin)
+    pi, cells, _, want = pi_and_cells(rows, half, c_val, confounder, gamma, keep_frac, pmin, **kw)
     p_cell = {c: 1.0 - float(np.prod(1.0 - pi[cells == c])) for c in want}
     incl = pi / np.array([p_cell[c] for c in cells])
-    cv = c_val[rows].astype(np.float64)
+    if confounder == "cell_id":
+        cv = (line_group_sign(c_val[rows], kw["population"]) > 0).astype(np.float64)
+    else:
+        cv = c_val[rows].astype(np.float64)
     high = half[rows] == 1
     out = {"keep_frac_expected": float(incl.mean()), "n_train": int(rows.size)}
     for nm, sel in (("low", ~high), ("high", high)):
@@ -185,16 +281,34 @@ def planned_bias(rows: np.ndarray, half: np.ndarray, c_val: np.ndarray,
 
 def thin_compound(rows: np.ndarray, half: np.ndarray, c_val: np.ndarray,
                   confounder: str, gamma: float, keep_frac: float, pmin: float,
-                  rng: np.random.Generator, max_redraws: int) -> dict:
+                  rng: np.random.Generator, max_redraws: int, **kw) -> dict:
     """Layer 3 for one scored compound: pi, the kept mask, and its positivity cells.
     `half` is splits.dose_half over the table (1 = high half of the compound's levels)."""
-    pi, cells, z, want = pi_and_cells(rows, half, c_val, confounder, gamma, keep_frac, pmin)
-    for attempt in range(1, max_redraws + 1):
-        kept = rng.random(rows.size) < pi
-        if all(kept[cells == c].any() for c in want):
-            break
+    pi, cells, z, want = pi_and_cells(rows, half, c_val, confounder, gamma, keep_frac, pmin, **kw)
+    if confounder == "cell_id":
+        # Per-cell redraw: the same distribution as the whole-compound loop
+        # below (cells are independent and each is conditioned on keeping >= 1),
+        # without its ~0.84^30 acceptance rate. Cells in sorted order, so the
+        # draw is reproducible from the seed.
+        kept = np.zeros(rows.size, dtype=bool)
+        attempt = 0
+        for c in sorted(want):
+            idx = np.flatnonzero(cells == c)
+            for n_try in range(1, max_redraws + 1):
+                k = rng.random(idx.size) < pi[idx]
+                if k.any():
+                    break
+            else:
+                raise RuntimeError(f"cell {c}: no draw in {max_redraws} kept a train well")
+            kept[idx] = k
+            attempt = max(attempt, n_try)
     else:
-        raise RuntimeError(f"no draw in {max_redraws} kept >= 1 train well in every positivity cell")
+        for attempt in range(1, max_redraws + 1):
+            kept = rng.random(rows.size) < pi
+            if all(kept[cells == c].any() for c in want):
+                break
+        else:
+            raise RuntimeError(f"no draw in {max_redraws} kept >= 1 train well in every positivity cell")
     # realised inclusion probability under the redraw: pi_i / P(cell of i keeps >= 1)
     p_cell = {c: 1.0 - float(np.prod(1.0 - pi[cells == c])) for c in want}
     incl = pi / np.array([p_cell[c] for c in cells])
@@ -233,11 +347,12 @@ def main():
     ap.add_argument("--scored_compounds", default=None, help="pert_ids to thin (json / text file or comma list). Omit for v1.")
     ap.add_argument("--confounder", choices=CONFOUNDERS, default=None, help="C the thinning selects on (required with --scored_compounds).")
     ap.add_argument("--gamma", type=float, default=0.0, help="Selection strength in exp(-gamma * z); 0 = uniform (MCAR) control.")
-    ap.add_argument("--keep_frac", type=float, default=None, help="Expected kept fraction of a scored compound's train wells (default 0.4 syn_c, 0.6 cell_id).")
+    ap.add_argument("--keep_frac", type=float, default=None, help="Kept fraction of a scored compound's train wells. syn_c (default 0.4): the nominal one, sum(pi)/n before the positivity redraw. cell_id (default 0.75): the expected REALISED one under the per-cell redraw, so gamma = 0 and gamma > 0 keep the same share.")
     ap.add_argument("--pmin", type=float, default=0.05, help="Positivity floor on per-well retention probability.")
     ap.add_argument("--max_redraws", type=int, default=1000)
     ap.add_argument("--out_dir", default=None, help="Default: the base nuisance dir for v1, else <nuisance_dir>_tier_C<c>_k<k>_g<gamma>_s<seed>.")
     ap.add_argument("--overwrite", action="store_true", help="Replace a split built with other parameters (refused while downstream artifacts exist).")
+    ap.add_argument("--print_out_dir", action="store_true", help="Print the split dir these arguments name and exit (no table is read, nothing is written). With --confounder and no --scored_compounds it names the tier instance.")
     ap.add_argument("--plan", action="store_true", help="Print the expected naive-vs-IPW bias per gamma and WRITE NOTHING (§3.8.1).")
     ap.add_argument("--plan_gammas", default="0,0.5,1,2", help="--plan: the gammas to table.")
     ap.add_argument("--syn_effect", type=float, default=1.0, help="--plan: beta = this x the scale in responders.json / syn_meta.json.")
@@ -249,6 +364,8 @@ def main():
     seed = cfg.seed if args.seed is None else args.seed
     base_nz = cfg.paths.nuisance_dir
     scored = read_compound_list(args.scored_compounds) if args.scored_compounds else []
+    if args.print_out_dir and args.confounder and not scored:
+        scored = ["<tier>"]          # only its truthiness reaches default_out_dir
     if scored and args.confounder is None:
         ap.error("--scored_compounds needs --confounder")
     if not scored and (args.k_reserve or args.confounder or args.gamma):
@@ -257,13 +374,27 @@ def main():
     keep_frac = (args.keep_frac if args.keep_frac is not None else DEFAULT_KEEP_FRAC[confounder]) if scored else None
     if scored and not 0 < keep_frac < 1:
         ap.error("--keep_frac must be in (0, 1)")
+    if confounder == "cell_id" and line_groups(cfg.population) is None:
+        ap.error(f"--confounder cell_id: population {cfg.population.name!r} declares no "
+                 f"line groups (spec.LINE_GROUPS)")
     out_dir = os.path.abspath(args.out_dir) if args.out_dir else default_out_dir(
         cfg, base_nz, scored, confounder, args.k_reserve, args.gamma, seed)
+    if args.print_out_dir:          # for scripts: the one place the dir name is built
+        print(out_dir)
+        return
 
     params = {"population": population_key(cfg), "holdout_frac": args.holdout_frac, "seed": seed,
               "k_reserve": args.k_reserve, "scored_compounds": scored, "confounder": confounder,
               "gamma": args.gamma if scored else None, "keep_frac": keep_frac,
               "pmin": args.pmin if scored else None}
+    # Step A: the line groups are part of the instance (a change of groups is a
+    # different thinning). Added only for cell_id, so step-C params are unchanged
+    # and an existing step-C instance still reads as "same parameters".
+    lg = None
+    if confounder == "cell_id":
+        lg = line_groups(cfg.population)
+        params["line_groups"] = {k: list(v) for k, v in lg.items()}
+    tkw = {"dose_level": None, "population": cfg.population} if confounder == "cell_id" else {}
     sp = os.path.join(out_dir, SPLITS_FILENAME)
     # --plan writes nothing, so none of the write guards below apply to it.
     if os.path.isfile(sp) and not args.plan:
@@ -339,15 +470,23 @@ def main():
     if args.plan:
         if not scored:
             ap.error("--plan describes a thinning instance; pass --scored_compounds")
-        beta, src = _plan_beta(cfg, args)
+        beta, src = (1.0, "unit contrast") if confounder == "cell_id" else _plan_beta(cfg, args)
         in_train = np.zeros(n_total, dtype=bool)
         in_train[train_idx] = True
         c_val = df[confounder].values
         half = dose_half(comp, dose_level, ctl)
+        if tkw:
+            tkw["dose_level"] = dose_level
         print(f"\n[plan] {len(scored_ci):,} scored compounds, confounder {confounder}, "
               f"keep_frac {keep_frac}, pmin {args.pmin}")
-        print(f"[plan] beta = {beta:.4f} ({src}); the bias lives along v, so these are "
-              f"signed z-space shifts of <tau_hat, v>")
+        if confounder == "cell_id":
+            print(f"[plan] line groups {params['line_groups']}: dp is the shift of the G2 share "
+                  f"among kept wells. The bias of an arm is dp x its own G2 - G1 contrast, so "
+                  f"there is no single beta; the columns below are in units of that contrast "
+                  f"(src.eval.step_a_power turns them into the S0 gate).")
+        else:
+            print(f"[plan] beta = {beta:.4f} ({src}); the bias lives along v, so these are "
+                  f"signed z-space shifts of <tau_hat, v>")
         print(f"\n{'gamma':>6s} {'kept':>6s} {'dp_low':>9s} {'dp_high':>9s} "
               f"{'bias_low':>9s} {'bias_high':>10s} {'high-low':>10s} {'IPW':>5s}")
         for g in [float(x) for x in args.plan_gammas.split(",") if x.strip()]:
@@ -356,7 +495,7 @@ def main():
                 rows = np.flatnonzero(in_train & scored_mask & (comp == ci))
                 try:
                     rec.append(planned_bias(rows, half, c_val, confounder, g,
-                                           keep_frac, args.pmin))
+                                           keep_frac, args.pmin, **tkw))
                 except (ValueError, NotImplementedError):
                     continue
             if not rec:
@@ -382,6 +521,8 @@ def main():
         in_train[train_idx] = True
         c_val = df[confounder].values
         half = dose_half(comp, dose_level, ctl)
+        if tkw:
+            tkw["dose_level"] = dose_level
         drop = np.zeros(n_total, dtype=bool)
         w_of = {}
         inv_vocab = {v: k for k, v in vocab.items()}
@@ -393,7 +534,7 @@ def main():
                                  f"the dose-half selection needs >= 2")
             try:
                 t = thin_compound(rows, half, c_val, confounder, args.gamma,
-                                  keep_frac, args.pmin, thin_rng, args.max_redraws)
+                                  keep_frac, args.pmin, thin_rng, args.max_redraws, **tkw)
             except (ValueError, RuntimeError) as e:
                 raise type(e)(f"scored compound {inv_vocab[ci]}: {e}") from None
             drop[rows[~t["kept"]]] = True
@@ -405,6 +546,9 @@ def main():
                 "compound_idx": ci, "dose_levels": levels, "n_train": int(rows.size),
                 "n_kept": int(t["kept"].sum()), "sum_pi": float(t["pi"].sum()),
                 "expected_kept": float(t["incl"].sum()),
+                # cell_id only: the cells' floor (>= 1 well each) is above keep_frac
+                "keep_frac_at_floor": bool(confounder == "cell_id"
+                                           and t["incl"].sum() > keep_frac * rows.size * (1 + 1e-6)),
                 "pi_min": float(t["pi"].min()), "pi_max": float(t["pi"].max()), "n_draws": t["n_draws"],
                 "cells_train_kept": cells, "p_cell": t["p_cell"],
                 "rows": rows.tolist(), "z": [float(v) for v in t["z"]], "pi": [float(p) for p in t["pi"]],
@@ -415,6 +559,10 @@ def main():
         n_kept = sum(a["n_kept"] for a in tier_arms)
         n_exp = sum(a["expected_kept"] for a in tier_arms)
         ess_n = float(w_train.sum() ** 2 / np.square(w_train).sum() / w_train.size)
+        n_floor = sum(a["keep_frac_at_floor"] for a in tier_arms)
+        if n_floor:
+            print(f"[tier] {n_floor} compound(s) sit at their positivity floor: their cells "
+                  f"cannot be thinned to keep_frac {keep_frac}, so they keep more")
         print(f"[tier] thinning ({confounder}, gamma={args.gamma:g}, keep_frac={keep_frac}, pmin={args.pmin}): "
               f"{len(scored_ci)} compounds, kept {n_kept:,}/{n_sc:,} train wells ({n_kept / max(n_sc, 1):.3f}; "
               f"expected {n_exp / max(n_sc, 1):.3f} under the positivity redraw); "
@@ -428,7 +576,11 @@ def main():
         tier.update({
             "confounder": confounder, "gamma": args.gamma, "keep_frac": keep_frac, "pmin": args.pmin,
             "selection": "z = standardize(z_dose * z_C) within compound; z_dose = +/-1 high/low dose half, z_C = +/-1",
-            "positivity_cells": "(compound, dose half, syn_c)",
+            "positivity_cells": "(" + ", ".join(POSITIVITY_KEYS[confounder]) + ")"
+                                if confounder != "syn_c" else "(compound, dose half, syn_c)",
+            **({"line_groups": params["line_groups"],
+                "z_C": "-1 for a G1 line, +1 for a G2 line (spec.LINE_GROUPS)",
+                "redraw": "per positivity cell"} if confounder == "cell_id" else {}),
             "positivity_key": list(POSITIVITY_KEYS[confounder]),
             "scored_compounds": {a["pert_id"]: a["compound_idx"] for a in tier_arms},
             "n_thinned": int(train_idx.size - final_train.size),
@@ -455,6 +607,9 @@ def main():
         _write_json(os.path.join(out_dir, "tier_meta.json"), {
             "gamma": args.gamma, "seed": seed, "k_reserve": args.k_reserve, "pmin": args.pmin,
             "keep_frac": keep_frac, "confounder": confounder,
+            "keep_frac_is": ("expected realised fraction under the per-cell redraw"
+                             if confounder == "cell_id" else "nominal fraction, sum(pi) / n"),
+            "n_compounds_at_keep_frac_floor": int(sum(a["keep_frac_at_floor"] for a in tier_arms)),
             "realised_kept_frac": float(sum(a["n_kept"] for a in tier_arms) / max(sum(a["n_train"] for a in tier_arms), 1)),
             "reserve": reserve_arms,
             "design_weight": "P_c / pi_i on kept scored wells (inverse realised inclusion probability under the positivity redraw)",

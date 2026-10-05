@@ -21,7 +21,9 @@ Phase 0 decisions (IMPLEMENT.md §3.12; 3 and 5 amended 2026-09-29), frozen here
                                          -> OutcomeSpec.normalize_mean / normalize_std
     6. DMSO-median plate centring + 3x plate QC -> OutcomeSpec.plate_center / plate_qc_max_spread_ratio
 A different cell line is a separate population (its own `PopulationSpec.name`
-and paths), never an edit of these defaults. A compound subset
+and paths), never an edit of these defaults: `POPULATIONS` is the registry, and
+`--population` (or the build dir's own population_qc.json) selects from it.
+Step A's `core5_24h` and its line groups are declared there (STEP_A.md). A compound subset
 (`--population_compounds`) is applied downstream on the same build and paths;
 it redefines the estimand, is part of the splits cache key, and must be named
 in every result.
@@ -298,6 +300,68 @@ class PopulationSpec:
         return out
 
 
+# Step A (IMPLEMENT.md §3.8.3; STEP_A.md): the five lines with >= 99.8% of
+# MCF7's arms. A population with more than one cell line keeps only compounds
+# with a treated well in EVERY line (applied in build_dataset after plate QC).
+# That rule is a property of "more than one line", not a PopulationSpec field:
+# `asdict(PopulationSpec)` is embedded in decisions_record, and a new field
+# would invalidate the mcf7_24h build.
+CORE5_LINES: tuple[str, ...] = ("MCF7", "HT29", "HA1E", "A375", "PC3")
+POPULATIONS: dict[str, PopulationSpec] = {
+    DEFAULT_POPULATION: PopulationSpec(),
+    "core5_24h": PopulationSpec(name="core5_24h", cell_ids=CORE5_LINES),
+}
+
+# The two line groups step A's selection score contrasts (z_C = -1 / +1), per
+# population. Declared 2026-10-05 (STEP_A.md D3), BEFORE any step-A result:
+# G1 = the three carcinoma lines, G2 = HA1E (immortalised kidney) and A375
+# (melanoma). The tier dir tag and every step-A artifact record them.
+LINE_GROUPS: dict[str, dict[str, tuple[str, ...]]] = {
+    "core5_24h": {"G1": ("MCF7", "HT29", "PC3"), "G2": ("HA1E", "A375")},
+}
+for _pop, _g in LINE_GROUPS.items():
+    if sorted(_g["G1"] + _g["G2"]) != sorted(POPULATIONS[_pop].cell_ids) or set(_g["G1"]) & set(_g["G2"]):
+        raise ValueError(f"LINE_GROUPS[{_pop!r}] must partition the population's cell_ids")
+
+
+def line_groups(population: "PopulationSpec | str") -> dict[str, tuple[str, ...]] | None:
+    """{"G1": lines, "G2": lines} for a population, or None if it declares none
+    (a single-line population has no line contrast)."""
+    name = population if isinstance(population, str) else population.name
+    return LINE_GROUPS.get(name)
+
+
+def line_group_sign(cell_id, population: "PopulationSpec | str"):
+    """(N,) float: -1 for G1 lines, +1 for G2 lines -- step A's z_C. Raises on a
+    line in neither group, and when the population declares no groups."""
+    import numpy as np
+    g = line_groups(population)
+    if g is None:
+        raise ValueError(f"population {population if isinstance(population, str) else population.name!r} "
+                         f"declares no line groups (spec.LINE_GROUPS); step A needs them")
+    c = np.asarray(cell_id).astype(str)
+    out = np.where(np.isin(c, g["G2"]), 1.0, np.where(np.isin(c, g["G1"]), -1.0, np.nan))
+    if np.isnan(out).any():
+        raise ValueError(f"cell_ids {sorted(set(c[np.isnan(out)]))[:5]} are in neither line group {g}")
+    return out
+
+
+def line_group_tag(population: "PopulationSpec | str") -> str:
+    """Dir-tag form of G2 (G1 is the rest), e.g. "G2-A375-HA1E"."""
+    return "G2-" + "-".join(sorted(line_groups(population)["G2"]))
+
+
+def population_of_build(data_dir: str) -> str | None:
+    """The population a build dir was made for (its population_qc.json), or None
+    when the dir holds no build yet."""
+    import json
+    path = os.path.join(data_dir, "population_qc.json")
+    if not os.path.isfile(path):
+        return None
+    with open(path) as fh:
+        return str(json.load(fh)["population"])
+
+
 # LINCS_ROOT: the directory holding src/ (i.e. lincs/), as RXRX19A_ROOT is RxRx19a/.
 PROJECT_ROOT = Path(os.environ.get("LINCS_ROOT", Path(__file__).resolve().parent.parent))
 
@@ -450,7 +514,11 @@ def decisions_record(cfg: CaseConfig) -> dict:
 
 
 def add_adjustment_set_cli(parser) -> None:
-    """Register `--adjustment_set` """
+    """Register `--adjustment_set` (and the population selectors)"""
+    parser.add_argument("--population", default=None, choices=sorted(POPULATIONS),
+                        help="Which declared population (spec.POPULATIONS). Default: the one "
+                             "the --data_dir build was made for, else mcf7_24h. A build and "
+                             "a population that disagree are refused.")
     parser.add_argument("--population_compounds", default=None, help="Comma-separated pert_ids or a file path; restricts the action space (controls always kept). Redefines the estimand.")
     parser.add_argument("--environment_set", default=None,  help="Comma-separated E fields for THIS arm; '' = explicitly empty, omit = role=E defaults. alpha sees C UNION E; V-REx runs over E.")
     parser.add_argument("--adjustment_set", default=None, help="Comma-separated C fields for THIS arm; '' = explicitly empty, omit = declared default. Generator and BOTH DR legs must match.")
@@ -492,8 +560,9 @@ def check_syn_args(cfg: CaseConfig, args) -> None:
 
 
 def config_from_args(args) -> CaseConfig:
-    """`default_config()` with an adjustment_set. """
-    cfg = default_config()
+    """`default_config()` with an adjustment_set (and `--population`, if given). """
+    pop_name = getattr(args, "population", None)
+    cfg = default_config() if pop_name is None else CaseConfig(population=POPULATIONS[pop_name])
     if not hasattr(args, "adjustment_set"):
         raise AttributeError("args has no `adjustment_set` attribute; add the field to the carrier -- defaulting silently would let the generator's C diverge from the DR legs'.")
     raw = args.adjustment_set
@@ -538,6 +607,18 @@ def apply_paths_args(cfg: CaseConfig, args, *, require_splits: bool = True) -> C
     if data_dir:
         # runs follow the build: data/mcf7_24h_limit1500 -> runs/mcf7_24h_limit1500
         data_dir = os.path.abspath(data_dir)
+        # The build names its own population; `--population` may confirm it but
+        # never contradict it, so one flag cannot point a command at the wrong
+        # table. Without `--population` the build's population is adopted.
+        built = population_of_build(data_dir)
+        if built is not None and built != cfg.population.name:
+            if getattr(args, "population", None) is not None:
+                raise SystemExit(f"--population {cfg.population.name} but {data_dir} is a build of "
+                                 f"{built!r} (its population_qc.json); they must agree")
+            if built not in POPULATIONS:
+                raise SystemExit(f"{data_dir} is a build of {built!r}, which spec.POPULATIONS "
+                                 f"does not declare")
+            cfg.population = replace(POPULATIONS[built], compounds=cfg.population.compounds)
         cfg.paths = Paths(population=cfg.population.name, raw_dir=cfg.paths.raw_dir, data_dir=data_dir,
                           train_output_dir=str(PROJECT_ROOT / "runs" / os.path.basename(data_dir)))
     nz = getattr(args, "nuisance_dir", None)

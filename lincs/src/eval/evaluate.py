@@ -58,7 +58,8 @@ from src.eval import dist_metrics as dm  # noqa: E402
 from src.nuisances.precompute_cmean import group_means  # noqa: E402
 from src.spec import (  # noqa: E402
     PLATE_CENTER_MODES, add_adjustment_set_cli, add_paths_cli, add_syn_cli,
-    apply_paths_args, check_syn_args, config_from_args, format_role_summary)
+    apply_paths_args, check_syn_args, config_from_args, format_role_summary,
+    line_group_sign, line_groups)
 
 # Table columns the estimand needs. `dose_level` is NOT in LincsDataset's
 # TABLE_COLUMNS, and the curated panel needs the names, so read the table
@@ -357,6 +358,137 @@ def bias_along_v(tau_est: np.ndarray, tau_truth: np.ndarray, arm_key: np.ndarray
     return out
 
 
+def group_contrast(y: np.ndarray, keys: np.ndarray, sign: np.ndarray,
+                   arm_key: np.ndarray) -> dict:
+    """Per arm, the line-group contrast c_a = tau_G2(a) - tau_G1(a) (STEP_A.md §3).
+
+    tau_G(a) is the arm's mean over its wells in group G's lines minus the
+    VEHICLE mean over the same group's lines, so a difference between the two
+    groups' vehicles cannot enter the contrast. `sign` is -1 (G1) / +1 (G2) per
+    row; `y`, `keys` and `sign` are the pool's rows. Returns the contrast aligned
+    to `arm_key` (NaN rows where the arm lacks one of the groups) and the well
+    counts per group.
+    """
+    keys = np.asarray(keys).astype(str)
+    g2 = np.asarray(sign) > 0
+    out = np.full((len(arm_key), y.shape[1]), np.nan, dtype=np.float64)
+    n = {1: np.zeros(len(arm_key), dtype=np.int64), 2: np.zeros(len(arm_key), dtype=np.int64)}
+    tau = {}
+    for gi, m in ((1, ~g2), (2, g2)):
+        if not m.any():
+            return {"contrast": out, "n1": n[1], "n2": n[2], "n_dmso": {1: 0, 2: 0}}
+        uniq, mu, cnt = group_means(y[m], keys[m])
+        uniq = uniq.astype(str)
+        i0 = np.flatnonzero(uniq == CONTROL_ARM)
+        if i0.size != 1:
+            raise RuntimeError(f"line group G{gi} has no vehicle wells in this pool")
+        pos = {k: i for i, k in enumerate(uniq)}
+        idx = np.array([pos.get(str(k), -1) for k in arm_key], dtype=np.int64)
+        t = np.full((len(arm_key), y.shape[1]), np.nan, dtype=np.float64)
+        ok = idx >= 0
+        t[ok] = mu[idx[ok]] - mu[int(i0[0])]
+        n[gi][ok] = cnt[idx[ok]]
+        tau[gi] = t
+        n[f"dmso{gi}"] = int(cnt[int(i0[0])])
+    out = tau[2] - tau[1]
+    return {"contrast": out, "n1": n[1], "n2": n[2],
+            "n_dmso": {1: n["dmso1"], 2: n["dmso2"]}}
+
+
+def bias_along_contrast(tau_est: np.ndarray, tau_truth: np.ndarray, arm_key: np.ndarray,
+                        contrast: np.ndarray, half_of_arm: dict, scored_ci: set[int],
+                        n_wells: np.ndarray | None = None) -> tuple[dict, np.ndarray]:
+    """Step A's readout (STEP_A.md §3): the error projected on each arm's OWN
+    line-group contrast direction u_a = c_a / ||c_a||.
+
+    A thinning that over-keeps G2 by dp_a biases the line-pooled estimate of a
+    generator blind to the line by dp_a * c_a, and the selection score flips
+    dp's sign between dose halves. So the statistic has the shape of step C's:
+    the mean projection in the high half minus the low half, on scored arms --
+    `bias_along_v` with v replaced by u_a, which is what is called here. Arms
+    without a direction are left out and counted.
+
+    `contrast` MUST come from wells no estimator trained on: the oracle's
+    `contrast_dir`, taken over the HOLDOUT wells only. A direction from the
+    pool's own wells shares their noise with anything fitted to the kept train
+    wells, and that term scales with dp: an estimator that memorises its kept
+    wells then shows dp * ||noise||^2 / ||c|| of "bias" with no line effect at
+    all, and the gamma = 0 control does not remove it because dp itself is what
+    gamma switches on (review, IMPLEMENT.md §5). With a holdout direction the
+    estimator's noise is independent of u_a, so the statistic is 0 in
+    expectation without effect modification. The price is a noisier direction
+    (1 holdout well per arm and line), i.e. an attenuated but unbiased signal.
+
+    The oracle's own noise is in both tau_truth and (on the holdout wells) u_a;
+    that term does not involve dp, is the same at both gammas, and cancels in
+    the difference in differences.
+
+    Returns (summary, per-arm projection aligned to `arm_key`, NaN where left out).
+    """
+    c = np.asarray(contrast, dtype=np.float64)
+    nrm = np.linalg.norm(c, axis=1)
+    ok = np.isfinite(c).all(axis=1) & (nrm > 0)
+    proj = np.full(len(arm_key), np.nan, dtype=np.float64)
+    if not ok.any():
+        return {"n_scored_arms": 0, "n_unscored_arms": 0,
+                "n_arms_without_contrast": int((~ok).sum())}, proj
+    u = c[ok] / nrm[ok, None]
+    te = np.asarray(tau_est, dtype=np.float64)[ok]
+    tt = np.asarray(tau_truth, dtype=np.float64)[ok]
+    out = bias_along_v(te, tt, np.asarray(arm_key)[ok], u, half_of_arm, scored_ci,
+                       n_wells=None if n_wells is None else np.asarray(n_wells)[ok])
+    proj[ok] = np.einsum("ag,ag->a", te - tt, u)
+    comp, _ = _split_key(np.asarray(arm_key)[ok])
+    sc = np.isin(comp, list(scored_ci)) if scored_ci else np.zeros(comp.size, bool)
+    out.update({
+        "direction": "u_a = c_a / ||c_a||, c_a = the G2 - G1 line-group contrast of arm a "
+                     "over the HOLDOUT wells (disjoint from every training well)",
+        "n_arms_without_contrast": int((~ok).sum()),
+        "contrast_norm": _q(nrm[ok]),
+        "contrast_norm_scored": _q(nrm[ok][sc]),
+    })
+    return out, proj
+
+
+def learned_line_contrast(gen_contrast: np.ndarray, oracle_contrast: np.ndarray,
+                          arm_key: np.ndarray, half_of_arm: dict,
+                          scored_ci: set[int]) -> dict:
+    """How much of each arm's line-group contrast the generator reproduces.
+
+    The step-A analogue of lambda-hat: per arm, <c_gen(a), u_a> against
+    ||c_a||, with c_gen the same G2 - G1 contrast taken over the generated row
+    means. A generator blind to the line gives exactly 0. The ratio is NOT a
+    share with ceiling 1: `oracle_contrast` is the holdout-well direction
+    (`contrast_dir`), a noisy estimate from ~5 wells per arm, so even a perfect
+    generator scores well below 1. Read it across arms, not against 1.
+    """
+    cg = np.asarray(gen_contrast, dtype=np.float64)
+    co = np.asarray(oracle_contrast, dtype=np.float64)
+    nrm = np.linalg.norm(co, axis=1)
+    ok = np.isfinite(cg).all(axis=1) & np.isfinite(co).all(axis=1) & (nrm > 0)
+    if not ok.any():
+        return {"n_arms": 0}
+    pg = np.einsum("ag,ag->a", cg[ok], co[ok] / nrm[ok, None])
+    comp, _ = _split_key(np.asarray(arm_key)[ok])
+    sc = np.isin(comp, list(scored_ci)) if scored_ci else np.zeros(comp.size, bool)
+    halves = np.array([int(half_of_arm.get(k, -1)) for k in np.asarray(arm_key)[ok]])
+    cosv = pg / (np.linalg.norm(cg[ok], axis=1) + 1e-12)
+    out = {"n_arms": int(ok.sum()),
+           "note": "ratio = sum <c_gen, u_a> / sum ||c_a||; ||c_a|| is noisy, so the "
+                   "ceiling is below 1 -- compare arms, not against 1"}
+    for name, sel in (("all", np.ones(ok.sum(), bool)), ("scored", sc), ("unscored", ~sc),
+                      ("scored_low", sc & (halves == 0)), ("scored_high", sc & (halves == 1))):
+        if not sel.any():
+            out[name] = None
+            continue
+        out[name] = {"n": int(sel.sum()),
+                     "ratio": float(pg[sel].sum() / nrm[ok][sel].sum()),
+                     "proj_mean": float(pg[sel].mean()),
+                     "oracle_norm_mean": float(nrm[ok][sel].mean()),
+                     "cos_median": float(np.median(cosv[sel]))}
+    return out
+
+
 def learned_syn_effect(row_mean: np.ndarray, keys: np.ndarray, syn_c: np.ndarray,
                        syn: dict, half_of_arm: dict, scored_ci: set[int],
                        keep_arms: set[str] | None = None) -> dict:
@@ -576,6 +708,7 @@ def _pool_block(real: dict, gen: dict | None, *, meta_by_arm: dict, floor: dict,
     tau_real = real["tau"]
     n_wells = real["n_wells"]
     comp, dose = _split_key(keys)
+    contrast_proj = None
     floor_med = floor_for_sizes(floor, n_wells)
     tau_norm_real = np.linalg.norm(tau_real, axis=1)
     ratio = tau_norm_real / np.where(floor_med > 0, floor_med, np.nan)
@@ -684,6 +817,14 @@ def _pool_block(real: dict, gen: dict | None, *, meta_by_arm: dict, floor: dict,
             acc["bias_along_v"] = bias_along_v(
                 te, tt, shared, directions_for(syn, _split_key(shared)[0]),
                 half_of_arm, scored_ci or set(), n_wells=n_wells[i_est])
+        # Step A's readout (STEP_A.md §3): the same statistic, each arm projected
+        # on the ORACLE's line-group contrast of that arm.
+        if truth.get("contrast_dir") is not None and half_of_arm is not None:
+            acc["bias_along_contrast"], cproj = bias_along_contrast(
+                te, tt, shared, truth["contrast_dir"][i_tr], half_of_arm,
+                scored_ci or set(), n_wells=n_wells[i_est])
+            contrast_proj = np.full(keys.size, np.nan)
+            contrast_proj[i_est] = cproj
         block["accuracy"] = acc
         arm_cos, arm_pear = np.full(keys.size, np.nan), np.full(keys.size, np.nan)
         arm_cos[i_est] = cos; arm_pear[i_est] = pear
@@ -749,6 +890,41 @@ def _pool_block(real: dict, gen: dict | None, *, meta_by_arm: dict, floor: dict,
                     "tau_norm_gen": tau_norm_est,
                     "mu0_gen": gen["mu0"].astype(np.float32),
                     "arm_cos": arm_cos, "arm_pearson": arm_pear})
+    # Step A (a population with line groups). The oracle stores each arm's
+    # contrast; a scored run stores its per-arm projection, which is all
+    # `step_a_report` needs for the clustered error.
+    if real.get("contrast") is not None:
+        c = real["contrast"]
+        cn = np.linalg.norm(c, axis=1)
+        has = np.isfinite(c).all(axis=1)
+        cd = real["contrast_dir"]
+        dn = np.linalg.norm(cd, axis=1)
+        hasd = np.isfinite(cd).all(axis=1) & (dn > 0)
+        both = has & hasd
+        block["line_contrast"] = {
+            "n_arms_with_contrast": int(has.sum()),
+            "n_arms_without_contrast": int((~has).sum()),
+            "norm": _q(cn[has]),
+            "norm_responder": _q(cn[has & responder_arm]),
+            "wells_per_arm": {"G1": _q(real["contrast_n1"][has]), "G2": _q(real["contrast_n2"][has])},
+            # the READOUT's direction: the same contrast over this pool's holdout
+            # wells only, which no estimator trained on (bias_along_contrast)
+            "direction": {
+                "source": "the pool's holdout wells",
+                "n_arms": int(hasd.sum()), "n_arms_without": int((~hasd).sum()),
+                "norm": _q(dn[hasd]),
+                "wells_per_arm": {"G1": _q(real["dir_n1"][hasd]), "G2": _q(real["dir_n2"][hasd])},
+                "cos_with_pool_contrast": _q(np.einsum("ag,ag->a", c[both], cd[both])
+                                             / (cn[both] * dn[both] + 1e-12)),
+            },
+        }
+        if gen is None:
+            npz.update({"contrast": c.astype(np.float32),
+                        "contrast_n1": real["contrast_n1"], "contrast_n2": real["contrast_n2"],
+                        "contrast_dir": cd.astype(np.float32),
+                        "contrast_dir_n1": real["dir_n1"], "contrast_dir_n2": real["dir_n2"]})
+    if contrast_proj is not None:
+        npz["contrast_proj"] = contrast_proj
     return block, npz
 
 
@@ -862,7 +1038,12 @@ def _load_truth(path: str, this: dict, pool: str, min_n: int) -> dict:
             "arm_key": z[f"{pool}/arm_key"], "tau": z[f"{pool}/tau"],
             "n_wells": z[f"{pool}/n_wells"], "responder": z[f"{pool}/responder"],
             "reliability_cos": z[f"{pool}/reliability_cos"],
-            "mu0": z[f"{pool}/mu0"]}
+            "mu0": z[f"{pool}/mu0"],
+            # step A: each arm's G2 - G1 line-group contrast over the pool's wells
+            # (descriptive) and over its HOLDOUT wells only (the readout's
+            # direction). Absent on a single-line population.
+            "contrast": (z[f"{pool}/contrast"] if f"{pool}/contrast" in z else None),
+            "contrast_dir": (z[f"{pool}/contrast_dir"] if f"{pool}/contrast_dir" in z else None)}
 
 
 # ---------------------------------------------------------------------------
@@ -903,6 +1084,13 @@ def main():
     # does, so --min_dose_n dropping an arm cannot shift a compound's halves.
     half_all = dose_half(compound_idx, dose_level, is_control)
     half_of_arm = dict(zip(keys_all, half_all))
+    # Step A: the population's two line groups, -1 (G1) / +1 (G2) per row. None
+    # on a single-line population, where none of the contrast machinery runs.
+    lgroups = line_groups(cfg.population)
+    gsign = (line_group_sign(meta["cell_id"].values, cfg.population)
+             if lgroups is not None else None)
+    in_holdout = np.zeros(n_total, dtype=bool)
+    in_holdout[np.asarray(splits["holdout_idx"], dtype=np.int64)] = True
 
     pool_rows = {"all": np.arange(n_total, dtype=np.int64),
                  "train": splits["train_idx"],
@@ -1027,6 +1215,14 @@ def main():
         real = dict(real, arm_key=real["arm_key"][keep], mu=real["mu"][keep],
                     tau=real["tau"][keep], n_wells=real["n_wells"][keep])
         mu0_real = real["mu0"]
+        if gsign is not None:
+            ct = group_contrast(y_all[rows], keys_all[rows], gsign[rows], real["arm_key"])
+            # The direction of the readout: the same contrast over the pool's
+            # HOLDOUT wells only (see bias_along_contrast for why).
+            hrows = rows[in_holdout[rows]]
+            cd = group_contrast(y_all[hrows], keys_all[hrows], gsign[hrows], real["arm_key"])
+            real.update(contrast=ct["contrast"], contrast_n1=ct["n1"], contrast_n2=ct["n2"],
+                        contrast_dir=cd["contrast"], dir_n1=cd["n1"], dir_n2=cd["n2"])
 
         dmso_rows = rows[is_control[rows] == 1]
         floor = noise_floor(y_all[dmso_rows], _floor_sizes(real["n_wells"]),
@@ -1101,6 +1297,13 @@ def main():
                 gen_out["row_mean"][gen_pos[rows]], keys_all[rows],
                 meta["syn_c"].values[rows], syn, half_of_arm, scored_ci,
                 keep_arms=set(map(str, real["arm_key"])))
+        # Step A's analogue, on the generation pool: the generator's own G2 - G1
+        # contrast per arm against the real one.
+        if gen_out is not None and gsign is not None and pname == args.pool:
+            gct = group_contrast(gen_out["row_mean"][gen_pos[rows]], keys_all[rows],
+                                 gsign[rows], real["arm_key"])
+            block["learned_line_contrast"] = learned_line_contrast(
+                gct["contrast"], real["contrast_dir"], real["arm_key"], half_of_arm, scored_ci)
         pools_json[pname] = block
         for k, v in arrs.items():
             npz[f"{pname}/{k}"] = v
@@ -1119,6 +1322,7 @@ def main():
         "n_rows_pool": int(pool_rows.size),
         "responder_mult": float(args.responder_mult),
         "n_floor_draws": int(args.n_floor_draws),
+        **({"line_groups": {k: list(v) for k, v in lgroups.items()}} if lgroups else {}),
         "panel_missing": missing,
         "generator": None if args.source == ORACLE_SOURCE else {
             "run_dir": os.path.abspath(args.run_dir),
@@ -1220,6 +1424,26 @@ def _summarise(doc: dict) -> None:
                           f"high {bv[nm + '_high']['mean']}  "
                           f"high-low {bv[nm + '_high_minus_low_mean']} "
                           f"+/- {bv[nm + '_high_minus_low_se']}")
+        lc = b.get("line_contrast")
+        if lc:
+            print(f"  LINE CONTRAST (G2 - G1 per arm): {lc['n_arms_with_contrast']:,} arms, "
+                  f"||c|| median {lc['norm']['median']}  responder arms {lc['norm_responder']['median']}; "
+                  f"holdout-well direction on {lc['direction']['n_arms']:,} arms "
+                  f"(cos with the pool's contrast, median {lc['direction']['cos_with_pool_contrast']['median']})")
+        bc = (b.get("accuracy") or {}).get("bias_along_contrast")
+        if bc and bc.get("n_scored_arms") is not None and "scored_low" in bc:
+            print(f"    BIAS ALONG THE LINE CONTRAST (signed <tau_gen - tau_oracle, u_a>), "
+                  f"{bc['n_scored_arms']:,} scored / {bc['n_unscored_arms']:,} unscored arms")
+            for nm in ("scored", "unscored"):
+                print(f"      {nm:8s} mean low {bc[nm + '_low']['mean']}  "
+                      f"high {bc[nm + '_high']['mean']}  "
+                      f"high-low {bc[nm + '_high_minus_low_mean']} "
+                      f"+/- {bc[nm + '_high_minus_low_se']}")
+        ll = b.get("learned_line_contrast")
+        if ll and ll.get("n_arms"):
+            print(f"  LEARNED LINE CONTRAST (sum <c_gen, u_a> / sum ||c_a||; ceiling < 1), "
+                  f"{ll['n_arms']:,} arms: scored {(ll.get('scored') or {}).get('ratio')}  "
+                  f"unscored {(ll.get('unscored') or {}).get('ratio')}")
         ls = b.get("learned_syn_effect")
         if ls and ls.get("n_arms"):
             print(f"  LEARNED syn_c SHIFT (lambda-hat = <gen(syn_c=1) - gen(syn_c=0), v_k> / beta), "

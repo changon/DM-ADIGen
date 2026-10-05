@@ -26,7 +26,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.data.build_dataset import ContextEncoder  # noqa: E402
 from src.spec import (  # noqa: E402
-    CONTEXT_COL, CONTEXT_FIELDS, Paths, decisions_record, default_config)
+    CONTEXT_COL, CONTEXT_FIELDS, POPULATIONS, CaseConfig, Paths, decisions_record,
+    line_groups, population_of_build)
 
 FAILS: list[str] = []
 
@@ -41,12 +42,20 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data_dir", default=None, help="build dir (default: cfg.paths.data_dir)")
     p.add_argument("--n_sample", type=int, default=200, help="rows re-read from the GCTX by inst_id")
+    p.add_argument("--population", default=None, choices=sorted(POPULATIONS),
+                   help="default: the build's own (population_qc.json), else mcf7_24h")
     args = p.parse_args()
 
     import h5py
     from datasets import load_from_disk
 
-    cfg = default_config()
+    # The build names its own population (population_qc.json); --population may
+    # confirm it but not contradict it.
+    built = population_of_build(os.path.abspath(args.data_dir)) if args.data_dir else None
+    name = args.population or built or "mcf7_24h"
+    if built is not None and built != name:
+        raise SystemExit(f"[check] --population {name} but {args.data_dir} is a build of {built!r}")
+    cfg = CaseConfig(population=POPULATIONS[name])
     if args.data_dir:
         cfg.paths = Paths(population=cfg.population.name, data_dir=os.path.abspath(args.data_dir))
     P = cfg.paths
@@ -104,9 +113,37 @@ def main():
     if qc["limit"] is not None:                       # a --limit build keeps whole plates
         want = want[want["det_plate"].isin(set(qc["plate_qc"]["plates"]))]
     dropped_plates = [d["plate"] for d in qc["plate_qc"]["dropped_plates"]]
-    want_kept = set(want.loc[~want["det_plate"].isin(dropped_plates), "inst_id"])
-    check(want_kept == set(df["inst_id"]) and len(want) - len(want_kept) == qc["plate_qc"]["n_wells_dropped"],
-          f"table = re-filtered inst_info ({len(want):,}) minus QC-dropped wells ({len(want) - len(want_kept)})")
+    after_qc = want.loc[~want["det_plate"].isin(dropped_plates)]
+    n_qc = len(want) - len(after_qc)
+    multi = len(pop.cell_ids) > 1
+    n_rule = 0
+    if multi:
+        # the every-line rule, re-derived from inst_info: a treated well stays only
+        # if its compound has a treated well in every line after plate QC
+        t_ = after_qc[after_qc["pert_type"] == "trt_cp"]
+        nl_ = t_.groupby("pert_id")["cell_id"].nunique()
+        ok_ids = set(nl_.index[nl_ == len(pop.cell_ids)])
+        keep_ = (after_qc["pert_type"] != "trt_cp") | after_qc["pert_id"].isin(ok_ids)
+        n_rule = int((~keep_).sum())
+        after_qc = after_qc.loc[keep_]
+        cc = qc.get("common_compounds") or {}
+        check(cc.get("applies") is True and cc.get("n_treated_wells_dropped") == n_rule
+              and cc.get("n_compounds_kept") == len(ok_ids),
+              f"every-line rule re-derived from inst_info: {len(ok_ids):,} compounds in all "
+              f"{len(pop.cell_ids)} lines, {n_rule:,} treated wells dropped (recorded {cc.get('n_treated_wells_dropped')})")
+        per = df.loc[~ctl].groupby("pert_id")["cell_id"].nunique()
+        check(bool((per == len(pop.cell_ids)).all()),
+              f"every treated compound of the table has wells in all {len(pop.cell_ids)} lines")
+        check(set(df["cell_id"]) == set(pop.cell_ids), f"all {len(pop.cell_ids)} lines present {sorted(set(df['cell_id']))}")
+        lg = line_groups(pop)
+        check(qc.get("line_groups") == ({k: list(v) for k, v in lg.items()} if lg else None),
+              f"population_qc line groups = spec.LINE_GROUPS {qc.get('line_groups')}")
+    else:
+        check("common_compounds" not in qc, "a single-line build records no every-line rule")
+    want_kept = set(after_qc["inst_id"])
+    check(want_kept == set(df["inst_id"]) and n_qc == qc["plate_qc"]["n_wells_dropped"],
+          f"table = re-filtered inst_info ({len(want):,}) minus QC-dropped wells ({n_qc})"
+          + (f" minus the every-line rule ({n_rule})" if multi else ""))
     check(df["cell_id"].isin(pop.cell_ids).all() and np.allclose(df["pert_time"], pop.pert_time_h),
           f"population cell_ids {pop.cell_ids}, {pop.pert_time_h:g} h")
     check((df.loc[ctl, "pert_type"] == "ctl_vehicle").all() and (df.loc[~ctl, "pert_type"] == "trt_cp").all(),
@@ -172,7 +209,11 @@ def main():
     rule_ok = all((r["spread"] > ratio * pq["median_spread"][r["cell_id"]]) == r["dropped"]
                   for r in pq["plates"].values())
     check(rule_ok, f"recorded drops follow spread > {ratio} x median")
+    # a multi-line --limit build may keep a plate whose treated wells the every-line
+    # rule removed entirely; it then holds only vehicles, and is still a table plate
     check(set(pq["plates"]) - set(dropped) == set(df["det_plate"]), "kept plates = table plates")
+    lines_of_plate = df.groupby("det_plate")["cell_id"].nunique()
+    check(bool((lines_of_plate == 1).all()), "every plate holds one cell line")
     dmso = df.loc[ctl].groupby("det_plate").size()
     check(set(dmso.index) == set(df["det_plate"]), f"every plate has DMSO wells (min {dmso.min()})")
     # kept plates' spreads recomputed from expr.npy (1.4826 * MAD per gene, median over genes)

@@ -45,7 +45,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.data.expr_stats import GATE_MAX_OMEGA2, GATE_MAX_OMEGA2_RATIO, GATE_MAX_PLATE_MEAN_Z  # noqa: E402
 from src.data.splits import load_splits, split_layer, split_strata  # noqa: E402
 from src.spec import (  # noqa: E402
-    add_adjustment_set_cli, add_paths_cli, apply_paths_args, config_from_args)
+    add_adjustment_set_cli, add_paths_cli, apply_paths_args, config_from_args, line_groups)
 
 FAILS: list[str] = []
 
@@ -320,9 +320,19 @@ def main():
         check(np.array_equal(dz["row_id"], tr) and str(dz["split_fingerprint"]) == s["split_fingerprint"],
               "dr_weights_design.npz row_id = train_idx, same split")
         comp, dl, syn = df["compound_idx"].values, df["dose_level"].values, df["syn_c"].values
+        conf = tier["confounder"]
+        line = df["cell_id"].values.astype(str)
+        if conf == "cell_id":
+            # step A: z_C from the declared line groups, cells = (dose_level, line)
+            lgr = line_groups(cfg.population)
+            check(lgr is not None and tier.get("line_groups") == {k: list(v) for k, v in lgr.items()}
+                  and tm["confounder"] == "cell_id",
+                  f"tier line groups = spec.LINE_GROUPS {tier.get('line_groups')}")
+            g2 = set(lgr["G2"]) if lgr else set()
         w_want = np.ones(tr.size)
         pos = {int(r): i for i, r in enumerate(tr)}
         dropped, ok = set(), {"rows": True, "z": True, "pi": True, "kept": True, "cells": True}
+        n_floor = 0
         g, kf, pmin = tm["gamma"], tm["keep_frac"], tm["pmin"]
         for c in tm["compounds"]:
             ci = c["compound_idx"]
@@ -330,28 +340,54 @@ def main():
             ok["rows"] &= np.array_equal(np.sort(rows), nu[(comp[nu] == ci) & ~ctl[nu]])
             lv = sorted(set(dl[pop & ~ctl & (comp == ci)].tolist()))
             high = np.array([lv.index(v) >= len(lv) // 2 for v in dl[rows]])
-            raw_z = np.where(high, 1.0, -1.0) * np.where(syn[rows] == 1, 1.0, -1.0)
+            zc = (np.array([1.0 if c_ in g2 else -1.0 for c_ in line[rows]]) if conf == "cell_id"
+                  else np.where(syn[rows] == 1, 1.0, -1.0))
+            raw_z = np.where(high, 1.0, -1.0) * zc
             z = (raw_z - raw_z.mean()) / raw_z.std() if raw_z.std() > 1e-12 else np.zeros(rows.size)
             ok["z"] &= np.allclose(z, c["z"])
             pi = np.array(c["pi"])
             free = (pi > pmin + 1e-9) & (pi < 1 - 1e-9)
             ratio = pi[free] / np.exp(-g * z[free])
+            if conf == "cell_id":
+                cells = np.array([f"{d:.6g}|{c_}" for d, c_ in zip(dl[rows], line[rows])])
+                n_want = len(lv) * len(cfg.population.cell_ids)   # every dose level in every line
+                # step A: keep_frac is the expected REALISED kept fraction under the
+                # per-cell redraw, sum_i pi_i / P_cell(i) = keep_frac * n -- unless the
+                # compound sits at its positivity floor (every pi = pmin keeps more).
+                p_c = {k: 1.0 - np.prod(1.0 - pi[cells == k]) for k in set(cells)}
+                exp_kept = float(sum(pi[i] / p_c[cells[i]] for i in range(rows.size)))
+                at_floor = bool(np.all(pi <= pmin + 1e-9)) and exp_kept > kf * rows.size
+                n_floor += at_floor
+                size_ok = at_floor or abs(exp_kept - kf * rows.size) < 1e-4 * rows.size
+                size_ok &= at_floor == bool(c.get("keep_frac_at_floor"))
+            else:
+                cells = np.array([f"{int(h)}|{int(sc)}" for h, sc in zip(high, syn[rows])])
+                n_want = 4
+                size_ok = abs(pi.sum() - kf * rows.size) < 1e-4 * rows.size
             ok["pi"] &= (ratio.size == 0 or np.ptp(ratio) <= 1e-6 * ratio.mean()) \
-                and abs(pi.sum() - kf * rows.size) < 1e-4 * rows.size and pi.min() >= pmin - 1e-9
+                and size_ok and pi.min() >= pmin - 1e-9
             kept = np.array(c["kept"]).astype(bool)
             ok["kept"] &= set(rows[kept].tolist()) == set(rows.tolist()) & set(tr.tolist())
             dropped |= set(rows[~kept].tolist())
-            cells = np.array([f"{int(h)}|{int(sc)}" for h, sc in zip(high, syn[rows])])
-            ok["cells"] &= len(set(cells)) == 4 and all(kept[cells == k].any() for k in set(cells))
+            ok["cells"] &= len(set(cells)) == n_want and all(kept[cells == k].any() for k in set(cells))
             for i in np.flatnonzero(kept):
                 p_c = 1.0 - np.prod(1.0 - pi[cells == cells[i]])
                 w_want[pos[int(rows[i])]] = p_c / pi[i]
         check(ok["rows"], "tier rows = each scored compound's unthinned treated train rows (table)")
-        check(ok["z"], "selection z = standardize(z_dose * z_syn_c) recomputed from dose_level / syn_c")
-        check(ok["pi"], "pi = calibrate(exp(-gamma z)): proportional where unclipped, sum = keep_frac * n, >= pmin")
+        check(ok["z"], f"selection z = standardize(z_dose * z_C) recomputed from dose_level / {conf}")
+        check(ok["pi"], "pi = calibrate(exp(-gamma z)): proportional where unclipped, >= pmin, "
+              + (f"expected realised kept = keep_frac * n under the per-cell redraw "
+                 f"({n_floor} compound(s) at their positivity floor)" if conf == "cell_id"
+                 else "sum = keep_frac * n"))
+        if conf == "cell_id":
+            check(tm.get("n_compounds_at_keep_frac_floor") == n_floor
+                  and "realised" in str(tm.get("keep_frac_is")),
+                  f"tier_meta records keep_frac as the realised fraction; {n_floor} compound(s) at the floor")
         check(ok["kept"] and set(nu.tolist()) - set(tr.tolist()) == dropped,
               f"thinned rows ({len(dropped):,}) = scored train rows not kept; kept rows stay in train")
-        check(ok["cells"], "every positivity cell (compound, dose half, syn_c) keeps >= 1 train well (table)")
+        check(ok["cells"], "every positivity cell "
+              + ("(compound, dose_level, cell_id)" if conf == "cell_id" else "(compound, dose half, syn_c)")
+              + " keeps >= 1 train well (table)")
         check(np.allclose(dz["w"], w_want, rtol=1e-6),
               "design weights = P_c / pi on kept scored rows (inverse realised inclusion), 1 elsewhere")
     if os.path.normpath(nz) != os.path.normpath(base_nz) and os.path.isfile(base_split):
