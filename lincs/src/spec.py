@@ -351,6 +351,19 @@ def line_group_tag(population: "PopulationSpec | str") -> str:
     return "G2-" + "-".join(sorted(line_groups(population)["G2"]))
 
 
+# The decision task on step A (DECISION.md §4-5). Declared 2026-10-05, BEFORE any
+# decision number was read. Task B's axis is fixed here, not fitted: equal
+# weights on these cell-cycle landmark genes, signed so that a larger effect
+# means LOWER expression of the set (read as more anti-proliferative).
+PROLIFERATION_GENES: tuple[str, ...] = (
+    "TOP2A", "CCNB1", "CDK1", "PCNA", "AURKA", "PLK1", "BIRC5",
+    "CCNA2", "CDC20", "KIF20A", "CCNE2", "MCM3", "E2F2", "CDC25A")
+DECISION_MIN_DOSES = 4                  # a compound enters with >= this many eligible doses
+DECISION_K = 100                        # task B's headline top-k (X4)
+DECISION_K_CURVE: tuple[int, ...] = (25, 50, 100, 200)
+DECISION_K_CONTROL = 50                 # D5's screen over the unthinned compounds only
+
+
 def population_of_build(data_dir: str) -> str | None:
     """The population a build dir was made for (its population_qc.json), or None
     when the dir holds no build yet."""

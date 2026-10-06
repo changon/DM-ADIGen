@@ -3846,3 +3846,466 @@ Review findings not acted on:
   0. Its "+0.0000" at γ = 0 is a median; the per-compound mean is +0.0015.
 - `load_syn_meta` records `table_fingerprint` and does not compare it.
 - The oracle JSON is written atomically and its `_tau.npz` is not.
+
+#### Step A results (2026-10-05)
+
+All 28 GPU jobs (993188–993215, `zabih`) and the P1 + verdict job (993216,
+`bindel`) completed with no failure or requeue. Training took 47–52 min per
+run and scoring 33–34 min. Verdicts:
+`runs/core5_24h/eval_artifacts/step_a_verdict.json` (pool all, the readout
+declared in `STEP_A.md` §3) and `step_a_verdict_poolholdout.json` (secondary).
+
+**Verdict on the declared readout (pool all): S1–S5 all pass.**
+
+| arm | seeds | DiD scored ± clustered SE | seed sd | DiD unscored | MSE / `conditional` | learned line contrast, scored / unscored |
+|---|---|---|---|---|---|---|
+| `naive` | 1 | −0.793 ± 0.042 | n/a | −0.050 ± 0.007 | 1.058 | 0.000 / 0.000 |
+| `conditional` | 2 | −0.071 ± 0.015 | 0.002 | +0.000 ± 0.003 | 1.000 | 0.121 / 0.066 |
+| `dr` | 2 | −0.000 ± 0.018 | 0.025 | +0.011 ± 0.003 | 1.016 | 0.123 / 0.064 |
+| `dr_p2` | 2 | −0.005 ± 0.017 | 0.018 | +0.006 ± 0.003 | 1.013 | 0.122 / 0.065 |
+| `p1_cond_counts` | 2 | −0.048 ± 0.031 | 0.000 | −0.001 ± 0.001 | 0.878 | (generator unchanged) |
+| `p1_cond_ones` (control) | 2 | −0.004 ± 0.026 | 0.005 | −0.001 ± 0.001 | 0.746 | |
+| `p1_naive_counts` | 1 | −0.051 ± 0.031 | n/a | −0.001 ± 0.001 | 0.886 | |
+| `p1_naive_ones` (control) | 1 | −0.951 ± 0.052 | n/a | −0.001 ± 0.001 | 0.782 | |
+
+| # | Criterion | Result |
+|---|---|---|
+| S0 | bias in the training data ≥ 5 SE | PASS: −0.941 ± 0.052 (18.2 SE) |
+| S1 | `naive` biased, > 3 SE | PASS: 18.9 SE |
+| S2 | `conditional` biased, > 2 SE (testability) | PASS: 4.7 SE |
+| S3 | ADIGen arm beats `conditional` by > 2 paired SE | PASS: `dr` reduction +0.070 ± 0.019 (3.7 SE); `dr_p2` +0.066 ± 0.010 (6.9 SE) |
+| S4 | unscored compounds unchanged | PASS for all four arms (bound 0.198) |
+| S5 | weight hashes match | PASS, 14 runs |
+
+Findings:
+
+1. **`naive` learns 84% of the planted bias** (−0.793 of −0.941). Step C2's
+   `naive` learned 18% and step C's 65%.
+2. **`conditional` removes 91% of it but keeps a residual**, −0.071 (4.7 SE),
+   reproduced by both seeds (−0.069, −0.072). This is the first experiment
+   where "DR against `conditional`" is testable.
+3. **Both ADIGen arms remove the residual.** `dr` is at −0.000 ± 0.018 and
+   `dr_p2` at −0.005 ± 0.017. There is no over-correction: step C2's `dr`
+   overshot to +0.58.
+4. **`dr`'s 0.000 is a mean of two seeds of opposite sign** (−0.018, +0.018).
+   Each seed alone is at 0.018, about a quarter of `conditional`'s residual, so
+   the per-seed reduction is ≈ 0.053, still well above the paired SE.
+5. **The generator is not damaged the way it was in C2.** MSE is 1.6% (`dr`)
+   and 1.3% (`dr_p2`) above `conditional`, against +29% for `dr` in C2, and
+   the learned line contrast is unchanged on scored and unscored compounds.
+   The MSE ratio understates the cost, though: against the truth the weights
+   add 17% (`dr`) and 11% (`dr_p2`) to the model's error on the thinned
+   compounds ("MSE decomposition" below).
+6. **`dr` and `dr_p2` are indistinguishable here.** P2's repair was not needed
+   in step A; it does no harm.
+7. **Unscored compounds move a little.** `naive` −0.050 ± 0.007 and `dr`
+   +0.011 ± 0.003 are both more than 2 SE from zero. They pass S4 on the size
+   bound (a quarter of `naive`'s scored bias), not on the noise allowance. So
+   the thinning of 848 compounds leaks slightly into the 902 others through
+   the shared generator.
+8. **The AIPW baseline (P1) fixes `naive` but does not beat `conditional`.**
+   `p1_naive_counts` cuts −0.793 to −0.051. `p1_cond_counts` is at
+   −0.048 ± 0.031, a reduction of +0.023 ± 0.028 over `conditional` (0.8 SE).
+   Both P1 arms equal the counts-weighted memoriser of the S0 table
+   (−0.046 ± 0.031): with weights that are exact per cell, the correction
+   replaces the generator's arm mean by the weighted mean of the kept wells,
+   whatever the generator. Its error is that estimate's sampling noise, which
+   is about twice the ADIGen arms' SE.
+9. **P1's MSE advantage is in-sample.** On pool all its MSE is 12–25% below
+   `conditional`, because the correction uses training wells that are also in
+   the oracle. On the holdout pool it is 42–48% above `conditional`, while
+   `dr` and `dr_p2` are within 1%.
+
+**The flat-weight control on `conditional` did not come out worse**
+(`p1_cond_ones` −0.004 against `conditional` −0.071), which §3 said it must.
+On `naive` the control behaves as required (−0.951, the memoriser's −0.941).
+My reading, from the algebra and not checked by a separate experiment:
+
+- Write the generator's arm mean in line $c$ as the kept wells' mean plus a
+  misfit $\delta_c$. `conditional`'s error is $\sum_c P(c)\,\delta_c$. The
+  flat-weight correction leaves $\sum_c (P(c) - p_\text{kept}(c))\,\delta_c$,
+  and exact weights leave 0.
+- The flat correction therefore removes any misfit that is common to the
+  lines. A generator that ignores the line has $\delta_c$ equal to minus the
+  line effect, which is the fully line-specific case, and the control
+  reproduces the memoriser. That is what the control was designed on.
+- For `conditional` the control lands on zero, so its residual is mostly a
+  line-common misfit that follows the kept mix: the part of the response the
+  model shares across lines is pulled toward the lines that were kept.
+- Consequence: the control's rule ("must be worse") is wrong for a generator
+  that sees C and should be dropped for it. And an unweighted residual
+  correction also removes `conditional`'s bias here, so step A shows that the
+  weighted risk repairs the generator, not that the weights are the only way
+  to repair the estimate.
+
+**Secondary pool (holdout wells as truth): same direction, not significant.**
+
+| arm | DiD scored ± SE | reduction over `conditional` |
+|---|---|---|
+| `naive` | −0.796 ± 0.043 | |
+| `conditional` | −0.064 ± 0.016 (4.1 SE) | |
+| `dr` | +0.017 ± 0.018 | +0.047 ± 0.032 (1.5 SE) |
+| `dr_p2` | +0.013 ± 0.018 | +0.051 ± 0.032 (1.6 SE) |
+
+- The report prints S3 as FAIL on this pool. It is not the declared readout:
+  its truth is each arm's holdout wells only, and the paired SE is 1.7–3×
+  larger. The point estimates agree with pool all.
+
+What step A does and does not establish:
+
+- It establishes, on a real confounder, the ordering `naive` ≫ `conditional`
+  > ADIGen ≈ 0, with the ADIGen advantage at 3.7 SE (`dr`) on the declared
+  readout and no cost in MSE.
+- The advantage is small in absolute terms: `conditional` already removes 91%
+  of the bias and ADIGen the remaining 9%.
+- It does not establish that ADIGen beats the AIPW baseline on bias. The two
+  are within noise of each other (0.000 ± 0.018 against −0.048 ± 0.031; the
+  paired difference was not computed). ADIGen's advantage over P1 is variance
+  out of sample (finding 9) and that it yields a generator.
+- One tier seed (42) and one γ. The clustered SE covers the compounds, not a
+  second thinning draw.
+
+#### MSE decomposition: where the squared error comes from (2026-10-05)
+
+Question (user): list every term that contributes to the MSE and show how
+small the confounding-bias term is.
+
+- **Code:** `src/eval/mse_decomposition.py` (new, numpy only),
+  `scripts/mse_decomposition_cpu.sub`; jobs 157 and 185 on `bindel`, 3 min,
+  4.4 GB.
+- **Output:** `runs/core5_24h/eval_artifacts/mse_decomposition.json` (every
+  number below, at γ = 0 and γ = 1, for scored, unscored and all arms).
+- **Units:** squared error per arm, summed over the 978 genes. Divide by 978
+  for the per-gene MSE that `evaluate` prints.
+
+**Answer.**
+
+- The bias the step-A readout measures is 0.004% of `conditional`'s squared
+  error on the thinned arms and 0.3% of `naive`'s. MSE cannot see it.
+- The reported MSE is roughly the oracle's own noise. The model's error
+  against the truth is about a quarter of that size and is mostly hidden,
+  because the generator copies noise from training wells the oracle shares.
+- Against the truth, the weighted arms pay a variance cost on the thinned arms
+  that the MSE ratio understated: +17% for `dr`, +11% for `dr_p2`.
+
+**The terms.** For one arm, let τ_gen be the generator's estimate, τ_o the
+all-wells oracle and τ\* the true effect, with e = τ_gen − τ\* and
+ε = τ_o − τ\*. Then ‖τ_gen − τ_o‖² = ‖ε‖² − 2⟨e, ε⟩ + ‖e‖², and ‖e‖² splits
+further:
+
+| Row | What it is |
+|---|---|
+| total | ‖τ_gen − τ_o‖², the generator against the all-wells oracle; the reported MSE × 978 |
+| oracle noise | ‖ε‖², the oracle's own sampling error (it averages ~15 wells); the same for every arm of the experiment |
+| overlap credit | −2⟨e, ε⟩; negative because the generator reproduces noise from training wells that are also in the oracle, which makes it look closer to the oracle than it is to the truth |
+| **model error** | ‖e‖², the generator against the truth |
+| – generation noise | error from estimating each well's mean with 16 generated samples |
+| – training variance | what changes when the same model is retrained with another seed |
+| – seed-shared error | the rest: what both seeds have in common. It holds the model's misfit **and** the noise inherited from the particular training wells, which a new seed does not redraw |
+| bias², as the DiD reads it | the shift of the estimate from γ = 0 to γ = 1 along the line-contrast direction, averaged over the arms of each dose half with its sign, then squared. One component of the seed-shared error |
+
+**How the truth-dependent rows are measured.** Two references are built per
+arm from disjoint wells: τ_h from its holdout wells and τ_tr from its unthinned
+train wells. Each is standardised to the arm's line mix over all wells and
+uses its own vehicle mean, so both are unbiased for τ\* with independent
+noise. No generator trains on a holdout well. Then:
+
+- ⟨τ_h, τ_tr⟩ estimates ‖τ\*‖² (the noise terms average to zero);
+- oracle noise = ‖τ_o‖² − ⟨τ_h, τ_tr⟩;
+- model error = ‖τ_gen‖² − 2⟨τ_gen, τ_h⟩ + ⟨τ_h, τ_tr⟩;
+- overlap credit = total − oracle noise − model error;
+- generation noise = Σ over the arm's rows of row_var/(m − 1)/n², m = 16,
+  from the saved per-row variances;
+- seed-shared error = model error − ½‖τ_gen(seed 0) − τ_gen(seed 1)‖².
+
+No noise model is assumed. A single arm's estimate is very noisy; the means
+are precise, with delete-one-compound jackknife errors. "Truth" is what the
+arm's average converges to with unlimited replicate wells in this experiment.
+The method needs a holdout and a train well in every one of the arm's lines:
+7,466 of 10,484 arms (3,550 scored, 3,916 unscored). The all-wells reference
+recomputed from rows matches the stored oracle to 3e-7.
+
+**Scored (thinned) arms, γ = 1** (3,550 arms):
+
+| term | `naive` | `conditional` | `dr` | `dr_p2` |
+|---|---|---|---|---|
+| **total** | 56.07 ± 1.05 | 52.46 ± 0.96 | 54.15 ± 0.98 | 54.04 ± 0.98 |
+| oracle noise | 47.66 ± 0.86 | 47.66 | 47.66 | 47.66 |
+| overlap credit | −11.11 | −12.22 | −13.38 | −12.46 |
+| **model error** | 19.52 ± 1.05 | 17.02 ± 1.01 | 19.86 ± 1.06 | 18.84 ± 1.04 |
+| – generation noise | 2.48 | 2.27 | 2.25 | 2.25 |
+| – training variance | n/a (1 seed) | 0.8 to 3.0 | 1.0 to 3.2 | 1.0 to 3.2 |
+| – seed-shared error | n/a | 11.7 to 14.0 | 14.4 to 16.6 | 13.4 to 15.6 |
+| – – its change from γ = 0 to γ = 1 | −0.18 ± 0.46 (model error) | −0.63 ± 0.40 | +0.35 ± 0.52 | −0.17 ± 0.46 |
+| **bias², as the DiD reads it** | 0.179 | 0.0019 | 0.00002 | 0.00009 |
+| – the DiD itself on these arms | −0.780 | −0.076 | −0.005 | −0.018 |
+| – share of the total | 0.32% | 0.004% | < 0.001% | < 0.001% |
+| – share of the model error | 0.92% | 0.011% | < 0.001% | < 0.001% |
+| model error minus `conditional`'s (paired) | +2.50 ± 0.40 | 0 | +2.84 ± 0.28 | +1.82 ± 0.22 |
+| the same at γ = 0 | +2.09 ± 0.33 | 0 | +1.94 ± 0.18 | +1.37 ± 0.14 |
+
+Oracle noise + overlap credit + model error = total, by construction. The two
+ranges are explained under "Limits".
+
+**Unscored arms and all arms, γ = 1:**
+
+| term | `naive` | `conditional` | `dr` | `dr_p2` |
+|---|---|---|---|---|
+| *Unscored (3,916 arms)* | | | | |
+| total | 32.65 | 32.11 | 32.45 | 32.19 |
+| oracle noise | 34.96 ± 0.33 | 34.96 | 34.96 | 34.96 |
+| overlap credit | −7.17 | −7.61 | −7.03 | −7.53 |
+| model error | 4.86 ± 0.25 | 4.76 ± 0.23 | 4.51 ± 0.23 | 4.75 ± 0.23 |
+| – generation noise | 1.81 | 1.76 | 1.79 | 1.76 |
+| – training variance | n/a | 0 to 1.1 | 0 to 1.1 | 0 to 1.1 |
+| – seed-shared error | n/a | 1.9 to 3.7 | 1.6 to 3.4 | 1.9 to 3.6 |
+| bias², as the DiD reads it | 0.0005 | 0.00001 | 0.00002 | 0.00000 |
+| model error minus `conditional`'s (paired) | +0.10 ± 0.10 | 0 | −0.25 ± 0.03 | −0.00 ± 0.02 |
+| *All (7,466 arms)* | | | | |
+| total | 43.78 | 41.79 | 42.77 | 42.58 |
+| oracle noise | 41.00 ± 0.47 | 41.00 | 41.00 | 41.00 |
+| overlap credit | −9.04 | −9.80 | −10.05 | −9.87 |
+| model error | 11.83 ± 0.55 | 10.59 ± 0.52 | 11.81 ± 0.55 | 11.45 ± 0.54 |
+| – generation noise | 2.13 | 2.00 | 2.01 | 2.00 |
+| – training variance | n/a | 0.0 to 2.0 | 0.1 to 2.1 | 0.1 to 2.1 |
+| – seed-shared error | n/a | 6.6 to 8.6 | 7.7 to 9.7 | 7.3 to 9.3 |
+| bias², as the DiD reads it | 0.045 | 0.0005 | 0.00000 | 0.00002 |
+| model error minus `conditional`'s (paired) | +1.24 ± 0.20 | 0 | +1.22 ± 0.14 | +0.86 ± 0.11 |
+
+Findings:
+
+1. **The bias term is negligible in the MSE.** No arm's squared error rises
+   measurably from γ = 0 to γ = 1, `naive` included (all within 1.6 SE of
+   zero). MSE cannot detect confounding of the size planted here; the signed
+   readout of `STEP_A.md` §3 is the instrument for it.
+2. **The MSE is roughly the oracle's noise.** Over all arms the oracle noise
+   (41.0) is about the size of the total (41.8). The model error (10.6) is
+   mostly cancelled by the overlap credit (−9.8).
+3. **Most of the model error is common to both seeds and is there at γ = 0.**
+   On thinned arms it is 12–17 of 17–20, and it does not change with γ. It is
+   not confounding.
+4. **The weights cost variance on the thinned arms.** `dr` is 2.84 ± 0.28
+   above `conditional` (+17%) and `dr_p2` 1.82 ± 0.22 (+11%). Most of it is
+   there at γ = 0, so it is the price of weighting, not of the correction. On
+   unthinned arms there is no cost (`dr` is 0.25 ± 0.03 *below*
+   `conditional`). Over all arms it is +12% and +8%.
+5. **P2 appears to pay less than `dr`.** The two were not compared with their
+   own paired SE.
+6. **Thinned arms carry far more model error than unthinned ones** (17 against
+   4.8). They are the responders, with a true effect five times larger
+   (‖τ\*‖² 132 against 25), so there is more to get wrong.
+
+**What the seed-shared row contains, and why `dr`'s is higher.** `dr` and
+`conditional` share the architecture, the data and C; only the per-row loss
+weights differ. Their misfit should be about equal, so `dr`'s excess must be
+the other component: noise inherited from the training wells, which the
+weights amplify. Evidence, on thinned arms:
+
+| | `conditional` | `dr` | `dr_p2` |
+|---|---|---|---|
+| model error minus `conditional`'s, mean of γ = 0 and γ = 1 | 0 | +2.39 | +1.60 |
+| sensitivity to a redraw of the kept wells (half of the shift ‖D‖² between the γ = 0 and γ = 1 instances) | 2.76 | 4.70 | 4.07 |
+| – minus `conditional`'s | 0 | +1.94 | +1.31 |
+| overlap with the oracle's noise, ⟨e, ε⟩ | 6.11 | 6.69 | 6.23 |
+
+- The two instances keep different wells, so their difference shows how much
+  an estimate depends on which wells it got. `dr`'s extra sensitivity accounts
+  for about 80% of its excess error (1.94 of 2.39; 1.31 of 1.60 for `dr_p2`).
+  Only the thinned-away quarter of the wells is redrawn, so this understates
+  the full effect.
+- The excess is on thinned arms only, where the weights are unequal.
+- It grows with the spread of the weights: +1.94 at γ = 0, +2.84 at γ = 1.
+- `dr` copies more of the training wells' noise (largest overlap).
+
+Reading (mine, not separately tested): unequal weights inside an arm make its
+fit lean on fewer wells, which `dr` and `dr_p2` share; and `dr`'s global
+normalisation gives thinned arms more total weight than unthinned ones, so the
+model fits their wells more closely, which would explain `dr` > `dr_p2`.
+
+Limits:
+
+- **Two rows are ranges.** Every run was scored with the same sampling seed
+  (eval seed 0), so the generation noise is largely common to the two training
+  seeds and cancels in their difference. The lower end of the training
+  variance (upper end of the seed-shared error) assumes the sampling noise is
+  not shared at all; the other end, that it is fully shared. On unscored arms
+  the seed difference is smaller than the generation noise, so at least 38%
+  of it is shared.
+- **Misfit and inherited noise are not separated.** Of `conditional`'s
+  11.7–14.0 on thinned arms, at least 2.8 is inherited noise (its own redraw
+  sensitivity). Splitting the rest needs runs on a second split seed.
+- `naive` has one seed, so only its model error and generation noise are
+  separated.
+- The redraw-sensitivity row mixes the redraw with the confounding shift. The
+  confounding part is the bias² row, which is far smaller.
+
+Corrections to what was said before this entry:
+
+- The model error was first put at 3.5–5 per arm by subtracting a noise floor
+  from the total. That assumed the model's error and the oracle's noise were
+  independent, and they are not. It is 10.6 per arm over all arms.
+- `naive`'s error is 12% above `conditional`'s over all arms, not 50–75%.
+- The seed-shared row was first called "systematic error" and read as misfit.
+  It also holds the noise inherited from the training wells.
+
+#### Decision task on step A (2026-10-05)
+
+Question (main author): the target is a debiased generator for decisions, not
+the lowest MSE. Do the step-A generators choose a dose or a compound better
+with the weighted risk? The plan, the effect definition and the criteria are
+in `DECISION.md`; they were fixed before any decision number was read.
+
+**Verdict: neither task is testable (D0 fails on both). The planted
+confounding does not move either decision even in the raw data.** What the run
+does show: the weights' extra error costs nothing in decisions (D4 passes), and
+neither ADIGen arm chooses measurably better or worse than `conditional`.
+
+- **Code:** `src/eval/decision_task.py` and `src/tests/check_decision.py` (new,
+  numpy only), `scripts/decision_cpu.sub`, four constants in `spec.py`
+  (`PROLIFERATION_GENES`, `DECISION_MIN_DOSES`, `DECISION_K`, `DECISION_K_CURVE`,
+  `DECISION_K_CONTROL`). No training and no sampling: it reads the `row_mean`
+  of the 14 step-A scoring runs.
+- **Jobs** (`bindel`, 4 CPUs, 7 GB, no job preempted):
+  - 4002, the smoke test (`MODE=check`): 48 checks, 0 failures, 1 min 11 s;
+  - 4014, checks and analysis: exit 0, 4 min 40 s, peak 5.7 GB.
+- **Output:** `runs/core5_24h/eval_artifacts/decision_task.json` (every number
+  below, both truths) and `decision_task_values.npz` (per compound).
+
+**Set-up as run.**
+
+- Effect: the equal-weight mean over the five lines of [cell mean − that line's
+  vehicle mean], for the truth and every estimator.
+- Truth: holdout wells (primary); the same choices scored on all wells
+  (secondary).
+- 7,451 of 10,484 arms have a holdout well in every line. 632 thinned and 709
+  unthinned compounds have at least 4 such doses and enter.
+- Task A: the dose with the largest effect along the compound's own signature.
+  Task B: the top-100 compounds (each at its best dose) on a fixed axis, minus
+  the mean of 14 cell-cycle genes.
+- Value: the mean true effect of what was chosen, in z units along a unit
+  vector, reported as the gain over a random choice. The captured share is
+  that gain as a fraction of the full-data reference's.
+- Task-B axis check on the oracle, before any generator was read: the
+  proteasome, HSP90 and HDAC compounds of the §3.7 panel sit at a median
+  percentile of 0.96 (needed ≥ 0.8).
+- The G2 share of the kept train wells moved by +0.154 (low dose half) and
+  −0.134 (high half) at γ = 1, and by +0.003 / +0.001 at γ = 0.
+
+**Primary truth (holdout wells).** Gain over a random choice, ± compound-level SE.
+
+| policy | task A, γ = 0 | task A, γ = 1 | share, γ = 1 | task B top-100, γ = 0 | γ = 1 | share, γ = 1 |
+|---|---|---|---|---|---|---|
+| full-data reference | 3.911 ± 0.224 | (same) | 1 | 5.001 ± 0.215 | (same) | 1 |
+| pooled real mean | 3.794 ± 0.227 | 3.751 ± 0.227 | 0.959 ± 0.018 | 4.883 ± 0.212 | 4.912 ± 0.211 | 0.982 ± 0.009 |
+| stratified real mean | 3.787 ± 0.228 | 3.801 ± 0.227 | 0.972 ± 0.018 | 4.985 ± 0.209 | 4.993 ± 0.207 | 0.998 ± 0.005 |
+| `naive` | 3.801 ± 0.223 | 3.971 ± 0.219 | 1.015 ± 0.032 | 4.912 ± 0.217 | 4.831 ± 0.228 | 0.966 ± 0.011 |
+| `conditional` | 3.908 ± 0.218 | 3.924 ± 0.219 | 1.003 ± 0.033 | 4.937 ± 0.216 | 4.948 ± 0.221 | 0.989 ± 0.007 |
+| `dr` | 3.982 ± 0.216 | 3.994 ± 0.218 | 1.021 ± 0.031 | 4.955 ± 0.218 | 4.935 ± 0.223 | 0.987 ± 0.008 |
+| `dr_p2` | 3.969 ± 0.217 | 4.055 ± 0.217 | 1.037 ± 0.031 | 4.944 ± 0.215 | 4.940 ± 0.225 | 0.988 ± 0.008 |
+
+Task A is over the 632 thinned compounds (jackknife); task B over all 1,341
+candidates (bootstrap, 2,000 resamples). The SE of a single gain is dominated
+by the spread between compounds, which is common to every policy; the paired
+errors below are the ones to compare policies with.
+
+| # | Criterion | Task A | Task B |
+|---|---|---|---|
+| D0 | pooled real mean loses value, ≥ 3 SE | **FAIL**: +0.043 ± 0.081 (0.5 SE) | **FAIL**: −0.029 ± 0.051 (−0.6 SE) |
+| D1 | `naive` loses value, > 2 SE | not judged: −0.170 ± 0.092 (it gains) | not judged: +0.080 ± 0.053 |
+| D2 | `conditional` loses value, > 2 SE | not judged: −0.016 ± 0.044 | not judged: −0.011 ± 0.022 |
+| D3 | gain of `dr` / `dr_p2` over `conditional` | not judged: −0.004 ± 0.067 / +0.070 ± 0.074 | not judged: −0.031 ± 0.024 / −0.015 ± 0.021 |
+| D4 | no decision cost of the weights at γ = 0 | PASS: +0.073 ± 0.036 / +0.061 ± 0.036 | PASS: +0.018 ± 0.018 / +0.007 ± 0.013 |
+| net | `dr` / `dr_p2` minus `conditional` at γ = 1 | +0.070 ± 0.059 / +0.131 ± 0.069 | −0.013 ± 0.017 / −0.008 ± 0.019 |
+| D5 | unthinned control unchanged | PASS (largest \|z\| 1.49) | PASS (largest \|z\| 1.14) |
+
+Findings:
+
+1. **D0 fails, so the comparison the task was built for cannot be made.** With
+   the line ignored, the real kept wells choose as well at γ = 1 as at γ = 0.
+   By `DECISION.md` §6 both tasks are recorded as not testable, and D1–D3 are
+   descriptive.
+2. **Why: the tilt is small against the dose curve.** The best dose beats a
+   random one by 3.9 on task A, and every policy captures 96–104% of what the
+   full data captures.
+   - The pooled real mean changes its dose for 23% of the thinned compounds
+     between the two instances, and the stratified mean for 25%. So the changes
+     come from which wells were kept, not from the line mix.
+   - The predicted direction is visible and tiny: the chosen dose moves by
+     +0.08 ranks as predicted for the pooled real mean and +0.11 for `naive`,
+     against −0.03 to 0.00 for the stratified mean and the three adjusted
+     generators. No error was computed for these, and they cost no value.
+3. **The weights' extra error costs nothing in decisions (D4).** At γ = 0,
+   `dr` and `dr_p2` are not below `conditional` on either task. On task A they
+   are slightly above it (+0.073 ± 0.036 and +0.061 ± 0.036). That is 2.0 and
+   1.7 SE on one of several comparisons, so it is not a result. This is the
+   main author's point about the MSE, and it holds here.
+4. **Neither ADIGen arm chooses measurably better than `conditional` at
+   γ = 1.** Every net difference is within 2 SE (largest: `dr_p2` on task A,
+   1.9 SE).
+   - `naive` on task A is not below `conditional` at γ = 1: +0.047 ± 0.087,
+     paired, from the per-compound file.
+   - `naive` on task B's top-100 has the lowest share at γ = 1 (0.966 ± 0.011
+     against 0.989 ± 0.007 for `conditional`). That paired difference was not
+     computed.
+5. **On weak compounds the generators choose better than the real wells; on
+   strong ones, as well.** (Paired differences are from the per-compound file,
+   task A, γ = 1.)
+   - Thinned compounds: the generators' shares are 1.00–1.04 against 0.96–0.97
+     for the real means of the kept wells, and the difference is within noise
+     (`conditional` minus the stratified real mean: +0.123 ± 0.129).
+   - Unthinned compounds (mostly non-responders): the full-data real mean gains
+     only +0.065 ± 0.067 over a random dose, and the four generators +0.33 to
+     +0.36. Paired against that real mean: `conditional` +0.268 ± 0.056
+     (4.8 SE), `dr` +0.281 ± 0.054, `naive` +0.277 ± 0.057. A generator pools
+     information across doses and compounds, which a per-arm mean cannot.
+   - This is a property of all four generators, not of the weighted risk.
+6. **The secondary truth gives the same verdict and shows why it is
+   secondary.** Against all wells, D0 fails on both tasks and D4 passes. The
+   ranking of estimators reverses: the real means capture 0.97 on task A and
+   the generators 0.90–0.92, because the real means' own wells are in that
+   truth.
+7. **The control behaves (D5).** On unthinned compounds no arm's value changes
+   between the instances by more than 1.5 SE.
+
+**Review** (automated `code-review`, high, before any job): ten findings, no
+bug in the effect, design, jackknife or bootstrap code.
+
+| Finding | Action |
+|---|---|
+| A failed D0 left D1–D3 with a PASS / FAIL | Fixed: they become "not judged" with the would-be result kept; D4 and D5 are still judged. Checked in `check_decision` |
+| The job script passed `--verdict` to the analysis only | Fixed: `VERDICT=` goes to both steps; `--verdict` as an extra argument is refused |
+| The secondary truth ran on the primary's compounds and doses, not "all six doses of all 1,750 compounds" as the memo said | Kept, and the memo changed: the same choices are scored on both truths, so only the truth differs |
+| A `None` z-score crashed a print | Fixed |
+| The SE of a captured share is unstable when the reference's gain is near zero | Fixed: no SE is given unless that gain is ≥ 3 SE above zero (the † in the report) |
+| Seeds were paired across arms by list position | Fixed: the ADIGen arms must have `conditional`'s seeds, or the run stops |
+| The npz name assumed `--out` ends in `.json` | Fixed |
+| An ad-hoc hash for the bootstrap stream; a rank correlation through BLAS | Fixed: blake2b; an explicit sum |
+| `check_decision` rebuilt the frame by copy | Fixed: `build_frame` and `read_verdict` are shared by the job and the checks |
+| The loader duplicates `mse_decomposition`'s | **Not acted on.** That module's numbers are recorded in this log and it was left untouched. Open follow-up: one shared step-A frame loader |
+
+The fixes were not reviewed again; the 33 synthetic checks and the 15 real-data
+checks pass on the fixed code.
+
+What this does and does not establish:
+
+- It establishes that, in step A as built, these two decisions are insensitive
+  to the planted confounding, that `conditional` and the ADIGen arms choose
+  alike, and that the weights' MSE cost has no decision cost.
+- It does not establish a decision advantage for ADIGen. The experiment cannot
+  show one: the data-level gate fails, so there is nothing for `dr` to repair.
+- It does not show that confounding never matters for decisions. A decision
+  flips only when the tilt exceeds the gap between the best and the next-best
+  option, and here it does not.
+- One thinning draw, one γ, two seeds (one for `naive`), as in step A.
+
+Options for a testable decision task (not decided; for the user and the main
+author):
+
+1. A stronger lever: a larger γ or a lower `keep_frac`. It needs new tier
+   instances and 14 new runs (about 25 GPU-hours).
+2. A decision that reads the direction the bias was planted on, for example
+   which line group responds more to a compound (selectivity). The step-A
+   readout found the bias there (−0.79 for `naive`). No new training.
+3. The same tasks on compounds whose best and next-best doses are close.
+   Choosing that subset after seeing this result would need its own
+   pre-declared rule.

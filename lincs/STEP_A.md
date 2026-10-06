@@ -222,7 +222,8 @@ normalised weight 4.0); on the full build it binds on 2 rows at γ = 1 (§5,
 
 *Status 2026-10-05: all code is written, reviewed and smoke-tested end to end on
 a `--limit` build (2 whole plate maps, 11,904 wells, 110 compounds). The full
-data layer is built and **S0 passes** (job 992724; "Full build" below). Details
+data layer is built, S0 passes (job 992724; "Full build" below), and **the 14
+runs are trained, scored and judged: S1–S5 all pass** (A12). Details
 in `IMPLEMENT.md` §5, "Step A implementation and review" and "Step A launch".*
 
 - [ ] **A0** (code) `--population` switch through build, splits, expression
@@ -278,13 +279,24 @@ in `IMPLEMENT.md` §5, "Step A implementation and review" and "Step A launch".*
         (even ids), each chained to its scoring job (odd ids, 993189–993215),
         then the P1 + verdict job 993216 on `bindel`. Run dirs
         `runs/core5_24h/stepa_{arm}_g{0,1}_s{seed}`.
+      - Done 2026-10-05: 14 runs, 47–52 min each, no failure.
 - [ ] **A10** (GPU) score each run, chained after its training
+      - Done: 33–34 min each at 16 GB.
 - [ ] **A11** (CPU) P1 (`dr_target`) on the `naive` and `conditional` runs,
       with the counts weights and the flat-weight control
       - `dr_target` needed a small change after all: it now carries the §3
         readout through the correction.
 - [ ] **A12** (CPU) `step_a_report`; verdict against S1–S5 written into
       `IMPLEMENT.md` §5
+      - Done (job 993216, with A11): **S1–S5 all pass on the declared
+        readout.** `naive` −0.793 ± 0.042, `conditional` −0.071 ± 0.015,
+        `dr` −0.000 ± 0.018, `dr_p2` −0.005 ± 0.017; `dr` beats `conditional`
+        by +0.070 ± 0.019 (3.7 SE). Full table, the holdout-pool check and the
+        caveats are in `IMPLEMENT.md` §5, "Step A results".
+      - The secondary MSE is decomposed term by term in `IMPLEMENT.md` §5,
+        "MSE decomposition": the bias the readout measures is at most 0.3% of
+        any arm's squared error, and against the truth the weights cost +17%
+        (`dr`) and +11% (`dr_p2`) on the thinned arms.
 
 **How to run the rest** (from `lincs/`):
 
