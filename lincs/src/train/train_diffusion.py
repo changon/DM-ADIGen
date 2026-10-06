@@ -73,7 +73,7 @@ from src.models import (  # noqa: E402
     ARCHS, DIT_SIZES, MLP_SIZES, arch_spec, build_generator, read_arch_spec,
     resolve_arch_kwargs, write_arch_spec)
 from src.processes import make_train_flow_matching, make_train_scheduler, training_target  # noqa: E402
-from src.data.splits import load_splits  # noqa: E402
+from src.data.splits import load_splits, tier_cell_key  # noqa: E402
 from src.nuisances.weight_norm import NORM_MODES, group_normalize, train_groups  # noqa: E402
 from src.data.dataset import (  # noqa: E402
     LincsDataset, build_cond_spec, cond_from_batch, dose_probe)
@@ -545,7 +545,10 @@ def main():
                 if not tier.get("active"):
                     raise SystemExit("[init] --dr_weight_norm group needs a tiered split: the group is the "
                                      "positivity cell minus the confounder, and this split thins on nothing")
-                _grp = train_groups(cfg, tier["confounder"], train_idx)
+                _grp = train_groups(cfg, tier_cell_key(tier), train_idx)
+            elif args.dr_weight_norm == "context":
+                # POLICY_LEARNING.md §8: a retargeted run keeps each (compound, line)'s mass
+                _grp = train_groups(cfg, "context", train_idx)
             else:
                 _grp = np.zeros(len(dr_w), dtype=np.int8)
             _w64, dr_weight_stats = group_normalize(dr_w, _grp, cap=args.dr_weight_clip)

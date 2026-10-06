@@ -34,7 +34,10 @@ import numpy as np
 
 from src.nuisances.knn_dr import ess
 
-NORM_MODES = ("global", "group")
+# 'context' (POLICY_LEARNING.md §8): the group is the decision context (compound,
+# line), so a retargeted run keeps every context's mass while moving it between
+# doses. The retargeting weights average to 1 under the logger within a context.
+NORM_MODES = ("global", "group", "context")
 # THE cap of the P2 arm (`dr_p2`), fixed on 2026-10-05 before any P2 run
 # (STEP_A.md §4). The launcher, the smoke and the report all read it from here.
 P2_CLIP = 5.0
@@ -110,15 +113,22 @@ def group_normalize(w: np.ndarray, groups: np.ndarray, cap: float | None = None,
     return out, stats
 
 
-def train_groups(cfg, confounder: str, train_idx: np.ndarray) -> np.ndarray:
-    """(n_train,) the target group of each train row, derived on the whole table."""
+def train_groups(cfg, key: str, train_idx: np.ndarray) -> np.ndarray:
+    """(n_train,) the group of each train row, derived on the whole table. `key`
+    is a POSITIVITY_KEYS name (the target group: the cell minus the confounder)
+    or "context" (the (compound, line) a policy decides for; vehicles form one
+    group per line)."""
     from datasets import load_from_disk
 
-    from src.data.splits import target_groups
-    meta = (load_from_disk(cfg.paths.tabular_dataset_dir)
-            .select_columns(["compound_idx", "dose_level", "is_control"]).to_pandas())
-    g = target_groups(confounder,
-                      meta["compound_idx"].values.astype(np.int64),
-                      meta["dose_level"].values.astype(np.float64),
-                      meta["is_control"].values.astype(np.int8))
+    from src.data.splits import CONTROL_ARM, target_groups
+    cols = ["compound_idx", "dose_level", "is_control"] + (["cell_id"] if key == "context" else [])
+    meta = load_from_disk(cfg.paths.tabular_dataset_dir).select_columns(cols).to_pandas()
+    comp = meta["compound_idx"].values.astype(np.int64)
+    ctl = meta["is_control"].values.astype(bool)
+    if key == "context":
+        line = meta["cell_id"].values.astype(str)
+        g = np.array([f"{CONTROL_ARM}|cell_id={v}" if k else f"{c}|cell_id={v}"
+                      for c, v, k in zip(comp, line, ctl)], dtype=object)
+    else:
+        g = target_groups(key, comp, meta["dose_level"].values.astype(np.float64), ctl.astype(np.int8))
     return g[np.asarray(train_idx, dtype=np.int64)]

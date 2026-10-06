@@ -4309,3 +4309,427 @@ author):
 3. The same tasks on compounds whose best and next-best doses are close.
    Choosing that subset after seeing this result would need its own
    pre-declared rule.
+
+#### Policy learning on step A: implementation and review (2026-10-06)
+
+Plan of record: `POLICY_LEARNING.md` (Algorithm 1 of the paper draft,
+ADIGen-PO, with retargeting). Decisions P0 are the user's of 2026-10-06:
+the signature utility as the headline, the disfavoured dose half keeps 1 of
+6, halves by well, the reweighted risk as it stands.
+
+**What was built** (all numpy except the rollout driver; nothing trained
+yet when this entry was written):
+
+| Piece | Where |
+|---|---|
+| Positivity at the dose half for `cell_id` (`cell_id@half` in `POSITIVITY_KEYS`; `tier_cell_key`) | `splits.py`, `build_tiered_split --positivity_key half` (dir tag `_pk-half`) |
+| The weight export and the trainer's group normalisation read the tier's key; a `context` normalisation group for retargeted runs | `export_urr_weights.py`, `weight_norm.py`, `train_diffusion.py` |
+| Two training halves per instance | `src/data/split_halves.py` (`<tier>_h1`, `_h2`) |
+| The decision targets, shared by both sides | `src/policy/targets.py` |
+| Rollouts: every (context, dose) × L, the generated vehicle per line | `src/policy/rollouts.py` (GPU) |
+| Frame, logger, tilt, value, stages gate / round1 / pilot / round2 / report | `src/policy/learn.py`, `src/policy/values.py` |
+| Checks: 21 synthetic, 28 on real data | `src/tests/check_policy.py` |
+| Jobs: data layer, one chained launcher per instance, rollouts, CPU stages, an end-to-end smoke on the limit build | `scripts/policy_{cpu,smoke,rollouts,stage}.sub`, `scripts/policy_arms.sh` |
+
+Measured on the limit build (103 scored compounds) before any GPU job: the
+γ = 3 instance keeps 59% of the scored wells, 0.18 of the thin half against
+1.00 of the favoured; weights up to 7.3, ESS/n 0.52; the γ = 0 control keeps
+0.59 / 0.59 with near-flat weights. The counts logger's high-half share
+tracks the design's at a correlation of 0.99.
+
+**Review** (automated `code-review`, high): ten findings, all fixed before
+the smoke; the fixes were not reviewed again.
+
+| Finding | Fix |
+|---|---|
+| `oracle_h` chose its temperature on the estimated logger and was scored on the uniform one | One selector with an explicit logger |
+| The (context, dose) half table was rebuilt through row presence; a target without a row would inherit its neighbour's half, a missing last one would crash | The half is the dose's rank among the compound's levels (as `dose_half` defines it), asserted against the table |
+| Retargeting weights at λ = 1 could underflow to exactly 0 in float32 and stop the trainer's context normalisation | Floor of 1e-6 on the ratio; the count of floored rows is recorded |
+| An unestimable error was FAIL in L1–L4 and PASS in L5–L6 | "not judged" everywhere |
+| The report ignored `--prefix` | Passed through |
+| The launcher did not forward the checkpoint epoch to the rollouts | `--gen_epoch EPOCHS−1` |
+| The pilot stage recomputed round 1 | Reads the round-1 record; μ̂ from the two `dr` rollouts |
+| A duplicated temperature selector; dead code; a check that could not fail | Removed |
+
+**Smoke** (job 8510, `zabih`, 5 min 31 s): the whole chain on the limit
+build, 26 tiny legs, rollouts, the five CPU stages and the verdict; green.
+The full-build data layer (job 8523, `bindel`, 1 min 21 s): both instances,
+their halves, 50 checks, 0 failures. The γ = 3 instance keeps 59.0% of the
+scored wells, 0.19 of the thin half against 0.99 of the favoured; counts
+weights up to 10.2, ESS/n 0.61; the halves hold 52k rows each. 6,773 of the
+8,750 contexts have a holdout well at every dose: 3,337 thinned (1,320
+validation, 2,017 test) and 3,436 control.
+
+**Gate L0: FAIL on the full build** (utility A, the reference tilt at
+β = 0.2). The reference puts 0.457 of its mass on the thin half (needs
+≥ 1/3), but the kept-pooled policy does not lose value against it: the
+difference is −0.53 ± 0.16, the wrong sign. Read with the paired numbers,
+computed by hand on the same frame (values on the thinned contexts, gain over
+a random dose in brackets):
+
+| policy, β = 0.2 | value |
+|---|---|
+| random | 10.24 ± 0.19 |
+| the logger itself (γ = 3) | 10.49 ± 0.21 (+0.25) |
+| unthinned, per line (the declared reference) | 13.71 ± 0.33 (+3.47) |
+| unthinned, pooled over lines | 14.64 ± 0.34 (+4.40) |
+| kept, pooled over lines, γ = 3 | 14.24 ± 0.34 (+4.00) |
+| kept, pooled over lines, γ = 0 | 14.19 ± 0.33 (+3.95) |
+| kept, per line, γ = 3 | 12.94 ± 0.30 (+2.70) |
+| kept, per line, γ = 0 | 13.23 ± 0.32 (+2.99) |
+| the holdout truth tilted on itself (optimistic) | 18.78 ± 0.33 (+8.54) |
+
+- **The confounding does not move a line-blind policy:** kept-pooled at
+  γ = 0 minus γ = 3 is −0.05 ± 0.12 (paired by compound). The per-line
+  memoriser does lose +0.29 ± 0.12 (2.4 SE), which is the thin half's single
+  well, i.e. variance.
+- **The logger's prior costs nothing:** the same policy with a uniform
+  logger instead of π̂_b differs by −0.014 ± 0.011. At β = 0.2 the tilt is
+  near the argmax and a dose gap of 3–4 overrides a prior of 1/6.
+- **Pooling the lines beats the per-line reference by 0.9**, because the
+  dose effect dominates the line effect (step A measured a learned line
+  contrast of 12%), and five lines give a dose curve with five times the
+  wells.
+- So on LINCS the cell line is too weak a confounder, relative to the dose
+  effect, for any line-based logger to bias a dose policy, even with a
+  sixfold overlap gap. This is the decision task's lesson again, now with
+  poor overlap added.
+
+**Decision (user, 2026-10-06): launch the full chain anyway (`FORCE=1`),
+both instances.** Recorded against the plan's rule, which says not to; the
+likely outcome is L2 failing, in which case L3 and L4 are reported, not
+judged.
+
+#### Policy learning on step A: results (2026-10-06)
+
+All 59 jobs of the two chains (8572–8632) completed with exit 0, no requeue:
+26 training runs of about 21.5 min, 26 rollout jobs of about 5.5 min, the CPU
+stages under 1 min each. The chain ran from 00:57 to 03:17 (2 h 20 min wall,
+about 12 GPU-hours). Records: `runs/core5_24h/eval_artifacts/policy/`
+(`round{1,2}_g{0,3}.json`, `pilot_*.json`, `values_*.npz`,
+`policy_verdict.json`). The paired differences and the model error by dose half
+below come from `src/policy/paired_followup.py` (job 11581, `bindel`), written
+after the runs and not reviewed.
+
+**Verdict: the experiment is not testable, and no arm chooses better than
+another.** L0 failed before launch; L2 fails too (`conditional` loses
++0.009 ± 0.075 from γ = 0 to γ = 3), so L3 and L4 are reported, not judged.
+The target, `dr` beating `conditional` under the policy-learning algorithm,
+is not met: the differences are within noise and nominally the other way.
+
+| # | Criterion | Quantity (test compounds) | Result |
+|---|---|---|---|
+| L0 | power gate on real wells | reference minus kept-pooled −0.53 ± 0.16 (needs ≥ +3 SE) | **FAIL** |
+| L1 | `naive` loses value at γ = 3 | +0.039 ± 0.122 | not judged |
+| L2 | `conditional` loses value (testability) | +0.009 ± 0.075 | not judged (would fail) |
+| L3 | `dr` loses less than `conditional` | −0.043 ± 0.081 | not judged |
+| L4 | retargeted beats `dr` at γ = 3 | +0.010 ± 0.060 | not judged |
+| L5 | no value cost of the weights at γ = 0 | `dr` −0.031 ± 0.050; retargeted +0.003 ± 0.047 | PASS |
+| L6 | control contexts unchanged | largest \|z\| 1.33 | PASS |
+| L7 | λ and transfer factor | λ = 0.25 selected in all four cases; see finding 7 | FAIL as coded |
+
+**Values** (utility A, holdout truth, 2,017 thinned test contexts; halves
+averaged; the ± of a single value is the spread between compounds, common to
+every arm, so compare arms with the paired table).
+
+| policy | γ = 0 | γ = 3 | mass on the thin half, γ = 3 |
+|---|---|---|---|
+| random dose | 10.23 ± 0.25 | 10.23 | 0.500 |
+| the logger | 10.23 | 10.43 ± 0.26 | 0.157 |
+| real, unthinned, per line (reference) | 13.49 ± 0.42 | 13.49 | 0.454 |
+| real, kept, per line | 13.09 ± 0.41 | 12.83 ± 0.40 | 0.322 |
+| real, kept, pooled over lines | 13.85 ± 0.43 | 13.96 ± 0.43 | 0.437 |
+| `naive` | 13.78 ± 0.41 | 13.74 ± 0.41 | 0.429 |
+| `conditional` | 13.91 ± 0.41 | 13.90 ± 0.41 | 0.417 |
+| `dr` | 13.88 ± 0.41 | 13.82 ± 0.41 | 0.445 |
+| retargeted, λ = 0.25 (selected) | 13.91 ± 0.41 | 13.83 ± 0.41 | 0.426 |
+| retargeted, λ = 0.5 | 13.98 | 13.88 | 0.423 |
+| retargeted, λ = 0.75 | 14.00 | 13.84 | 0.425 |
+| retargeted, λ = 1 | 13.69 | 13.57 | 0.430 |
+| the holdout truth tilted on itself (optimistic) | 18.70 | 18.70 | 0.460 |
+
+**Paired differences in value** (compound-clustered).
+
+| difference | γ = 0 | γ = 3 | γ = 3, reference optimum in the thin half (913 contexts; post hoc) |
+|---|---|---|---|
+| `dr` − `conditional` | −0.031 ± 0.050 | −0.074 ± 0.066 | −0.156 ± 0.089 |
+| retargeted (0.25) − `conditional` | +0.003 ± 0.047 | −0.064 ± 0.056 | −0.154 ± 0.086 |
+| retargeted (0.25) − `dr` | +0.033 ± 0.053 | +0.010 ± 0.060 | +0.002 ± 0.092 |
+| retargeted λ = 1 − λ = 0.25 | −0.224 ± 0.084 | −0.260 ± 0.089 | −0.147 ± 0.118 |
+| `naive` − `conditional` | −0.131 ± 0.114 | −0.161 ± 0.116 | −0.181 ± 0.170 |
+| `conditional` − real kept pooled | +0.059 ± 0.213 | −0.061 ± 0.222 | +0.035 ± 0.237 |
+| `conditional` − real unthinned per line | +0.420 ± 0.152 | +0.410 ± 0.152 | +0.435 ± 0.244 |
+| `conditional` − real kept per line | +0.814 ± 0.159 | +1.064 ± 0.167 | +2.103 ± 0.275 |
+
+**Model error** (mean squared error of μ̂ against the holdout well, per dose;
+its level, about 60, is mostly the holdout well's own noise, which cancels in
+the differences).
+
+| difference | thin-half doses, γ = 0 | thin, γ = 3 | favoured-half doses, γ = 0 | favoured, γ = 3 |
+|---|---|---|---|---|
+| `dr` − `conditional` | +0.13 ± 0.21 | **+3.85 ± 0.92** | −0.57 ± 0.48 | **+3.71 ± 0.53** |
+| retargeted (0.25) − `conditional` | +0.79 ± 0.37 | +1.13 ± 0.38 | +1.28 ± 0.35 | +1.28 ± 0.33 |
+| retargeted (0.25) − `dr` | +0.65 ± 0.39 | **−2.72 ± 1.00** | +1.85 ± 0.62 | **−2.43 ± 0.56** |
+| retargeted λ = 1 − λ = 0.25 | +13.7 ± 1.4 | +19.4 ± 2.4 | +13.0 ± 1.3 | +12.8 ± 1.5 |
+| `naive` − `conditional` | +15.2 ± 2.1 | +14.8 ± 2.3 | +12.3 ± 2.1 | +13.4 ± 1.9 |
+| each arm, γ = 3 minus γ = 0: `conditional` | | +2.79 ± 0.90 | | −3.19 ± 0.94 |
+| each arm, γ = 3 minus γ = 0: `dr` | | +6.51 ± 1.14 | | +1.09 ± 0.95 |
+
+Findings:
+
+1. **The planted logging does not move any policy's value.** Every arm's
+   γ = 3 minus γ = 0 difference is within 1 SE (`naive` −0.04 ± 0.12,
+   `conditional` −0.01 ± 0.08, `dr` −0.05 ± 0.08, retargeted −0.08 ± 0.08).
+2. **`dr` does not beat `conditional`, and retargeting does not beat `dr`, on
+   value.** All three are within 0.08 of each other on a gain over random of
+   3.6, i.e. within 2%, at both γ. On the post hoc subset where the optimum
+   sits in the thin half, the two weighted arms are nominally 0.15 below
+   `conditional` (1.8 SE).
+3. **The policies do go where the logger is thin.** At γ = 3 the tilts put
+   0.42–0.45 of their mass on the thin half, where the logger has 0.157; the
+   realised transfer factor (max over doses of π̂/π̂_b, averaged over
+   contexts) is about 10, against 6 at γ = 0, with a maximum of 48–57. So
+   the low-overlap condition of Theorems 3–4 is present; the generator's
+   error there is not.
+4. **The thinning costs `conditional` about 5% accuracy on the thin half and
+   nothing in decisions.** Its error on thin-half doses rises by 2.8 ± 0.9
+   (on a level of 58) and falls by 3.2 ± 0.9 on the favoured half. The dose
+   gaps the policy reads are far larger than that.
+5. **The counts weights cost `dr` accuracy at γ = 3, on both halves.** Its
+   error is 3.9 ± 0.9 above `conditional`'s on the thin half and 3.7 ± 0.5 on
+   the favoured half (4.2 and 6.9 SE); at γ = 0 the two are equal. `dr` also
+   reads the thin half 0.40 ± 0.13 too high relative to the favoured half,
+   where `conditional` (+0.09 ± 0.13) and `naive` (−0.01 ± 0.15) show no
+   tilt. So here the weights add noise and a small optimistic tilt on the
+   doses they up-weight, and remove no bias, because there is none to
+   remove. This is the weight cost of the theory (1 + χ²) with no transfer
+   gain to pay for it.
+6. **Retargeting at λ = 0.25 recovers most of that cost.** Against `dr` at
+   γ = 3 its error is 2.7 ± 1.0 lower on the thin half and 2.4 ± 0.6 lower on
+   the favoured half; as a difference from γ = 0, −3.4 ± 0.9 and −4.3 ± 0.9
+   (3.8 and 5.0 SE). It stays 1.1–1.3 above `conditional`. This is the one
+   place the paper's mechanism shows: the mixture law is a cheaper training
+   target than the balanced interventional law. It does not reach the level
+   of a decision.
+7. **λ = 1 hurts, and validation picks the smallest λ every time.** At
+   β = 0.05 the pilot policy is almost a point mass, so at λ = 1 about half
+   of the treated rows sit at the weight floor (ESS/n 0.15, largest weight
+   48): the error rises by 13–19 and the value falls by 0.26 ± 0.09. L7 as
+   coded compared the policy's transfer factor against the logger, which
+   retargeting cannot change (10.4 against 10.1); the theorem's quantity is
+   the ratio against the training law π_λ, bounded by 1/λ. The criterion was
+   mis-specified and its FAIL carries no information.
+8. **The temperature sits at the grid's lower edge** (0.05 or 0.1 for every
+   generator), and the validation value is flat from 0.05 to 0.2. The
+   policies are close to an argmax, so the KL regulariser plays no part.
+9. **The line input matters for accuracy, not for the decision.** `naive`'s
+   error is 13–15 above `conditional`'s at both γ, and its value is 0.13–0.16
+   lower (1.2–1.4 SE).
+10. **A generator chooses as well as the pooled real wells and better than the
+    per-line real wells.** `conditional` minus the unthinned per-line mean is
+    +0.41 ± 0.15 on the test contexts and +0.70 ± 0.07 on the control
+    contexts; against the kept per-line mean, +1.06 ± 0.17. Against the kept
+    wells pooled over lines it is −0.06 ± 0.22. The gain is the pooling over
+    lines, which the dose effect allows.
+11. **The generators are far less optimistic about their own policy than the
+    raw means.** On utility B, whose axis shares no noise with the truth, the
+    self-evaluation error (model value minus true value) is +0.06 to +0.13
+    for `conditional`, `dr` and the retargeted arm, +0.19 for `naive`, +0.31
+    for the kept pooled mean and +0.51 for the unthinned per-line mean. On
+    utility A it is about −3 for every generator, which mixes the generator's
+    shrinkage with the positive offset the holdout-built axis gives the
+    truth (`DECISION.md` §4), so it is not read.
+12. **Utility B gives the same picture** (descriptive): every generator
+    captures 0.98–1.00 of the reference's gain at both γ, `naive` 0.93–0.95,
+    λ = 1 about 0.94.
+
+What this does and does not establish:
+
+- It establishes that on the step-A data, with a sixfold overlap gap planted
+  on the cell line, policy learning over doses is insensitive to the logging
+  and to the choice among `conditional`, `dr` and the retargeted generator.
+- It establishes two things about the generators themselves, at 4–7 SE: the
+  balanced-law weights cost accuracy when overlap is poor, and the mixture
+  law at a small λ recovers most of that cost.
+- It does not establish a decision advantage for ADIGen or for retargeting.
+  The experiment cannot show one: the cell line barely changes which dose is
+  best, so a logger that depends on the line is nearly ignorable for this
+  decision, whatever its overlap.
+- One thinning draw, one training seed per half, one γ > 0. The model-error
+  differences are 4–7 SE on one draw; the value differences are null.
+
+Options (not decided; for the user and the main author):
+
+1. **A semi-synthetic effect modifier on LINCS**, as step C2 did for `syn_c`:
+   inject a line-group × dose interaction of known size into the utility, so
+   that the best dose differs by line group and the logger hides it. This is
+   the paper's own design (logs confounded through a factor that changes the
+   reward) and needs the PL tier's machinery unchanged plus one injection;
+   about 12 GPU-hours.
+2. **Report LINCS as the robustness result it is**: the weights' cost and the
+   retargeting recovery in model error (findings 5–6), with the value table
+   as the null, next to the simulation and video experiments that carry the
+   regret claim.
+3. **A different action on LINCS**, the compound instead of the dose, with a
+   logger that depends on the line. The line does change which compounds
+   work (the step-A readout found the bias there), but it needs a
+   parametric policy and a new rollout layout.
+
+#### Policy learning with the semi-synthetic effect modifier: results (2026-10-06)
+
+Plan: `POLICY_LEARNING.md` §14 (decided by the user after the null of the
+previous entry; design, β rule, gate and criteria fixed before any number was
+read). Build: `data/core5_24h_inj-m2`, β = 2 σ_w = 9.286 (the 1.5 σ_w build
+failed gate (c); ladder table in `POLICY_LEARNING.md` §14). Runs:
+`runs/core5_24h_inj-m2/pl_*` (γ = 3: the full chain; γ = 0: round 1 only);
+records under `runs/core5_24h_inj-m2/eval_artifacts/policy/`. Jobs
+12052–12103, 42 jobs, all exit 0, 11:06–12:42 (1 h 36 min wall, 8.3
+GPU-hours). The paired differences below are from
+`src/policy/paired_followup.py` (job 12920), written after the runs and not
+reviewed.
+
+**Verdict: the target is met. With the modifier, the task is testable, and
+the ADIGen generator's policy beats the conditional generator's by
+0.68 ± 0.10 (7 SE), while the two are identical when overlap is fine.
+Retargeting does not add to it here (L4 fails).**
+
+| # | Criterion | Quantity (2,017 thinned test contexts) | Result |
+|---|---|---|---|
+| L0′ | power gate | (a) 0.500; (b) +1.50 ± 0.17; (c) +0.96 ± 0.18 | **PASS** |
+| L1 | `naive` loses value at γ = 3 | +0.693 ± 0.168 (4.1 SE) | **PASS** |
+| L2 | `conditional` loses value (testability) | +0.668 ± 0.101 (6.6 SE) | **PASS** |
+| L3 | `dr` loses less than `conditional` | **+0.678 ± 0.098 (6.9 SE)** | **PASS** |
+| L4 | retargeted beats `dr` at the validation λ (0.5) | −0.607 ± 0.088 (−6.9 SE) | **FAIL** |
+| L5 | no value cost of the weights at γ = 0 | `dr` +0.004 ± 0.051; retargeted not run at γ = 0 | PASS for `dr`; not judged for `rt` |
+| L6 | control contexts unchanged | `conditional` +0.126 ± 0.035 (3.5 SE), `dr` −0.097 ± 0.039 (2.5 SE) | FAIL (see finding 7) |
+| L7 | λ and transfer factor | λ = 0.5 both halves; TF against the training law 6.7–7.7 < 11 | PASS |
+
+**Values** (utility A, holdout truth; halves averaged).
+
+| policy | γ = 0, test | γ = 3, test | planted share, thin half, γ = 0 / γ = 3 | leak to the favoured half, γ = 3 |
+|---|---|---|---|---|
+| random dose | 10.48 | 10.48 | | |
+| real, kept, pooled over lines | 15.42 | 14.88 | | |
+| real, kept, per line | 16.14 | 15.97 | | |
+| real, unthinned, per line (reference) | 16.47 | 16.47 | | |
+| `naive` | 14.45 | 13.76 | 0.25 / 0.07 | 0.04 |
+| `conditional` | 15.00 | 14.34 | 0.39 / **0.13** | 0.06 |
+| `dr` | 15.01 | **15.02** | 0.39 / **0.33** | 0.14 |
+| retargeted, λ = 0.25 | — | 14.48 | — / 0.15–0.16 | 0.07 |
+| retargeted, λ = 0.5 (selected) | — | 14.41 | — / 0.14–0.15 | 0.07 |
+| retargeted, λ = 1 | — | 13.85 | — / 0.12–0.13 | 0.08 |
+| the holdout truth tilted on itself (optimistic) | 20.92 | 20.92 | | |
+
+The planted share is the mean over the thin-half cells of
+$m\,(\hat\mu_\text{inj} - \hat\mu_\text{uninj}) / \beta$ against the
+uninjected run of the same name (same rows, seeds, noise seeds); on the
+control compounds, where every cell has three wells, every generator learns
+0.31–0.34 at both γ.
+
+**Paired differences in value** (compound-clustered).
+
+| difference | γ = 0 | γ = 3 | γ = 3, reference optimum in the thin half (1,009) | in the favoured half (1,008) | control (3,436), γ = 3 |
+|---|---|---|---|---|---|
+| `dr` − `conditional` | +0.004 ± 0.051 | **+0.682 ± 0.084** | +0.416 ± 0.136 | +0.773 ± 0.157 | +0.223 ± 0.044 |
+| retargeted (0.25) − `conditional` | — | +0.147 ± 0.065 | +0.233 ± 0.119 | +0.148 ± 0.117 | +0.278 ± 0.043 |
+| retargeted (0.25) − `dr` | — | −0.535 ± 0.078 | −0.183 ± 0.132 | −0.625 ± 0.126 | +0.056 ± 0.036 |
+| retargeted λ = 1 − λ = 0.25 | — | −0.636 ± 0.123 | | | −1.485 ± 0.070 |
+| `naive` − `conditional` | −0.553 ± 0.122 | −0.578 ± 0.144 | −1.123 ± 0.239 | +0.067 ± 0.201 | −1.185 ± 0.083 |
+| `conditional` − real kept per line | −1.133 ± 0.199 | −1.637 ± 0.203 | | | |
+
+**Model error** (squared error of μ̂ against the holdout well, per dose).
+
+| difference | thin-half doses, γ = 0 | thin, γ = 3 | favoured-half doses, γ = 0 | favoured, γ = 3 |
+|---|---|---|---|---|
+| `dr` − `conditional` | −0.10 ± 0.31 | **−16.6 ± 1.4** | +0.42 ± 0.23 | **+6.8 ± 0.7** |
+| retargeted (0.25) − `dr` | — | +14.3 ± 1.2 | — | −5.5 ± 0.7 |
+| each arm, γ = 3 minus γ = 0: `conditional` | | +32.9 ± 1.6 | | −6.5 ± 1.1 |
+| each arm, γ = 3 minus γ = 0: `dr` | | +16.4 ± 1.6 | | −0.1 ± 0.9 |
+
+Findings:
+
+1. **The modifier makes the decision depend on what the logger hides.** The
+   line-blind real policy loses 1.50 ± 0.17 against the per-line reference
+   (gate b), `naive` loses 0.69 and `conditional` 0.67 from γ = 0 to γ = 3.
+   The previous entry's null is gone.
+2. **`dr` keeps its value under the thinning and `conditional` does not.**
+   `dr` moves by +0.01 ± 0.10 from γ = 0 to γ = 3, `conditional` by −0.67 ±
+   0.10; at γ = 3 the paired gap is 0.68 ± 0.08, 15% of the gain over a
+   random dose. At γ = 0 the two generators are the same in every number.
+3. **The mechanism is the one the theory names.** On the thin half,
+   `conditional` learns 0.13 of the planted effect and `dr` 0.33, the share
+   both learn on the control compounds (0.31–0.34), where every cell has
+   three wells. `dr`'s thin-half model error is 16.6 ± 1.4 below
+   `conditional`'s (12 SE). The counts weights restore the thin cells to
+   the learning rate they have with overlap.
+4. **The gain is largest where the planted effect is a hidden harm.** On
+   contexts whose reference optimum is in the favoured half, `dr` −
+   `conditional` is +0.77 ± 0.16: `conditional` never learns that the thin
+   dose is bad (its μ̂ there stays at the pooled level) and picks it. On
+   contexts with the optimum in the thin half the gap is +0.42 ± 0.14.
+5. **The weights' cost is a leak, not noise, this time.** `dr` spreads 0.14
+   of the planted effect onto the favoured half, where nothing was planted
+   (`conditional` 0.06), and its favoured-half error is 6.8 ± 0.7 above
+   `conditional`'s. The thin-half gain outweighs it: the error at the policy
+   is −1.8 ± 2.1.
+6. **Retargeting loses what the balanced weights gained (L4).** At every λ
+   the retargeted generator's planted share is 0.12–0.16, barely above
+   `conditional`'s, and its value sits between the two (λ = 0.25: +0.15 ±
+   0.07 over `conditional`, −0.54 ± 0.08 under `dr`); validation picks
+   λ = 0.5, and λ = 1 is worse than `conditional`. Reading (mine, from the
+   weights): the retargeting law $\lambda\tilde\pi + (1-\lambda)\pi_b$ has no
+   component that balances the design. Its weight on a thin well is
+   $\lambda\,\tilde\pi/\pi_b + (1-\lambda)$: large only where the pilot policy
+   already goes, and about $1-\lambda$ where the pilot avoids a dose, which
+   is exactly where the planted effect is a harm. `dr`'s counts weight is 6
+   on every thin well, whatever its sign. So the retargeted generator
+   re-hides half of the modifier. As λ grows the effective sample also
+   collapses (ESS/n 0.76 → 0.17, weights up to 48).
+7. **Spillover onto the control compounds (L6).** The unthinned compounds'
+   values move between the instances although their rows do not: `dr`
+   gains 0.10 ± 0.04 at γ = 3 and `conditional` loses 0.13 ± 0.04. Shared
+   parameters carry the thinned compounds' fit to the others; the sign
+   differs by arm. Small against the 0.68 effect, but it is a departure from
+   the criterion, and the control is not a clean null here.
+8. **The generators capture a third of the planted effect; the real wells
+   capture it whole, noisily.** The per-line kept memoriser (15.97) beats
+   every generator (`dr` 15.02) by about 1, and the unthinned reference
+   (16.47) by 1.5. With β ≈ 2 σ_w a single well is informative, and the
+   generators shrink it.
+9. **Temperatures:** `dr` chose β = 0.2 on both halves (0.05–0.1 before the
+   modifier), `conditional` 0.05–0.1; the retargeted runs run at the pilot's
+   0.2.
+10. **The transfer-factor criterion is trivial as built** (L7): the ratio
+    against the training law is bounded by $1/\lambda$ by construction, and
+    at λ = 1 it is astronomically large where the pilot put no mass. It
+    carries no information beyond λ.
+
+What this does and does not establish:
+
+- With a line-group × dose-half effect modifier of 2 σ_w planted where the
+  logger is thin, the ADIGen (counts-weighted) generator's dose policy is
+  worth 0.68 ± 0.10 more than the conditional generator's, with no cost
+  when overlap is fine. That is the user's target, on one thinning draw and
+  one seed per half.
+- The effect is semi-synthetic and placed, by design, on exactly the half the
+  logger hides, with compound-specific signs; the write-up must say so.
+- Retargeting, as Algorithm 1 specifies it and as implemented here (the
+  mixture of the pilot policy and the logger as the training law), does not
+  improve on the balanced weights on this data; it sits between
+  `conditional` and `dr`.
+- Two further criteria did not behave as declared: the control compounds
+  move (L6), and L5's retargeted half was not run.
+- One thinning draw, one seed per half, one γ > 0, one β.
+
+Options (not decided):
+
+1. **A retargeting law that keeps the balance:** mix the pilot policy with
+   the balanced design instead of the logger,
+   $\nu_\lambda = \lambda\tilde\pi + (1-\lambda)\,\nu_\text{balanced}$, so
+   the weights are $\lambda\tilde\pi/\pi_b + (1-\lambda)\,\alpha_\text{counts}$.
+   It costs 8 runs (3.5 GPU-hours) and reuses everything.
+2. A second thinning seed and a second training seed, to put errors on the
+   draw as well as the compounds (about 8 GPU-hours).
+3. The write-up: the planted-share table (finding 3) is the mechanism
+   figure; the value table the headline; the leak (finding 5) and the
+   spillover (finding 7) the caveats.

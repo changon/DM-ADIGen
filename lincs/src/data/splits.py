@@ -118,7 +118,23 @@ def dose_half(compound_idx, dose_level, is_control) -> np.ndarray:
 # 2026-09-30): thinning keeps >= 1 train well in each, the design weight is
 # constant within each, and step C / A estimate the DR weights at this key.
 POSITIVITY_KEYS = {"syn_c": ("compound", "dose_half", "syn_c"),
-                   "cell_id": ("compound", "dose_level", "cell_id")}
+                   "cell_id": ("compound", "dose_level", "cell_id"),
+                   # The policy-learning tier (POLICY_LEARNING.md §5): the same
+                   # confounder, positivity one level up, so a context's
+                   # disfavoured dose half can keep a single well.
+                   "cell_id@half": ("compound", "dose_half", "cell_id")}
+
+
+def tier_cell_key(tier: dict) -> str:
+    """The POSITIVITY_KEYS name of a thinning instance's cells: its confounder,
+    or `<confounder>@half` when the instance was built with positivity at the
+    dose half (`build_tiered_split --positivity_key half`)."""
+    conf = str(tier["confounder"])
+    key = tuple(tier.get("positivity_key") or POSITIVITY_KEYS[conf])
+    for name, k in POSITIVITY_KEYS.items():
+        if k == key and name.split("@", 1)[0] == conf:
+            return name
+    raise ValueError(f"tier positivity key {key} is not declared for confounder {conf!r}")
 
 
 def positivity_cells(confounder: str, compound_idx, dose_level, is_control, c_values) -> np.ndarray:
@@ -136,6 +152,11 @@ def positivity_cells(confounder: str, compound_idx, dose_level, is_control, c_va
         arm = arm_keys(compound_idx, dose_level, ctl)
         return np.array([CONTROL_ARM if k else f"{a}|cell_id={v}"
                          for a, v, k in zip(arm, cv, ctl)], dtype=object)
+    if confounder == "cell_id@half":
+        comp = np.asarray(compound_idx, dtype=np.int64)
+        half = dose_half(comp, dose_level, ctl)
+        return np.array([CONTROL_ARM if k else f"{c}|h{h}|cell_id={v}"
+                         for c, h, v, k in zip(comp, half, cv, ctl)], dtype=object)
     raise ValueError(f"no positivity cell declared for confounder {confounder!r}; have {list(POSITIVITY_KEYS)}")
 
 
@@ -150,8 +171,9 @@ def target_groups(confounder: str, compound_idx, dose_level, is_control) -> np.n
     and the arm-level ratio that broke the weighted risk in step C2 cannot
     arise.
 
-        syn_c   -> "<compound_idx>|h<dose half>"      (coarser than an arm)
-        cell_id -> "<compound_idx>|<dose_level>"      (EXACTLY the arm key)
+        syn_c        -> "<compound_idx>|h<dose half>"      (coarser than an arm)
+        cell_id      -> "<compound_idx>|<dose_level>"      (EXACTLY the arm key)
+        cell_id@half -> "<compound_idx>|h<dose half>"      (the policy-learning tier)
 
     It is derived from `positivity_cells` rather than written out again, so the
     two can never drift. Each cell lies inside exactly one group (a property

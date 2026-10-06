@@ -170,7 +170,7 @@ def standardize(x: np.ndarray) -> np.ndarray:
 
 
 def default_out_dir(cfg: CaseConfig, base: str, scored: list[str], confounder: str | None,
-                    k: int, gamma: float, seed: int) -> str:
+                    k: int, gamma: float, seed: int, positivity_key: str = "dose_level") -> str:
     """v1 -> the base nuisance dir; anything else gets its own tagged sibling dir."""
     tag = ""
     if cfg.population.compounds:
@@ -179,30 +179,35 @@ def default_out_dir(cfg: CaseConfig, base: str, scored: list[str], confounder: s
         tag += f"_tier_C{confounder}_k{k}_g{gamma:g}_s{seed}"
         if confounder == "cell_id":      # the line groups z_C contrasts (§3.8.3)
             tag += "_" + line_group_tag(cfg.population)
+        if positivity_key != "dose_level":   # the policy-learning tier; step A's names are unchanged
+            tag += f"_pk-{positivity_key}"
     elif seed != cfg.seed:
         tag += f"_s{seed}"
     return os.path.normpath(base) + tag
 
 
 def tier_dir(cfg: CaseConfig, confounder: str, gamma: float, seed: int | None = None,
-             k_reserve: int = 0) -> str:
+             k_reserve: int = 0, positivity_key: str = "dose_level") -> str:
     """The split dir of a thinning instance of cfg's build -- the one definition of
     its name, for the builder, the checks and (via --print_out_dir) the scripts."""
     base = os.path.join(cfg.paths.data_dir, "nuisances")
     return default_out_dir(cfg, base, ["<tier>"], confounder, k_reserve, float(gamma),
-                           cfg.seed if seed is None else int(seed))
+                           cfg.seed if seed is None else int(seed), positivity_key)
 
 
 def pi_and_cells(rows: np.ndarray, half: np.ndarray, c_val: np.ndarray,
                  confounder: str, gamma: float, keep_frac: float,
                  pmin: float, *, dose_level: np.ndarray | None = None,
-                 population=None) -> tuple[np.ndarray, np.ndarray, np.ndarray, set]:
+                 population=None, positivity_key: str = "dose_level") -> tuple[np.ndarray, np.ndarray, np.ndarray, set]:
     """The selection probabilities and positivity cells of one scored compound,
     with no draw. Shared by `thin_compound` and `--plan`, so the planned bias and
     the realised thinning can never be computed from different pi.
 
     `cell_id` (step A) needs `dose_level` (the table's, for the (dose_level,
-    cell_id) cells) and `population` (its line groups, spec.LINE_GROUPS)."""
+    cell_id) cells) and `population` (its line groups, spec.LINE_GROUPS).
+    `positivity_key="half"` (the policy-learning tier, POLICY_LEARNING.md §5)
+    puts the cells at (dose half, line) instead: a context's disfavoured half
+    can then keep a single well, which no per-dose cell allows."""
     high = half[rows] == 1
     if confounder == "cell_id":
         if dose_level is None or population is None:
@@ -211,16 +216,22 @@ def pi_and_cells(rows: np.ndarray, half: np.ndarray, c_val: np.ndarray,
         zc = line_group_sign(lines, population)            # -1 G1, +1 G2
         z = standardize(np.where(high, 1.0, -1.0) * zc)
         dl = dose_level[rows]
-        cells = np.array([f"{d:.6g}|cell_id={c}" for d, c in zip(dl, lines)])
+        if positivity_key == "half":
+            cells = np.array([f"{'high' if h else 'low'}|cell_id={c}" for h, c in zip(high, lines)])
+            want = {f"{h}|cell_id={c}" for h in ("low", "high") for c in population.cell_ids}
+        elif positivity_key == "dose_level":
+            cells = np.array([f"{d:.6g}|cell_id={c}" for d, c in zip(dl, lines)])
+            # Every (dose level, line) of the compound: an arm missing from a line
+            # has no cell to keep, and the compound cannot be scored.
+            want = {f"{d:.6g}|cell_id={c}" for d in sorted(set(dl.tolist()))
+                    for c in population.cell_ids}
+        else:
+            raise ValueError(f"positivity_key {positivity_key!r}: dose_level or half")
         # keep_frac is the REALISED fraction here (see DEFAULT_KEEP_FRAC): the
         # gamma = 0 control and the confounded instance then keep the same share.
         ucell, inv = np.unique(cells, return_inverse=True)
         pi = _calibrate_pi_realised(np.exp(-gamma * z), inv, ucell.size,
                                     keep_frac * rows.size, pmin)
-        # Every (dose level, line) of the compound: an arm missing from a line
-        # has no cell to keep, and the compound cannot be scored.
-        want = {f"{d:.6g}|cell_id={c}" for d in sorted(set(dl.tolist()))
-                for c in population.cell_ids}
         missing = sorted(want - set(cells.tolist()))
         if missing:
             raise ValueError(f"positivity cells {missing[:4]}{' ...' if len(missing) > 4 else ''} "
@@ -349,6 +360,10 @@ def main():
     ap.add_argument("--gamma", type=float, default=0.0, help="Selection strength in exp(-gamma * z); 0 = uniform (MCAR) control.")
     ap.add_argument("--keep_frac", type=float, default=None, help="Kept fraction of a scored compound's train wells. syn_c (default 0.4): the nominal one, sum(pi)/n before the positivity redraw. cell_id (default 0.75): the expected REALISED one under the per-cell redraw, so gamma = 0 and gamma > 0 keep the same share.")
     ap.add_argument("--pmin", type=float, default=0.05, help="Positivity floor on per-well retention probability.")
+    ap.add_argument("--positivity_key", choices=("dose_level", "half"), default="dose_level",
+                    help="cell_id only. 'dose_level' (step A): >= 1 train well per (compound, dose, line). 'half' "
+                         "(the policy-learning tier, POLICY_LEARNING.md §5): per (compound, dose half, line), so a "
+                         "context's disfavoured half can keep one well of six. Tags the dir with _pk-half.")
     ap.add_argument("--max_redraws", type=int, default=1000)
     ap.add_argument("--out_dir", default=None, help="Default: the base nuisance dir for v1, else <nuisance_dir>_tier_C<c>_k<k>_g<gamma>_s<seed>.")
     ap.add_argument("--overwrite", action="store_true", help="Replace a split built with other parameters (refused while downstream artifacts exist).")
@@ -377,8 +392,10 @@ def main():
     if confounder == "cell_id" and line_groups(cfg.population) is None:
         ap.error(f"--confounder cell_id: population {cfg.population.name!r} declares no "
                  f"line groups (spec.LINE_GROUPS)")
+    if args.positivity_key != "dose_level" and confounder != "cell_id":
+        ap.error("--positivity_key applies to --confounder cell_id only")
     out_dir = os.path.abspath(args.out_dir) if args.out_dir else default_out_dir(
-        cfg, base_nz, scored, confounder, args.k_reserve, args.gamma, seed)
+        cfg, base_nz, scored, confounder, args.k_reserve, args.gamma, seed, args.positivity_key)
     if args.print_out_dir:          # for scripts: the one place the dir name is built
         print(out_dir)
         return
@@ -394,7 +411,10 @@ def main():
     if confounder == "cell_id":
         lg = line_groups(cfg.population)
         params["line_groups"] = {k: list(v) for k, v in lg.items()}
-    tkw = {"dose_level": None, "population": cfg.population} if confounder == "cell_id" else {}
+        if args.positivity_key != "dose_level":   # absent from step A's params, so those still match
+            params["positivity_key"] = args.positivity_key
+    tkw = ({"dose_level": None, "population": cfg.population, "positivity_key": args.positivity_key}
+           if confounder == "cell_id" else {})
     sp = os.path.join(out_dir, SPLITS_FILENAME)
     # --plan writes nothing, so none of the write guards below apply to it.
     if os.path.isfile(sp) and not args.plan:
@@ -571,17 +591,19 @@ def main():
 
     # --- write -------------------------------------------------------------
     os.makedirs(out_dir, exist_ok=True)
+    cell_key = (f"{confounder}@{args.positivity_key}" if scored and args.positivity_key != "dose_level"
+                else confounder)
     tier = {"active": bool(scored), "k_reserve": args.k_reserve}
     if scored:
         tier.update({
             "confounder": confounder, "gamma": args.gamma, "keep_frac": keep_frac, "pmin": args.pmin,
             "selection": "z = standardize(z_dose * z_C) within compound; z_dose = +/-1 high/low dose half, z_C = +/-1",
-            "positivity_cells": "(" + ", ".join(POSITIVITY_KEYS[confounder]) + ")"
+            "positivity_cells": "(" + ", ".join(POSITIVITY_KEYS[cell_key]) + ")"
                                 if confounder != "syn_c" else "(compound, dose half, syn_c)",
             **({"line_groups": params["line_groups"],
                 "z_C": "-1 for a G1 line, +1 for a G2 line (spec.LINE_GROUPS)",
                 "redraw": "per positivity cell"} if confounder == "cell_id" else {}),
-            "positivity_key": list(POSITIVITY_KEYS[confounder]),
+            "positivity_key": list(POSITIVITY_KEYS[cell_key]),
             "scored_compounds": {a["pert_id"]: a["compound_idx"] for a in tier_arms},
             "n_thinned": int(train_idx.size - final_train.size),
         })

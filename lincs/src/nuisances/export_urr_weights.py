@@ -57,7 +57,7 @@ from datasets import load_from_disk  # noqa: E402
 from src.data.build_dataset import (  # noqa: E402
     _atomic_write, covariate_blocks, load_covariate_encoder)
 from src.data.splits import (  # noqa: E402
-    POSITIVITY_KEYS, arm_keys, load_splits, population_rows, positivity_cells, resolve_split_file)
+    POSITIVITY_KEYS, arm_keys, load_splits, population_rows, positivity_cells, resolve_split_file, tier_cell_key)
 from src.nuisances.knn_dr import ess  # noqa: E402
 from src.spec import (  # noqa: E402
     add_adjustment_set_cli, add_paths_cli, alpha_cov_fields, apply_paths_args, config_from_args)
@@ -130,8 +130,9 @@ def main():
             if keep != [conf]:
                 raise ValueError(f"this split thins on {conf!r}: export its weights with --adjustment_set {conf} "
                                  f"(got X={keep or 'empty'}); the DR arm adjusts for the thinning covariate")
-            key = positivity_cells(conf, comp, dl, ic, np.asarray(meta[conf]))
-            what = f"positivity cells {POSITIVITY_KEYS[conf]}"
+            ckey = tier_cell_key(tier)                 # conf, or conf@half (the policy-learning tier)
+            key = positivity_cells(ckey, comp, dl, ic, np.asarray(meta[conf]))
+            what = f"positivity cells {POSITIVITY_KEYS[ckey]}"
         else:
             key = arm_keys(comp, dl, ic)
             if cov_idx:   # (arm, C) once C is non-empty (P2)
